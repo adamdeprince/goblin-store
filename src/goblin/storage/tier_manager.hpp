@@ -21,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <unordered_map>
 #include <span>
 #include <vector>
 
@@ -107,6 +108,18 @@ public:
     void touch(const Digest&);          // record a cache hit (eviction bookkeeping, ADR-0007)
     std::size_t head_resident() const;  // # heads currently cached in RAM (stats/tests)
 
+    // Head pinning (ADR-0017/0018): keep a resident head's RAM alive while a reader sends it
+    // zero-copy. Evicting/overwriting a pinned head defers the RAM free until the last unpin.
+    struct HeadPin {
+        unsigned block = 0;
+        std::uint32_t offset = 0;
+        std::uint32_t len = 0;
+        bool valid = false;
+    };
+    std::optional<HeadPin> pin_head(const Digest&); // pin + record the hit; nullopt if not resident
+    void unpin_head(const HeadPin&);
+    ByteView pinned_bytes(const HeadPin&) const; // zero-copy view of the pinned head region
+
     // Async read support (ADR-0002): open an object's files once, then plan() each piece — the head
     // is copied into the caller's buffer under the storage lock, and the disk portion is returned as
     // per-drive segments the caller reads on its own io_uring ring. Holds the fds for the read's life.
@@ -149,6 +162,10 @@ private:
           hdd_(std::move(hdd)), index_(&ix), mu_(std::make_unique<std::shared_mutex>()) {}
     void drop_object(const Digest&); // free head + unlink files + erase from index & policies
     void enforce_object_bound();     // evict whole objects while over the count limit
+    void free_head_region(unsigned block, std::uint32_t offset, std::uint32_t len); // free or orphan
+    static std::uint64_t region_id(unsigned block, std::uint32_t offset) {
+        return (static_cast<std::uint64_t>(block) << 32) | offset;
+    }
 
     TierSizes tiers_;
     core::BufferPool ram_;                          // RAM-head cache (ADR-0003/0008)
@@ -159,6 +176,12 @@ private:
     std::optional<Pool> hdd_;
     Index* index_;
     std::unique_ptr<std::shared_mutex> mu_; // rwlock: shared for reads, exclusive for writes (ADR-0018)
+    struct RegionPin {
+        std::uint32_t len = 0;
+        unsigned refcount = 0;
+        bool orphaned = false;
+    };
+    std::unordered_map<std::uint64_t, RegionPin> pins_; // pinned head regions (region_id -> state)
 };
 
 } // namespace goblin::storage

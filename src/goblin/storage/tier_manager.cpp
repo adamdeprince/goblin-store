@@ -141,7 +141,7 @@ Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, 
 
     // Free an overwritten object's old cached head before reserving a new one.
     if (const auto old = index_->lookup(digest); old && old->head.resident()) {
-        ram_.deallocate(old->head.block, old->head.offset, old->head.len);
+        free_head_region(old->head.block, old->head.offset, old->head.len);
         policy_->remove(digest);
     }
 
@@ -163,7 +163,7 @@ Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, 
             const auto victim = policy_->evict();
             if (!victim) break;
             if (const auto vm = index_->lookup(*victim); vm && vm->head.resident()) {
-                ram_.deallocate(vm->head.block, vm->head.offset, vm->head.len);
+                free_head_region(vm->head.block, vm->head.offset, vm->head.len);
                 index_->set_head(*victim, HeadLoc{});
             }
             region = ram_.allocate(static_cast<std::uint32_t>(head_len));
@@ -376,7 +376,7 @@ void TierManager::drop_object(const Digest& digest) {
     const auto meta = index_->lookup(digest);
     if (!meta) return;
     if (meta->head.resident()) {
-        ram_.deallocate(meta->head.block, meta->head.offset, meta->head.len);
+        free_head_region(meta->head.block, meta->head.offset, meta->head.len);
         policy_->remove(digest);
     }
     object_policy_->remove(digest);
@@ -409,6 +409,44 @@ void TierManager::touch(const Digest& digest) {
 std::size_t TierManager::head_resident() const {
     std::shared_lock<std::shared_mutex> lk(*mu_);
     return policy_->resident();
+}
+
+std::optional<TierManager::HeadPin> TierManager::pin_head(const Digest& digest) {
+    std::unique_lock<std::shared_mutex> lk(*mu_);
+    const auto meta = index_->lookup(digest);
+    if (!meta) return std::nullopt;
+    object_policy_->touch(digest); // the whole object was accessed
+    if (!meta->head.resident()) return std::nullopt;
+    policy_->touch(digest); // head-cache hit
+    auto& p = pins_[region_id(meta->head.block, meta->head.offset)];
+    p.len = meta->head.len;
+    ++p.refcount;
+    return HeadPin{meta->head.block, meta->head.offset, meta->head.len, true};
+}
+
+void TierManager::unpin_head(const HeadPin& pin) {
+    if (!pin.valid) return;
+    std::unique_lock<std::shared_mutex> lk(*mu_);
+    const auto it = pins_.find(region_id(pin.block, pin.offset));
+    if (it == pins_.end()) return;
+    if (--it->second.refcount == 0) {
+        if (it->second.orphaned) ram_.deallocate(pin.block, pin.offset, pin.len);
+        pins_.erase(it);
+    }
+}
+
+ByteView TierManager::pinned_bytes(const HeadPin& pin) const {
+    return ByteView(ram_.addr(pin.block, pin.offset), pin.len);
+}
+
+// Free a head's RAM, or — if a reader has it pinned — orphan it so the last unpin frees it.
+// Called under the storage lock (by begin_store / drop_object).
+void TierManager::free_head_region(unsigned block, std::uint32_t offset, std::uint32_t len) {
+    const auto it = pins_.find(region_id(block, offset));
+    if (it != pins_.end() && it->second.refcount > 0)
+        it->second.orphaned = true;
+    else
+        ram_.deallocate(block, offset, len);
 }
 
 } // namespace goblin::storage

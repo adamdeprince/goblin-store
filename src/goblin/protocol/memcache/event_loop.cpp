@@ -150,20 +150,27 @@ void EventLoop::process(Conn* c) {
                 c->out += kEnd; // miss
                 continue;
             }
-            auto rs = tm_.open_read(digest);
-            if (!rs) {
-                c->out += kEnd; // open failed -> treat as a miss
-                continue;
+            auto pin = tm_.pin_head(digest); // records the hit; pins the head if it's resident
+            const Size head_len = (pin && pin->valid) ? pin->len : 0;
+            if (meta->size > head_len) { // a disk tail remains -> need the files + an I/O buffer
+                auto rs = tm_.open_read(digest);
+                if (!rs) {
+                    if (pin) tm_.unpin_head(*pin);
+                    c->out += kEnd; // open failed -> treat as a miss
+                    continue;
+                }
+                auto buf = iobufs_.acquire();
+                if (!buf) {
+                    if (pin) tm_.unpin_head(*pin);
+                    close_conn(c); // out of I/O buffers (size the pool; backpressure is a TODO)
+                    return;
+                }
+                c->rs.emplace(std::move(*rs));
+                c->iobuf = *buf;
+                c->have_iobuf = true;
             }
-            auto buf = iobufs_.acquire();
-            if (!buf) {
-                close_conn(c); // out of I/O buffers (size the pool; backpressure queue is a TODO)
-                return;
-            }
-            tm_.touch(digest);
-            c->rs.emplace(std::move(*rs));
-            c->iobuf = *buf;
-            c->have_iobuf = true;
+            c->head_pin = pin.value_or(storage::TierManager::HeadPin{});
+            c->head_sent = 0;
             c->get_size = meta->size;
             c->get_pos = 0;
             c->out += value_header(key, meta->flags, meta->size);
@@ -261,6 +268,16 @@ void EventLoop::start_send_piece(Conn* c) {
         close_conn(c);
 }
 
+void EventLoop::start_send_head(Conn* c) {
+    if (c->closing) return;
+    const ByteView head = tm_.pinned_bytes(c->head_pin); // zero-copy: straight from the head pool
+    const ByteView rem(head.data() + c->head_sent, c->head_pin.len - c->head_sent);
+    if (r_.submit_send(c->fd, rem, tag(c, kSend)))
+        ++c->inflight;
+    else
+        close_conn(c);
+}
+
 void EventLoop::on_send(Conn* c, int res) {
     if (res <= 0) {
         close_conn(c);
@@ -276,6 +293,18 @@ void EventLoop::on_send(Conn* c, int res) {
         pump_get(c); // next piece, or trailer
         return;
     }
+    if (c->state == St::get_send_head) {
+        c->head_sent += static_cast<std::size_t>(res);
+        if (c->head_sent < c->head_pin.len) {
+            start_send_head(c); // short send -> remainder of the head
+            return;
+        }
+        const Size hl = c->head_pin.len;
+        unpin_if_held(c); // head fully sent -> release the pin
+        c->get_pos = hl;  // stream the disk tail (if any) after the head
+        pump_get(c);
+        return;
+    }
     // out-based send: idle response, GET header, or GET trailer
     c->out_sent += static_cast<std::size_t>(res);
     if (c->out_sent < c->out.size()) {
@@ -284,9 +313,15 @@ void EventLoop::on_send(Conn* c, int res) {
     }
     c->out.clear();
     c->out_sent = 0;
-    if (c->state == St::get_header)
-        pump_get(c); // header flushed -> stream the value
-    else if (c->state == St::get_trailer)
+    if (c->state == St::get_header) {
+        if (c->head_pin.valid) { // send the resident head zero-copy straight from the pool
+            c->head_sent = 0;
+            c->state = St::get_send_head;
+            start_send_head(c);
+        } else {
+            pump_get(c); // no resident head -> stream the value from disk
+        }
+    } else if (c->state == St::get_trailer)
         finish_get(c);
     else if (c->quit_after)
         close_conn(c);
@@ -301,8 +336,16 @@ void EventLoop::release_iobuf(Conn* c) {
     }
 }
 
+void EventLoop::unpin_if_held(Conn* c) {
+    if (c->head_pin.valid) {
+        tm_.unpin_head(c->head_pin);
+        c->head_pin.valid = false;
+    }
+}
+
 void EventLoop::finish_get(Conn* c) {
     release_iobuf(c);
+    unpin_if_held(c);
     c->rs.reset();
     c->state = St::idle;
     process(c); // resume any pipelined commands, or read more
@@ -310,6 +353,7 @@ void EventLoop::finish_get(Conn* c) {
 
 void EventLoop::abort_get(Conn* c) {
     release_iobuf(c);
+    unpin_if_held(c);
     c->rs.reset();
     close_conn(c);
 }
@@ -322,7 +366,8 @@ void EventLoop::close_conn(Conn* c) {
 
 void EventLoop::retire(Conn* c) {
     if (c->closing && c->inflight == 0) {
-        release_iobuf(c); // in case we closed mid-GET
+        release_iobuf(c);  // in case we closed mid-GET
+        unpin_if_held(c);  // release the head pin if a send was interrupted
         conns_.erase(c);
     }
 }

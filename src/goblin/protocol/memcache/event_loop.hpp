@@ -33,7 +33,7 @@ public:
     std::size_t live_conns() const noexcept { return conns_.size(); }
 
 private:
-    enum class St { idle, set_body, get_header, get_reading, get_send_piece, get_trailer };
+    enum class St { idle, set_body, get_header, get_send_head, get_reading, get_send_piece, get_trailer };
 
     struct Conn {
         int fd = -1;
@@ -56,6 +56,8 @@ private:
         std::size_t piece_sent = 0; // partial-send progress into the current piece
         unsigned pending_reads = 0; // disk segment reads outstanding for the current piece
         bool read_error = false;
+        storage::TierManager::HeadPin head_pin; // pinned RAM head for the zero-copy send (ADR-0018)
+        std::size_t head_sent = 0;              // partial-send progress into the head
 
         // SET ingest state:
         std::optional<storage::TierManager::StoreHandle> sh; // open writer for this SET
@@ -77,6 +79,8 @@ private:
     void on_recv(Conn*, int res);
     void on_send(Conn*, int res);
     void on_read(Conn*, int res);
+    void start_send_head(Conn*); // send the pinned head region zero-copy (partial-aware)
+    void unpin_if_held(Conn*);   // release the head pin if this conn holds one
     void process(Conn*);          // parse commands out of `in`, act, queue replies / start streams
     void pump_get(Conn*);         // produce + send the next value piece, or the trailer
     void start_send_piece(Conn*); // (re)send the current piece from iobuf (partial-aware)

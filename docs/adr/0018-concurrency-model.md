@@ -27,12 +27,14 @@ in-flight request. Throughput is the headline benchmark vs memcached extstore.
   each core thread (concurrency = thread count). The io_uring **multishot-recv async loop**
   (many connections multiplexed per core) is the throughput target and layers on top.
 
-## Deferred trade-offs (documented, not yet solved)
-- **Zero-copy head vs. concurrency.** A zero-copy head send holds a pointer into the head pool
-  across the (slow) network send; a concurrent eviction on another core could free it (UAF). v1
-  **copies the head** (under the lock) into the I/O buffer — correct, but gives up the zero-copy of
-  ADR-0017. **Head pinning** (refcount; eviction skips pinned heads) restores it — deferred.
-- **Atomic publish.** Stores overwrite the per-object files in place (`O_TRUNC`); a concurrent GET
+## Trade-offs
+- **Zero-copy head — RESOLVED (head pinning).** A GET pins the resident head (refcount, under the
+  lock), sends it zero-copy straight from the pool with no lock held, then unpins. An eviction or
+  overwrite of a pinned head **orphans** its RAM region (deferred free) until the last reader unpins,
+  so a late send can never touch freed memory. Head-resident GETs serve entirely from RAM and never
+  borrow an I/O buffer. (Pin/unpin are O(1) under the exclusive lock; a shared/atomic-refcount pin is
+  the scaling follow-up.)
+- **Atomic publish (deferred).** Stores overwrite the per-object files in place (`O_TRUNC`); a concurrent GET
   of the *same* key could read torn bytes. Index-gated visibility keeps distinct-key concurrency
   (the common case) correct; same-key store+read needs temp-file + atomic rename (ADR-0010) — deferred.
 - **Lock granularity.** One TierManager mutex is a contention point at high core counts; sharding

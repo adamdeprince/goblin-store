@@ -346,3 +346,63 @@ TEST("tier_manager: SSD object-count bound evicts whole objects; index stays cap
     }
     fs::remove_all(base);
 }
+
+TEST("tier_manager: a pinned head's RAM survives removal (deferred free)") {
+    if (!core::Reactor::available()) {
+        std::println("    (skipped: built without liburing)");
+        return;
+    }
+    auto reactor = core::Reactor::create();
+    if (!reactor) {
+        std::println("    (skipped: io_uring unavailable: {})", reactor.error().detail);
+        return;
+    }
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-pin-" + std::to_string(::getpid()))).string();
+    PoolConfig ssd, hdd;
+    ssd.stripe_unit = 64 * KiB;
+    for (const char* d : {"/s0", "/s1"}) ssd.dirs.push_back(base + d);
+    for (const auto& d : ssd.dirs) fs::create_directories(d);
+    TierSizes tiers;
+    tiers.ram_head = 16 * KiB;
+    tiers.ssd_prefix = 1 * MiB;
+    MemoryConfig mem;
+    mem.total_bytes = 8 * MiB;
+    mem.block_bytes = 1 * MiB;
+    mem.lock_memory = false;
+    EvictionConfig ev;
+    Index index;
+    auto tm = TierManager::open(tiers, mem, ev, ssd, hdd, index);
+    CHECK(tm.has_value());
+
+    std::string val(16 * 1024, '\0');
+    for (std::size_t i = 0; i < val.size(); ++i) val[i] = static_cast<char>((i * 41 + 7) & 0xFF);
+    const auto digest = hash_key("pinme");
+    CHECK(tm->store(digest, ByteView(reinterpret_cast<const std::byte*>(val.data()), val.size()), 0)
+              .has_value());
+    CHECK(index.lookup(digest) && index.lookup(digest)->head.resident());
+
+    auto pin = tm->pin_head(digest);
+    CHECK(pin.has_value() && pin->valid);
+    if (!pin) { fs::remove_all(base); return; }
+    auto as_str = [](ByteView b) {
+        return std::string(reinterpret_cast<const char*>(b.data()), b.size());
+    };
+    CHECK(as_str(tm->pinned_bytes(*pin)) == val); // the pinned head matches the stored value
+
+    // Remove while pinned: the head RAM is orphaned (not freed), the index entry is erased.
+    CHECK(tm->remove(digest));
+    CHECK(!index.lookup(digest).has_value());
+
+    // Allocate other heads — the orphaned region must NOT be reused while pinned.
+    for (int i = 0; i < 8; ++i) {
+        const std::string o(16 * 1024, static_cast<char>('a' + i));
+        CHECK(tm->store(hash_key("o" + std::to_string(i)),
+                        ByteView(reinterpret_cast<const std::byte*>(o.data()), o.size()), 0)
+                  .has_value());
+    }
+    CHECK(as_str(tm->pinned_bytes(*pin)) == val); // still intact: zero-copy stayed valid
+
+    tm->unpin_head(*pin); // frees the orphaned region (ASan: no leak, no double-free)
+    fs::remove_all(base);
+}
