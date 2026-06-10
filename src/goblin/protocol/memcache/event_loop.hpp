@@ -1,0 +1,98 @@
+// Per-core async event loop over one io_uring ring (ADR-0002). Owns its connections; dispatches
+// accept/recv/send/read completions by tagged user_data; frees a connection only once its in-flight
+// op count reaches zero (so a late completion can never touch freed memory). GET streams head-first
+// through TierManager::ReadStream: header -> per-piece plan() -> async disk segment reads -> piece
+// send -> trailer, borrowing one I/O-pool buffer for the stream. SET ingest lands in Step 4.
+#pragma once
+
+#include "goblin/core/buffer_pool.hpp"
+#include "goblin/core/reactor.hpp"
+#include "goblin/storage/index.hpp"
+#include "goblin/storage/tier_manager.hpp"
+
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace goblin::memcache {
+
+class EventLoop {
+public:
+    EventLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm, storage::Index& index,
+              core::IoBufferPool& iobufs);
+
+    void run();           // arm accept, then loop until stop()
+    void run_once();      // one submit -> wait(timeout) -> reap -> dispatch (steppable, tests)
+    void stop() noexcept; // ask run() to exit (thread-safe)
+    std::size_t live_conns() const noexcept { return conns_.size(); }
+
+private:
+    enum class St { idle, set_body, get_header, get_reading, get_send_piece, get_trailer };
+
+    struct Conn {
+        int fd = -1;
+        unsigned inflight = 0;   // outstanding SQEs referencing this Conn
+        bool closing = false;    // freed once inflight hits 0
+        bool quit_after = false; // close once the pending response is sent
+        St state = St::idle;
+        std::array<std::byte, 16 * 1024> rbuf;
+        std::string in;           // accumulated unparsed request bytes
+        std::string out;          // status line / VALUE header / trailer pending send
+        std::size_t out_sent = 0; // partial-send progress into out
+
+        // GET streaming state:
+        std::optional<storage::TierManager::ReadStream> rs; // open object files for this GET
+        MutBytes iobuf;             // borrowed I/O-pool buffer (value pieces land here)
+        bool have_iobuf = false;
+        Size get_size = 0;          // total value bytes
+        Size get_pos = 0;           // next byte to stream
+        Size piece_len = 0;         // bytes in the current piece
+        std::size_t piece_sent = 0; // partial-send progress into the current piece
+        unsigned pending_reads = 0; // disk segment reads outstanding for the current piece
+        bool read_error = false;
+
+        // SET ingest state:
+        std::optional<storage::TierManager::StoreHandle> sh; // open writer for this SET
+        Size set_remaining = 0;     // body bytes still to receive
+        std::uint32_t set_flags = 0;
+        bool set_noreply = false;
+        bool set_reject = false; // admission failed (add exists / replace missing) -> drain + NOT_STORED
+        bool set_failed = false; // a disk write failed -> don't commit
+    };
+
+    static constexpr std::uint64_t kAccept = 0; // user_data for the listener accept (no Conn)
+    enum Op : std::uint64_t { kRecv = 1, kSend = 2, kRead = 3 };
+    static std::uint64_t tag(Conn* c, Op op) { return reinterpret_cast<std::uint64_t>(c) | op; }
+
+    void arm_accept();
+    void on_accept(int res);
+    void start_recv(Conn*);
+    void start_send(Conn*);
+    void on_recv(Conn*, int res);
+    void on_send(Conn*, int res);
+    void on_read(Conn*, int res);
+    void process(Conn*);          // parse commands out of `in`, act, queue replies / start streams
+    void pump_get(Conn*);         // produce + send the next value piece, or the trailer
+    void start_send_piece(Conn*); // (re)send the current piece from iobuf (partial-aware)
+    void finish_get(Conn*);       // GET fully sent -> release buffers, resume parsing
+    void abort_get(Conn*);        // error mid-GET -> release buffers, close
+    void release_iobuf(Conn*);
+    void close_conn(Conn*);
+    void retire(Conn*);
+
+    core::Reactor& r_;
+    int lfd_;
+    storage::TierManager& tm_;
+    storage::Index& index_;
+    core::IoBufferPool& iobufs_;
+    std::atomic<bool> stop_{false};
+    std::unordered_map<Conn*, std::unique_ptr<Conn>> conns_;
+};
+
+} // namespace goblin::memcache

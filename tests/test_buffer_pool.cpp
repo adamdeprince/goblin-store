@@ -1,0 +1,151 @@
+#include "mini_test.hpp"
+
+#include "goblin/core/buffer_pool.hpp"
+
+#include <cstdint>
+
+using namespace goblin;
+using namespace goblin::core;
+
+TEST("buddy: split allocates distinct sub-blocks; used() tracks demand") {
+    BuddyAllocator b(64 * KiB, 4 * KiB);
+    const auto a0 = b.allocate(4 * KiB);
+    const auto a1 = b.allocate(4 * KiB);
+    CHECK(a0.has_value());
+    CHECK(a1.has_value());
+    CHECK(*a0 != *a1);
+    CHECK_EQ(b.used(), Size(8 * KiB));
+}
+
+TEST("buddy: whole-arena allocation, then exhausted") {
+    BuddyAllocator b(64 * KiB, 4 * KiB);
+    const auto big = b.allocate(64 * KiB);
+    CHECK(big.has_value());
+    CHECK_EQ(*big, Offset(0));
+    CHECK(!b.allocate(4 * KiB).has_value());
+}
+
+TEST("buddy: rounds up to a power of two") {
+    BuddyAllocator b(64 * KiB, 4 * KiB);
+    CHECK(b.allocate(5 * KiB).has_value());
+    CHECK_EQ(b.used(), Size(8 * KiB)); // 5 KiB -> 8 KiB block
+}
+
+TEST("buddy: free coalesces buddies back to the whole arena") {
+    BuddyAllocator b(64 * KiB, 4 * KiB);
+    const auto a0 = b.allocate(32 * KiB);
+    const auto a1 = b.allocate(32 * KiB);
+    CHECK(a0.has_value() && a1.has_value());
+    CHECK(!b.allocate(4 * KiB).has_value()); // full
+    b.deallocate(*a0, 32 * KiB);
+    b.deallocate(*a1, 32 * KiB);
+    CHECK_EQ(b.used(), Size(0));
+    const auto whole = b.allocate(64 * KiB); // merged back into one block
+    CHECK(whole.has_value());
+    CHECK_EQ(*whole, Offset(0));
+}
+
+TEST("buddy: zero and too-big allocations fail") {
+    BuddyAllocator b(64 * KiB, 4 * KiB);
+    CHECK(!b.allocate(0).has_value());
+    CHECK(!b.allocate(128 * KiB).has_value());
+}
+
+TEST("block_pool: acquire distinct, O_DIRECT-aligned blocks until exhausted") {
+    auto pool = BlockPool::create(64 * KiB, 4, /*lock_memory=*/false);
+    CHECK(pool.has_value());
+    auto& p = *pool;
+    CHECK_EQ(p.num_blocks(), Size(4));
+    CHECK_EQ(p.free_blocks(), Size(4));
+
+    bool seen[4] = {false, false, false, false};
+    for (int i = 0; i < 4; ++i) {
+        const auto idx = p.acquire();
+        CHECK(idx.has_value());
+        CHECK(*idx < 4u);
+        seen[*idx] = true;
+        CHECK_EQ(reinterpret_cast<std::uintptr_t>(p.block_data(*idx)) % kDeviceBlock,
+                 std::uintptr_t(0));
+    }
+    CHECK(seen[0] && seen[1] && seen[2] && seen[3]);
+    CHECK(!p.acquire().has_value());
+    CHECK_EQ(p.free_blocks(), Size(0));
+}
+
+TEST("block_pool: release returns a block to the pool") {
+    auto pool = BlockPool::create(64 * KiB, 2, false);
+    CHECK(pool.has_value());
+    auto& p = *pool;
+    const auto a = p.acquire();
+    const auto b = p.acquire();
+    CHECK(a && b);
+    CHECK(!p.acquire().has_value());
+    p.release(*a);
+    CHECK_EQ(p.free_blocks(), Size(1));
+    CHECK(p.acquire().has_value());
+}
+
+TEST("block_pool: rejects bad geometry") {
+    CHECK(!BlockPool::create(1000, 4, false).has_value());   // not a power of two
+    CHECK(!BlockPool::create(1 * KiB, 4, false).has_value()); // below the 4 KiB device block
+    CHECK(!BlockPool::create(64 * KiB, 0, false).has_value()); // zero blocks
+}
+
+TEST("buffer_pool: allocate distinct usable regions; write/read; addr matches") {
+    auto poolr = BufferPool::create(/*total=*/256 * KiB, /*block=*/64 * KiB, /*min=*/4 * KiB, false);
+    CHECK(poolr.has_value());
+    auto& pool = *poolr;
+
+    const auto a = pool.allocate(4 * KiB);
+    const auto b = pool.allocate(8 * KiB);
+    CHECK(a.has_value());
+    CHECK(b.has_value());
+    CHECK(a->data != b->data);
+    CHECK_EQ(pool.addr(a->block, a->offset), a->data);
+
+    for (std::uint32_t i = 0; i < a->len; ++i) a->data[i] = std::byte{0xAB};
+    bool ok = true;
+    for (std::uint32_t i = 0; i < a->len; ++i)
+        if (a->data[i] != std::byte{0xAB}) ok = false;
+    CHECK(ok);
+}
+
+TEST("buffer_pool: too-big alloc fails; exhaustion returns nullopt; free reuses the block") {
+    auto poolr = BufferPool::create(128 * KiB, 64 * KiB, 4 * KiB, false); // 2 blocks
+    CHECK(poolr.has_value());
+    auto& pool = *poolr;
+
+    CHECK(!pool.allocate(128 * KiB).has_value()); // larger than a block
+
+    const auto a = pool.allocate(64 * KiB); // fills block 0's arena
+    const auto b = pool.allocate(64 * KiB); // fills block 1's arena
+    CHECK(a.has_value());
+    CHECK(b.has_value());
+    CHECK(!pool.allocate(4 * KiB).has_value()); // both blocks in use -> exhausted
+
+    pool.deallocate(a->block, a->offset, a->len); // empties block 0 -> returned to pool
+    CHECK(pool.allocate(64 * KiB).has_value());   // reused
+}
+
+TEST("io_buffer_pool: fixed chunks, distinct + usable, exhaustion, release reuses") {
+    auto pr = IoBufferPool::create(/*chunk=*/64 * KiB, /*count=*/3, false);
+    CHECK(pr.has_value());
+    auto& p = *pr;
+    CHECK_EQ(p.chunk_bytes(), Size(64 * KiB));
+
+    const auto a = p.acquire();
+    const auto b = p.acquire();
+    const auto c = p.acquire();
+    CHECK(a.has_value());
+    CHECK(b.has_value());
+    CHECK(c.has_value());
+    CHECK(!p.acquire().has_value()); // only 3 chunks
+    CHECK_EQ(a->size(), std::size_t(64 * KiB));
+    CHECK(a->data() != b->data());
+
+    (*a)[0] = std::byte{0x11}; // usable
+    CHECK(std::to_integer<int>((*a)[0]) == 0x11);
+
+    p.release(*a);
+    CHECK(p.acquire().has_value()); // reused
+}
