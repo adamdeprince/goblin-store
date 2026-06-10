@@ -236,7 +236,11 @@ void EventLoop::pump_get(Conn* c) {
     c->read_error = false;
     c->state = St::get_reading;
     for (const auto& s : plan.segs) {
-        if (!r_.submit_read(s.fd, s.file_off, c->iobuf.subspan(s.out_off, s.len), tag(c, kRead))) {
+        // O_DIRECT (ADR-0011): the read length must be a device-block multiple. Round up into the
+        // (page-aligned, io_chunk-sized) I/O buffer and serve only piece_len bytes; offsets are
+        // already 4 KiB-aligned (pieces start on 4 KiB boundaries, segments at stripe boundaries).
+        const Size rlen = std::min<Size>(align_up(s.len, kDeviceBlock), c->iobuf.size() - s.out_off);
+        if (!r_.submit_read(s.fd, s.file_off, c->iobuf.subspan(s.out_off, rlen), tag(c, kRead))) {
             abort_get(c);
             return;
         }

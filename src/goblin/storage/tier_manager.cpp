@@ -265,10 +265,9 @@ Result<std::size_t> TierManager::read(core::Reactor& reactor, const Digest& dige
 
     const ObjectLayout layout = compute_layout(meta->size, tiers_, three_layer());
     const Size want = std::min<Size>(out.size(), meta->size - offset);
-    std::size_t total = 0;
 
-    // RAM head portion: copied out under the lock so a concurrent eviction can't free it mid-read
-    // (zero-copy would need pinning — ADR-0018). Residency is re-checked under the lock.
+    // RAM head portion: copied out under the lock so a concurrent eviction can't free it mid-read.
+    // (The hot GET path sends the head zero-copy via pinning, ADR-0018; this sync utility copies.)
     Size ram_end = 0;
     {
         std::shared_lock<std::shared_mutex> lk(*mu_); // read-only: shares with other readers
@@ -277,34 +276,36 @@ Result<std::size_t> TierManager::read(core::Reactor& reactor, const Digest& dige
             if (offset < ram_end) {
                 const Size n = std::min<Size>(offset + want, ram_end) - offset;
                 std::memcpy(out.data(), ram_.addr(m->head.block, m->head.offset) + offset, n);
-                total += static_cast<std::size_t>(n);
             }
         }
     }
 
     // SSD + HDD portions stream from disk on the caller's reactor — no lock held (ADR-0018).
+    // O_DIRECT (ADR-0011): the caller's buffer is page-aligned and a device-block multiple in size,
+    // so each portion reads straight into it with a block-aligned length — no bounce. The final
+    // block may read a few padding bytes into the buffer's aligned tail, which we never serve.
     const Size ssd_begin = std::max<Size>(offset, ram_end);
     const Size ssd_stop = std::min<Size>(offset + want, layout.ssd_bytes);
     if (ssd_begin < ssd_stop) {
         const Size len = ssd_stop - ssd_begin;
+        const Size room = std::min<Size>(align_up(len, kDeviceBlock), out.size() - (ssd_begin - offset));
         auto files = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/false);
         if (!files) return std::unexpected(files.error());
         auto n = striped_read(reactor, ssd_.drives(), digest.bucket(), files->fds(), ssd_begin,
-                              out.subspan(ssd_begin - offset, len));
+                              out.subspan(ssd_begin - offset, room));
         if (!n) return std::unexpected(n.error());
-        total += *n;
     }
     if (three_layer() && offset + want > layout.ssd_bytes) {
         const Size begin = std::max<Size>(offset, layout.ssd_bytes);
         const Size len = (offset + want) - begin;
+        const Size room = std::min<Size>(align_up(len, kDeviceBlock), out.size() - (begin - offset));
         auto files = hdd_->open_object(digest, layout.hdd_bytes, /*create=*/false);
         if (!files) return std::unexpected(files.error());
         auto n = striped_read(reactor, hdd_->drives(), digest.bucket(), files->fds(),
-                              begin - layout.ssd_bytes, out.subspan(begin - offset, len));
+                              begin - layout.ssd_bytes, out.subspan(begin - offset, room));
         if (!n) return std::unexpected(n.error());
-        total += *n;
     }
-    return total;
+    return static_cast<std::size_t>(want);
 }
 
 static void add_drive_segs(TierManager::ReadStream::Plan& p, const DrivePool& dp,
