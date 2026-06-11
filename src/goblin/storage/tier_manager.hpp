@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <atomic>
 #include <shared_mutex>
 #include <unordered_map>
 #include <span>
@@ -54,9 +55,14 @@ public:
     Pool& operator=(const Pool&) = delete;
 
     const DrivePool& drives() const noexcept { return drives_; }
-    // Open the per-object files for `digest` covering `tier_bytes` (create => O_RDWR|O_CREAT).
-    Result<ObjectFiles> open_object(const Digest& digest, Size tier_bytes, bool create) const;
-    void unlink_object(const Digest& digest, Size tier_bytes) const; // remove the per-object files
+    // Open the per-object files for `digest` covering `tier_bytes`. A non-empty `name_suffix`
+    // (e.g. ".tmp.N") opens copy-on-write scratch files; "" opens the live files (ADR-0018).
+    Result<ObjectFiles> open_object(const Digest& digest, Size tier_bytes, bool create,
+                                    std::string_view name_suffix = "") const;
+    // Atomically rename the `name_suffix` scratch files over the live names (per-drive rename()).
+    Status publish(const Digest& digest, Size tier_bytes, std::string_view name_suffix) const;
+    void unlink_object(const Digest& digest, Size tier_bytes,
+                       std::string_view name_suffix = "") const; // remove the per-object files
 
 private:
     Pool(DrivePool dp, std::vector<int> dirfds) : drives_(dp), dirfds_(std::move(dirfds)) {}
@@ -88,13 +94,16 @@ public:
     private:
         friend class TierManager;
         StoreHandle(TierManager* tm, Digest digest, ObjectLayout layout, ObjectFiles ssd,
-                    std::optional<ObjectFiles> hdd, std::optional<core::BufferPool::Region> head);
+                    std::optional<ObjectFiles> hdd, std::optional<core::BufferPool::Region> head,
+                    std::string suffix);
+        void abort_uncommitted(); // free the reserved head + unlink scratch files (never published)
         TierManager* tm_;
         Digest digest_;
         ObjectLayout layout_;
         ObjectFiles ssd_;
         std::optional<ObjectFiles> hdd_;
         std::optional<core::BufferPool::Region> head_;
+        std::string suffix_; // CoW scratch-file suffix; renamed onto the live names at commit
         Offset off_ = 0;
         bool committed_ = false;
     };
@@ -153,13 +162,25 @@ public:
     };
     Result<ReadStream> open_read(const Digest&);
 
+    // A consistent read snapshot (ADR-0018): the object's metadata, a pinned RAM head (if resident),
+    // and the open disk files (if a tail remains) -- all captured under one lock so a concurrent
+    // copy-on-write replace can't split head from body. The open fds pin the old inodes.
+    struct Snapshot {
+        ObjectMeta meta;
+        HeadPin pin;                  // pin.valid == false when the head isn't resident
+        std::optional<ReadStream> rs; // present iff size > head_len (a disk tail to stream)
+    };
+    std::optional<Snapshot> open_snapshot(const Digest&); // nullopt on miss / open failure
+
 private:
     TierManager(TierSizes t, core::BufferPool ram, std::unique_ptr<EvictionPolicy> head_policy,
                 std::unique_ptr<EvictionPolicy> object_policy, std::uint64_t max_objects, Pool ssd,
                 std::optional<Pool> hdd, Index& ix)
         : tiers_(t), ram_(std::move(ram)), policy_(std::move(head_policy)),
           object_policy_(std::move(object_policy)), max_objects_(max_objects), ssd_(std::move(ssd)),
-          hdd_(std::move(hdd)), index_(&ix), mu_(std::make_unique<std::shared_mutex>()) {}
+          hdd_(std::move(hdd)), index_(&ix),
+          store_seq_(std::make_unique<std::atomic<std::uint64_t>>(0)),
+          mu_(std::make_unique<std::shared_mutex>()) {}
     void drop_object(const Digest&); // free head + unlink files + erase from index & policies
     void enforce_object_bound();     // evict whole objects while over the count limit
     void free_head_region(unsigned block, std::uint32_t offset, std::uint32_t len); // free or orphan
@@ -175,6 +196,7 @@ private:
     Pool ssd_;
     std::optional<Pool> hdd_;
     Index* index_;
+    std::unique_ptr<std::atomic<std::uint64_t>> store_seq_; // unique CoW scratch-file suffixes
     std::unique_ptr<std::shared_mutex> mu_; // rwlock: shared for reads, exclusive for writes (ADR-0018)
     struct RegionPin {
         std::uint32_t len = 0;

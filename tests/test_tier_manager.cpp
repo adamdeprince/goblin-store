@@ -6,10 +6,13 @@
 #include "goblin/storage/tier_manager.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <print>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -404,5 +407,68 @@ TEST("tier_manager: a pinned head's RAM survives removal (deferred free)") {
     CHECK(as_str(tm->pinned_bytes(*pin)) == val); // still intact: zero-copy stayed valid
 
     tm->unpin_head(*pin); // frees the orphaned region (ASan: no leak, no double-free)
+    fs::remove_all(base);
+}
+
+TEST("tier_manager: concurrent replace + read never sees a torn value (atomic publish)") {
+    if (!core::Reactor::available()) {
+        std::println("    (skipped: built without liburing)");
+        return;
+    }
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-cow-" + std::to_string(::getpid()))).string();
+    PoolConfig ssd, hdd;
+    ssd.stripe_unit = 64 * KiB;
+    for (const char* d : {"/s0", "/s1"}) ssd.dirs.push_back(base + d);
+    for (const auto& d : ssd.dirs) fs::create_directories(d);
+    TierSizes tiers;
+    tiers.ram_head = 16 * KiB;
+    tiers.ssd_prefix = 1 * MiB;
+    MemoryConfig mem;
+    mem.total_bytes = 32 * MiB;
+    mem.block_bytes = 1 * MiB;
+    mem.lock_memory = false;
+    EvictionConfig ev;
+    Index index;
+    auto tm = TierManager::open(tiers, mem, ev, ssd, hdd, index);
+    CHECK(tm.has_value());
+
+    constexpr Size SZ = 64 * 1024; // 16 KiB head (RAM) + 48 KiB SSD -> spans both tiers
+    const std::string A(SZ, '\xAA'), B(SZ, '\xBB');
+    const auto digest = hash_key("k");
+    auto store = [&](const std::string& v) {
+        return tm->store(digest, ByteView(reinterpret_cast<const std::byte*>(v.data()), v.size()), 0)
+            .has_value();
+    };
+    CHECK(store(A)); // seed
+
+    std::atomic<bool> stop{false};
+    std::atomic<long> torn{0}, reads{0};
+    std::thread writer([&] {
+        for (int i = 0; i < 4000 && !stop.load(); ++i) store((i & 1) ? B : A); // replace in place
+        stop.store(true);
+    });
+    auto reader = [&] {
+        auto r = core::Reactor::create();
+        if (!r) return;
+        void* p = std::aligned_alloc(kDeviceBlock, SZ); // page-aligned, 4 KiB-multiple
+        auto* buf = static_cast<std::byte*>(p);
+        while (!stop.load()) {
+            auto n = tm->read(*r, digest, 0, MutBytes(buf, SZ));
+            if (!n || *n != SZ) continue;
+            const std::byte v0 = buf[0]; // a consistent snapshot is all-A or all-B
+            const bool ok = (v0 == std::byte{0xAA} || v0 == std::byte{0xBB}) &&
+                            std::all_of(buf, buf + SZ, [v0](std::byte b) { return b == v0; });
+            if (!ok) torn.fetch_add(1);
+            reads.fetch_add(1);
+        }
+        std::free(p);
+    };
+    std::thread r1(reader), r2(reader);
+    writer.join();
+    r1.join();
+    r2.join();
+    std::println("    [cow] reads={} torn={}", reads.load(), torn.load());
+    CHECK(torn.load() == 0); // copy-on-write publish: readers see old-or-new, never a mix
     fs::remove_all(base);
 }

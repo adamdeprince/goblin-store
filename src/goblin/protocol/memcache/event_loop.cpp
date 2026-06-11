@@ -145,35 +145,30 @@ void EventLoop::process(Conn* c) {
             if (!noreply) c->out += (erased ? kDeleted : kNotFound);
         } else if (verb == Verb::get || verb == Verb::gets) {
             const auto digest = crypto::hash_key(key);
-            const auto meta = index_.lookup(digest);
-            if (!meta) {
-                c->out += kEnd; // miss
+            // One consistent snapshot (ADR-0018): metadata + pinned head + open files, captured
+            // under one lock so a concurrent copy-on-write replace can't split head from body.
+            auto snap = tm_.open_snapshot(digest);
+            if (!snap) {
+                c->out += kEnd; // miss (or files vanished)
                 continue;
             }
-            auto pin = tm_.pin_head(digest); // records the hit; pins the head if it's resident
-            const Size head_len = (pin && pin->valid) ? pin->len : 0;
-            if (meta->size > head_len) { // a disk tail remains -> need the files + an I/O buffer
-                auto rs = tm_.open_read(digest);
-                if (!rs) {
-                    if (pin) tm_.unpin_head(*pin);
-                    c->out += kEnd; // open failed -> treat as a miss
-                    continue;
-                }
+            const Size head_len = snap->pin.valid ? snap->pin.len : 0;
+            if (snap->meta.size > head_len) { // a disk tail remains -> need an I/O buffer
                 auto buf = iobufs_.acquire();
                 if (!buf) {
-                    if (pin) tm_.unpin_head(*pin);
+                    if (snap->pin.valid) tm_.unpin_head(snap->pin);
                     close_conn(c); // out of I/O buffers (size the pool; backpressure is a TODO)
                     return;
                 }
-                c->rs.emplace(std::move(*rs));
+                c->rs.emplace(std::move(*snap->rs));
                 c->iobuf = *buf;
                 c->have_iobuf = true;
             }
-            c->head_pin = pin.value_or(storage::TierManager::HeadPin{});
+            c->head_pin = snap->pin;
             c->head_sent = 0;
-            c->get_size = meta->size;
+            c->get_size = snap->meta.size;
             c->get_pos = 0;
-            c->out += value_header(key, meta->flags, meta->size);
+            c->out += value_header(key, snap->meta.flags, snap->meta.size);
             c->state = St::get_header;
             break; // stream the value before parsing any further command
         } else if (verb == Verb::set || verb == Verb::add || verb == Verb::replace) {
