@@ -21,6 +21,7 @@ enum class Errc : std::uint16_t {
     io_error,
     unsupported,
     backpressure_timeout, // BLOCK-mode write waited too long for space
+    would_block,          // transient: a bounded resource (write-staging buffer) is busy; retry (ADR-0011/0016)
 };
 
 std::string_view to_string(Errc) noexcept;

@@ -188,7 +188,9 @@ int main(int argc, char** argv) {
     }
 
     storage::Index index;
-    auto tm = storage::TierManager::open(cfg.tiers, cfg.memory, cfg.eviction, cfg.ssd, cfg.hdd, index);
+    auto tm = storage::TierManager::open(cfg.tiers, cfg.memory, cfg.eviction, cfg.ssd, cfg.hdd, index,
+                                         cfg.io_chunk_bytes, cfg.io_buffers,
+                                         cfg.cache_bypass == CacheBypass::o_direct);
     if (!tm) {
         std::println(stderr, "startup: {}", tm.error().detail);
         return 1;

@@ -15,6 +15,7 @@ std::string_view to_string(Errc c) noexcept {
         case Errc::io_error:             return "io_error";
         case Errc::unsupported:          return "unsupported";
         case Errc::backpressure_timeout: return "backpressure_timeout";
+        case Errc::would_block:          return "would_block";
     }
     return "unknown";
 }

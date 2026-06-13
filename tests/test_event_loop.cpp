@@ -120,7 +120,8 @@ static std::string pattern(int seed, std::size_t n) {
     return s;
 }
 
-static Result<TierManager> open_tm(const std::string& base, Index& index, bool three_layer) {
+static Result<TierManager> open_tm(const std::string& base, Index& index, bool three_layer,
+                                   unsigned write_buffers = 8) {
     PoolConfig ssd, hdd;
     ssd.stripe_unit = 64 * KiB;
     ssd.dirs = {base + "/s0", base + "/s1"};
@@ -138,7 +139,7 @@ static Result<TierManager> open_tm(const std::string& base, Index& index, bool t
     mem.block_bytes = 1 * MiB;
     mem.lock_memory = false;
     EvictionConfig ev;
-    return TierManager::open(tiers, mem, ev, ssd, hdd, index);
+    return TierManager::open(tiers, mem, ev, ssd, hdd, index, 256 * KiB, write_buffers, false);
 }
 
 static bool store_obj(TierManager& tm, const std::string& key, const std::string& val) {
@@ -579,6 +580,50 @@ TEST("event loop: two loops share storage; 32 concurrent SET+GET round-trips (TS
     t1.join();
     ::close(lfd0);
     ::close(lfd1);
+    fs::remove_all(base);
+    CHECK_EQ(good.load(), kN);
+}
+
+TEST("event loop: SET backpressure — one staging buffer, many concurrent SETs all stored") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("setbp");
+    Index index;
+    // One write-staging buffer: with many concurrent SETs, all but one must park on would_block and
+    // resume when a buffer frees (ADR-0011 backpressure) — none may be dropped or NOT_STORED.
+    auto tm = open_tm(base, index, false, /*write_buffers=*/1);
+    auto io = make_iopool();
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    EventLoop loop(*rc, lfd, *tm, index, *io);
+    std::thread th([&] { loop.run(); });
+
+    constexpr int kN = 16;
+    std::atomic<int> good{0};
+    std::vector<std::thread> clients;
+    for (int i = 0; i < kN; ++i) {
+        clients.emplace_back([&, i] {
+            const int c = client_connect(port);
+            if (c < 0) return;
+            const std::string key = "bp" + std::to_string(i);
+            // Body > the 16 KiB recv buffer, so the holder keeps the lone staging buffer across
+            // several recvs — guaranteeing the other connections' SETs park while it streams.
+            const std::string v = pattern(2000 + i, 64 * 1024 + static_cast<std::size_t>(i) * 128);
+            const bool stored = set_value(c, key, v) == "STORED\r\n";
+            const auto g = get_value(c, key);
+            if (stored && g && *g == v) good.fetch_add(1);
+            ::close(c);
+        });
+    }
+    for (auto& t : clients) t.join();
+    loop.stop();
+    th.join();
+    ::close(lfd);
     fs::remove_all(base);
     CHECK_EQ(good.load(), kN);
 }

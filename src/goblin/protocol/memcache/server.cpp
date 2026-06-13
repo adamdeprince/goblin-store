@@ -93,7 +93,15 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
                                  (verb == Verb::replace && !index.contains(digest)));
             std::optional<storage::TierManager::StoreHandle> handle;
             if (admit) {
-                if (auto h = tm.begin_store(digest, nbytes)) handle.emplace(std::move(*h));
+                // Blocking-mode backpressure (ADR-0011/0016): if the write-staging pool is exhausted,
+                // retry rather than fail. A spinning worker holds no buffer, so a peer mid-SET will
+                // commit and free one -> forward progress (size io_buffers >= cores to never spin).
+                for (;;) {
+                    auto h = tm.begin_store(digest, nbytes);
+                    if (h) { handle.emplace(std::move(*h)); break; }
+                    if (h.error().code != Errc::would_block) break; // real failure -> NOT_STORED
+                    std::this_thread::yield();
+                }
             }
             bool write_ok = true;
 

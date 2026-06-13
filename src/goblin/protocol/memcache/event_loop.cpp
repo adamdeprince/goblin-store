@@ -44,6 +44,9 @@ void EventLoop::run_once() {
             on_read(c, res);
         retire(c);
     }
+    // After dispatch (incl. any SET commits that freed buffers this tick), wake parked SETs. Also
+    // runs on idle timeout ticks, which is how a buffer freed on another loop gets picked up.
+    if (!set_waiters_.empty()) drain_set_waiters();
 }
 
 void EventLoop::arm_accept() { r_.submit_accept(lfd_, kAccept); }
@@ -173,21 +176,30 @@ void EventLoop::process(Conn* c) {
             break; // stream the value before parsing any further command
         } else if (verb == Verb::set || verb == Verb::add || verb == Verb::replace) {
             const auto digest = crypto::hash_key(key);
-            bool reject = (verb == Verb::add && index_.contains(digest)) ||
-                          (verb == Verb::replace && !index_.contains(digest));
+            const bool reject = (verb == Verb::add && index_.contains(digest)) ||
+                                (verb == Verb::replace && !index_.contains(digest));
             c->sh.reset();
-            if (!reject) {
-                auto h = tm_.begin_store(digest, nbytes);
-                if (h)
-                    c->sh.emplace(std::move(*h));
-                else
-                    reject = true; // couldn't open the writer -> NOT_STORED
-            }
+            c->set_digest = digest;
             c->set_remaining = nbytes;
             c->set_flags = flags;
             c->set_noreply = noreply;
             c->set_reject = reject;
             c->set_failed = false;
+            if (!reject) {
+                auto h = tm_.begin_store(digest, nbytes);
+                if (h) {
+                    c->sh.emplace(std::move(*h));
+                } else if (h.error().code == Errc::would_block) {
+                    // Write-staging pool exhausted (ADR-0011/0016): park without posting a recv, so
+                    // the kernel's socket buffer fills and TCP backpressures this client. The body is
+                    // NOT drained into RAM. drain_set_waiters() retries begin_store once a buffer frees.
+                    c->state = St::set_wait;
+                    set_waiters_.push_back(c);
+                    return;
+                } else {
+                    c->set_reject = true; // real open failure -> NOT_STORED
+                }
+            }
             c->state = St::set_body;
             continue; // consume the body in the set_body branch
         } else {
@@ -204,6 +216,30 @@ void EventLoop::process(Conn* c) {
         close_conn(c);
     else
         start_recv(c);
+}
+
+// Retry SETs parked on write-staging exhaustion. Runs every run_once tick: a SET that commits on
+// THIS loop frees a buffer that's picked up the same tick; a buffer freed on ANOTHER loop is caught
+// on the next ~200 ms wait (no cross-thread wakeup). FIFO; stops at the first conn that still can't
+// get a buffer, since the pool is then empty.
+void EventLoop::drain_set_waiters() {
+    while (!set_waiters_.empty()) {
+        Conn* c = set_waiters_.front();
+        if (c->closing) { // parked conns have no in-flight op, but stay defensive
+            set_waiters_.pop_front();
+            continue;
+        }
+        auto h = tm_.begin_store(c->set_digest, c->set_remaining); // set_remaining == full nbytes here
+        if (!h) {
+            if (h.error().code == Errc::would_block) return; // still no buffer -> retry next tick
+            c->set_reject = true;                            // real open failure -> NOT_STORED
+        } else {
+            c->sh.emplace(std::move(*h));
+        }
+        set_waiters_.pop_front();
+        c->state = St::set_body;
+        process(c); // drive the body already buffered in `in`, then resume recv (or reply if rejected)
+    }
 }
 
 void EventLoop::pump_get(Conn* c) {

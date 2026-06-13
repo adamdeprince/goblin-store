@@ -47,7 +47,8 @@ private:
 // A storage pool: a DrivePool plus one open O_DIRECTORY fd per drive dir (ADR-0009 openat path).
 class Pool {
 public:
-    static Result<Pool> open(const std::vector<std::string>& dirs, Size stripe_unit);
+    static Result<Pool> open(const std::vector<std::string>& dirs, Size stripe_unit,
+                             bool direct_io = false);
     ~Pool();
     Pool(Pool&&) noexcept;
     Pool& operator=(Pool&&) noexcept;
@@ -65,15 +66,19 @@ public:
                        std::string_view name_suffix = "") const; // remove the per-object files
 
 private:
-    Pool(DrivePool dp, std::vector<int> dirfds) : drives_(dp), dirfds_(std::move(dirfds)) {}
+    Pool(DrivePool dp, std::vector<int> dirfds, bool direct_io)
+        : drives_(dp), dirfds_(std::move(dirfds)), direct_io_(direct_io) {}
     DrivePool drives_;
     std::vector<int> dirfds_;
+    bool direct_io_ = false; // open object files with O_DIRECT (ADR-0011)
 };
 
 class TierManager {
 public:
     static Result<TierManager> open(const TierSizes&, const MemoryConfig&, const EvictionConfig&,
-                                    const PoolConfig& ssd, const PoolConfig& hdd, Index& index);
+                                    const PoolConfig& ssd, const PoolConfig& hdd, Index& index,
+                                    Size io_chunk = 256 * KiB, unsigned write_buffers = 8,
+                                    bool direct_io = false);
     bool three_layer() const noexcept { return hdd_.has_value(); }
 
     // Streaming write (ADR-0016/0017): open files + reserve the RAM head once, append chunks with
@@ -95,8 +100,9 @@ public:
         friend class TierManager;
         StoreHandle(TierManager* tm, Digest digest, ObjectLayout layout, ObjectFiles ssd,
                     std::optional<ObjectFiles> hdd, std::optional<core::BufferPool::Region> head,
-                    std::string suffix);
+                    std::string suffix, MutBytes stage);
         void abort_uncommitted(); // free the reserved head + unlink scratch files (never published)
+        Status flush_block(Size n); // write the staged block (split SSD/HDD) at flushed_; 4 KiB-sized
         TierManager* tm_;
         Digest digest_;
         ObjectLayout layout_;
@@ -104,6 +110,9 @@ public:
         std::optional<ObjectFiles> hdd_;
         std::optional<core::BufferPool::Region> head_;
         std::string suffix_; // CoW scratch-file suffix; renamed onto the live names at commit
+        MutBytes stage_;      // borrowed aligned staging buffer (from tm_->write_pool_)
+        Size stage_fill_ = 0; // bytes accumulated in stage_, not yet flushed to disk
+        Size flushed_ = 0;    // bytes already written to disk (a 4 KiB-aligned prefix)
         Offset off_ = 0;
         bool committed_ = false;
     };
@@ -189,7 +198,8 @@ private:
     }
 
     TierSizes tiers_;
-    core::BufferPool ram_;                          // RAM-head cache (ADR-0003/0008)
+    core::BufferPool ram_;                           // RAM-head cache (ADR-0003/0008)
+    std::unique_ptr<core::IoBufferPool> write_pool_; // bounded aligned CoW write staging (ADR-0011)
     std::unique_ptr<EvictionPolicy> policy_;        // resident-head eviction (ADR-0007)
     std::unique_ptr<EvictionPolicy> object_policy_; // whole-object / SSD count bound (ADR-0012)
     std::uint64_t max_objects_;                     // 0 => unbounded

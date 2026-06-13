@@ -7,6 +7,7 @@
 
 #include "goblin/core/buffer_pool.hpp"
 #include "goblin/core/reactor.hpp"
+#include "goblin/crypto/sha256.hpp"
 #include "goblin/storage/index.hpp"
 #include "goblin/storage/tier_manager.hpp"
 
@@ -14,6 +15,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,7 +35,7 @@ public:
     std::size_t live_conns() const noexcept { return conns_.size(); }
 
 private:
-    enum class St { idle, set_body, get_header, get_send_head, get_reading, get_send_piece, get_trailer };
+    enum class St { idle, set_body, set_wait, get_header, get_send_head, get_reading, get_send_piece, get_trailer };
 
     struct Conn {
         int fd = -1;
@@ -61,7 +63,8 @@ private:
 
         // SET ingest state:
         std::optional<storage::TierManager::StoreHandle> sh; // open writer for this SET
-        Size set_remaining = 0;     // body bytes still to receive
+        crypto::Digest set_digest{}; // key digest; kept to retry begin_store while parked (set_wait)
+        Size set_remaining = 0;     // body bytes still to receive (== full nbytes while parked)
         std::uint32_t set_flags = 0;
         bool set_noreply = false;
         bool set_reject = false; // admission failed (add exists / replace missing) -> drain + NOT_STORED
@@ -82,6 +85,7 @@ private:
     void start_send_head(Conn*); // send the pinned head region zero-copy (partial-aware)
     void unpin_if_held(Conn*);   // release the head pin if this conn holds one
     void process(Conn*);          // parse commands out of `in`, act, queue replies / start streams
+    void drain_set_waiters();     // retry parked SETs (set_wait) once a write-staging buffer may be free
     void pump_get(Conn*);         // produce + send the next value piece, or the trailer
     void start_send_piece(Conn*); // (re)send the current piece from iobuf (partial-aware)
     void finish_get(Conn*);       // GET fully sent -> release buffers, resume parsing
@@ -97,6 +101,7 @@ private:
     core::IoBufferPool& iobufs_;
     std::atomic<bool> stop_{false};
     std::unordered_map<Conn*, std::unique_ptr<Conn>> conns_;
+    std::deque<Conn*> set_waiters_; // SETs parked on write-staging exhaustion (ADR-0011 backpressure)
 };
 
 } // namespace goblin::memcache

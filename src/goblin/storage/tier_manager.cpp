@@ -46,7 +46,7 @@ Pool& Pool::operator=(Pool&& o) noexcept {
     return *this;
 }
 
-Result<Pool> Pool::open(const std::vector<std::string>& dirs, Size stripe_unit) {
+Result<Pool> Pool::open(const std::vector<std::string>& dirs, Size stripe_unit, bool direct_io) {
     if (dirs.empty()) return err(Errc::invalid_argument, "empty pool");
     std::vector<int> dirfds;
     dirfds.reserve(dirs.size());
@@ -58,7 +58,8 @@ Result<Pool> Pool::open(const std::vector<std::string>& dirs, Size stripe_unit) 
         }
         dirfds.push_back(fd);
     }
-    return Pool(DrivePool(static_cast<unsigned>(dirs.size()), stripe_unit), std::move(dirfds));
+    return Pool(DrivePool(static_cast<unsigned>(dirs.size()), stripe_unit), std::move(dirfds),
+                direct_io);
 }
 
 Result<ObjectFiles> Pool::open_object(const Digest& digest, Size tier_bytes, bool create,
@@ -71,7 +72,8 @@ Result<ObjectFiles> Pool::open_object(const Digest& digest, Size tier_bytes, boo
     const Size stripe = drives_.stripe_unit();
     const Size nchunks = (tier_bytes + stripe - 1) / stripe;
     const unsigned used = static_cast<unsigned>(nchunks < n ? nchunks : n);
-    const int flags = create ? (O_RDWR | O_CREAT) : O_RDONLY;
+    int flags = create ? (O_RDWR | O_CREAT) : O_RDONLY;
+    if (direct_io_) flags |= O_DIRECT; // bypass the page cache: own the backing store (ADR-0011)
 
     for (unsigned c = 0; c < used; ++c) {
         const unsigned d = drives_.drive_of(digest.bucket(), static_cast<Offset>(c) * stripe);
@@ -121,7 +123,8 @@ void Pool::unlink_object(const Digest& digest, Size tier_bytes, std::string_view
 
 Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& mem,
                                       const EvictionConfig& ev, const PoolConfig& ssd,
-                                      const PoolConfig& hdd, Index& index) {
+                                      const PoolConfig& hdd, Index& index, Size io_chunk,
+                                      unsigned write_buffers, bool direct_io) {
     auto ram = core::BufferPool::create(mem.total_bytes, mem.block_bytes, kDeviceBlock,
                                         mem.lock_memory);
     if (!ram) return std::unexpected(ram.error());
@@ -133,16 +136,20 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
         ev.max_ssd_objects ? static_cast<std::size_t>(ev.max_ssd_objects) : cap_hint;
     auto object_policy = make_eviction_policy(ev.policy, obj_cap);
 
-    auto sp = Pool::open(ssd.dirs, ssd.stripe_unit);
+    auto sp = Pool::open(ssd.dirs, ssd.stripe_unit, direct_io);
     if (!sp) return std::unexpected(sp.error());
     std::optional<Pool> hp;
     if (!hdd.dirs.empty()) {
-        auto h = Pool::open(hdd.dirs, hdd.stripe_unit);
+        auto h = Pool::open(hdd.dirs, hdd.stripe_unit, direct_io);
         if (!h) return std::unexpected(h.error());
         hp.emplace(std::move(*h));
     }
-    return TierManager(t, std::move(*ram), std::move(head_policy), std::move(object_policy),
-                       ev.max_ssd_objects, std::move(*sp), std::move(hp), index);
+    auto wp = core::IoBufferPool::create(io_chunk, write_buffers, mem.lock_memory);
+    if (!wp) return std::unexpected(wp.error());
+    TierManager tm(t, std::move(*ram), std::move(head_policy), std::move(object_policy),
+                   ev.max_ssd_objects, std::move(*sp), std::move(hp), index);
+    tm.write_pool_ = std::make_unique<core::IoBufferPool>(std::move(*wp));
+    return tm;
 }
 
 Status TierManager::store(const Digest& digest, ByteView data, std::uint32_t flags) {
@@ -170,7 +177,21 @@ Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, 
 
     // Reserve the new RAM head, evicting cold heads (ADR-0007/0012) to make room. The old version's
     // head stays put; commit frees it once the new version is published.
-    std::unique_lock<std::shared_mutex> lk(*mu_); // mutates allocator + policy (exclusive)
+    std::unique_lock<std::shared_mutex> lk(*mu_); // mutates allocator + pool + policy (exclusive)
+
+    // Acquire a bounded, page-aligned staging buffer for the disk writes (ADR-0011): one per
+    // in-flight store, so write-staging RAM stays bounded. Exhaustion returns would_block (not a
+    // hard failure): the caller backpressures the connection and retries once a buffer frees, so the
+    // bound becomes a concurrency limit (tune via io_buffers/io_chunk), never an unbudgeted RAM grow.
+    // (SET is write-once; the extra copy through this buffer is a deliberate trade.)
+    auto stage = write_pool_->acquire();
+    if (!stage) {
+        lk.unlock();
+        ssd_.unlink_object(digest, layout.ssd_bytes, suffix); // discard the scratch files we opened
+        if (hdd_) hdd_->unlink_object(digest, layout.hdd_bytes, suffix);
+        return err(Errc::would_block, "write staging buffers exhausted");
+    }
+
     std::optional<core::BufferPool::Region> head;
     const Size head_len = std::min<Size>(size, tiers_.ram_head);
     if (head_len > 0) {
@@ -188,20 +209,20 @@ Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, 
     }
 
     return StoreHandle(this, digest, layout, std::move(*ssd_files), std::move(hdd_files), head,
-                       suffix);
+                       suffix, *stage);
 }
 
 TierManager::StoreHandle::StoreHandle(TierManager* tm, Digest digest, ObjectLayout layout,
                                       ObjectFiles ssd, std::optional<ObjectFiles> hdd,
                                       std::optional<core::BufferPool::Region> head,
-                                      std::string suffix)
+                                      std::string suffix, MutBytes stage)
     : tm_(tm), digest_(digest), layout_(layout), ssd_(std::move(ssd)), hdd_(std::move(hdd)),
-      head_(head), suffix_(std::move(suffix)) {}
+      head_(head), suffix_(std::move(suffix)), stage_(stage) {}
 
 TierManager::StoreHandle::StoreHandle(StoreHandle&& o) noexcept
     : tm_(o.tm_), digest_(o.digest_), layout_(o.layout_), ssd_(std::move(o.ssd_)),
-      hdd_(std::move(o.hdd_)), head_(o.head_), suffix_(std::move(o.suffix_)), off_(o.off_),
-      committed_(o.committed_) {
+      hdd_(std::move(o.hdd_)), head_(o.head_), suffix_(std::move(o.suffix_)), stage_(o.stage_),
+      stage_fill_(o.stage_fill_), flushed_(o.flushed_), off_(o.off_), committed_(o.committed_) {
     o.tm_ = nullptr;
     o.committed_ = true; // neutralize the moved-from handle's destructor
 }
@@ -216,6 +237,9 @@ TierManager::StoreHandle& TierManager::StoreHandle::operator=(StoreHandle&& o) n
         hdd_ = std::move(o.hdd_);
         head_ = o.head_;
         suffix_ = std::move(o.suffix_);
+        stage_ = o.stage_;
+        stage_fill_ = o.stage_fill_;
+        flushed_ = o.flushed_;
         off_ = o.off_;
         committed_ = o.committed_;
         o.tm_ = nullptr;
@@ -229,10 +253,16 @@ TierManager::StoreHandle::~StoreHandle() { abort_uncommitted(); }
 // Roll back a handle that was never committed: free the reserved head and delete the scratch files.
 void TierManager::StoreHandle::abort_uncommitted() {
     if (committed_ || !tm_) return;
-    if (head_) {
-        std::unique_lock<std::shared_mutex> lk(*tm_->mu_); // ram_ is shared (exclusive)
-        tm_->ram_.deallocate(head_->block, head_->offset, head_->len);
-        head_.reset();
+    if (head_ || !stage_.empty()) {
+        std::unique_lock<std::shared_mutex> lk(*tm_->mu_); // ram_ + write_pool_ are shared (exclusive)
+        if (head_) {
+            tm_->ram_.deallocate(head_->block, head_->offset, head_->len);
+            head_.reset();
+        }
+        if (!stage_.empty()) {
+            tm_->write_pool_->release(stage_);
+            stage_ = {};
+        }
     }
     tm_->ssd_.unlink_object(digest_, layout_.ssd_bytes, suffix_); // scratch files; filesystem only
     if (tm_->hdd_) tm_->hdd_->unlink_object(digest_, layout_.hdd_bytes, suffix_);
@@ -242,35 +272,68 @@ Status TierManager::StoreHandle::write(ByteView chunk) {
     const Size len = chunk.size();
     if (off_ + len > layout_.size) return err(Errc::invalid_argument, "write past end of object");
 
-    if (head_) { // fill the resident head as the bytes stream past
+    if (head_) { // fill the resident head directly from the chunk (RAM; no alignment needed)
         const Size hend = std::min<Size>(off_ + len, head_->len);
         if (off_ < hend) std::memcpy(head_->data + off_, chunk.data(), hend - off_);
     }
-    // SSD prefix portion: [off_, min(off_+len, ssd_bytes))
-    const Size ssd_stop = std::min<Size>(off_ + len, layout_.ssd_bytes);
-    if (off_ < ssd_stop) {
-        if (auto st = striped_pwrite(tm_->ssd_.drives(), digest_.bucket(), ssd_.fds(), off_,
-                                     ByteView(chunk.data(), ssd_stop - off_));
-            !st)
-            return st;
-    }
-    // HDD tail portion: [max(off_, ssd_bytes), off_+len)
-    if (off_ + len > layout_.ssd_bytes && tm_->hdd_) {
-        const Size begin = std::max<Size>(off_, layout_.ssd_bytes);
-        const Size src = begin - off_;
-        if (auto st = striped_pwrite(tm_->hdd_->drives(), digest_.bucket(), hdd_->fds(),
-                                     begin - layout_.ssd_bytes,
-                                     ByteView(chunk.data() + src, (off_ + len) - begin));
-            !st)
-            return st;
+    // Stage the body into the aligned buffer, flushing full device-block-aligned blocks to disk;
+    // the trailing partial block is flushed (zero-padded) at commit. SET is write-once, so the copy
+    // through this buffer is a deliberate trade for a zero-copy, page-cache-free read path.
+    const std::byte* p = chunk.data();
+    Size remaining = len;
+    while (remaining > 0) {
+        const Size take = std::min<Size>(remaining, stage_.size() - stage_fill_);
+        std::memcpy(stage_.data() + stage_fill_, p, take);
+        stage_fill_ += take;
+        p += take;
+        remaining -= take;
+        if (stage_fill_ == stage_.size())
+            if (auto st = flush_block(stage_.size()); !st) return st;
     }
     off_ += len;
+    return {};
+}
+
+// Write the staged block [0, n) (n device-block-aligned) at disk offset flushed_, split across the
+// SSD prefix and HDD tail. Aligned source/offset/length keep O_DIRECT happy. The SSD file is padded
+// to a 4 KiB boundary only when it holds the object's tail (no HDD); with an HDD tail the prefix
+// ends on the already-aligned ssd_bytes split.
+Status TierManager::StoreHandle::flush_block(Size n) {
+    const Offset o = flushed_;
+    const Size ssd_extent =
+        (layout_.hdd_bytes > 0) ? layout_.ssd_bytes : align_up(layout_.ssd_bytes, kDeviceBlock);
+    const Size ssd_stop = std::min<Size>(o + n, ssd_extent);
+    if (o < ssd_stop) {
+        if (auto st = striped_pwrite(tm_->ssd_.drives(), digest_.bucket(), ssd_.fds(), o,
+                                     ByteView(stage_.data(), ssd_stop - o));
+            !st)
+            return st;
+    }
+    if (o + n > layout_.ssd_bytes && hdd_) {
+        const Size begin = std::max<Size>(o, layout_.ssd_bytes);
+        const Size src = begin - o;
+        if (auto st = striped_pwrite(tm_->hdd_->drives(), digest_.bucket(), hdd_->fds(),
+                                     begin - layout_.ssd_bytes,
+                                     ByteView(stage_.data() + src, (o + n) - begin));
+            !st)
+            return st;
+    }
+    flushed_ += n;
+    stage_fill_ = 0;
     return {};
 }
 
 Status TierManager::StoreHandle::commit(std::uint32_t flags) {
     if (off_ != layout_.size)
         return err(Errc::invalid_argument, "commit before the full value was written");
+
+    // Flush the trailing partial block, zero-padded up to the device block (O_DIRECT). The file then
+    // ends on a 4 KiB boundary; the padding is never served (the index records the real size).
+    if (stage_fill_ > 0) {
+        const Size padded = align_up(stage_fill_, kDeviceBlock);
+        if (padded > stage_fill_) std::memset(stage_.data() + stage_fill_, 0, padded - stage_fill_);
+        if (auto st = flush_block(padded); !st) return st;
+    }
 
     std::unique_lock<std::shared_mutex> lk(*tm_->mu_); // publish + swap atomically (exclusive, ADR-0018)
     // Publish: rename the scratch files over the live names. Readers that already opened the old
@@ -291,6 +354,8 @@ Status TierManager::StoreHandle::commit(std::uint32_t flags) {
     tm_->index_->set(digest_, meta);
     if (head_) tm_->policy_->insert(digest_);
     if (!old) tm_->object_policy_->insert(digest_); // only new objects count toward the SSD bound
+    tm_->write_pool_->release(stage_);              // return the staging buffer (under the lock)
+    stage_ = {};
     committed_ = true;
     tm_->enforce_object_bound();                    // evict whole objects if over the limit
     return {};

@@ -9,10 +9,12 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <print>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -470,5 +472,65 @@ TEST("tier_manager: concurrent replace + read never sees a torn value (atomic pu
     r2.join();
     std::println("    [cow] reads={} torn={}", reads.load(), torn.load());
     CHECK(torn.load() == 0); // copy-on-write publish: readers see old-or-new, never a mix
+    fs::remove_all(base);
+}
+
+TEST("tier_manager: O_DIRECT round-trips an odd-sized object across all tiers") {
+    if (!core::Reactor::available()) {
+        std::println("    (skipped: built without liburing)");
+        return;
+    }
+    auto reactor = core::Reactor::create();
+    if (!reactor) {
+        std::println("    (skipped: io_uring unavailable: {})", reactor.error().detail);
+        return;
+    }
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-odirect-" + std::to_string(::getpid()))).string();
+    fs::create_directories(base);
+    { // probe O_DIRECT support; skip on filesystems that reject it
+        const std::string probe = base + "/.od-probe";
+        const int fd = ::open(probe.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0644);
+        if (fd < 0) {
+            std::println("    (skipped: O_DIRECT unsupported on this filesystem)");
+            fs::remove_all(base);
+            return;
+        }
+        ::close(fd);
+        ::unlink(probe.c_str());
+    }
+    PoolConfig ssd, hdd;
+    ssd.stripe_unit = 64 * KiB;
+    hdd.stripe_unit = 64 * KiB;
+    for (const char* d : {"/s0", "/s1"}) ssd.dirs.push_back(base + d);
+    hdd.dirs.push_back(base + "/h0");
+    for (const auto& d : ssd.dirs) fs::create_directories(d);
+    for (const auto& d : hdd.dirs) fs::create_directories(d);
+    TierSizes tiers;
+    tiers.ram_head = 16 * KiB;
+    tiers.ssd_prefix = 64 * KiB;
+    MemoryConfig mem;
+    mem.total_bytes = 16 * MiB;
+    mem.block_bytes = 1 * MiB;
+    mem.lock_memory = false;
+    EvictionConfig ev;
+    Index index;
+    auto tm = TierManager::open(tiers, mem, ev, ssd, hdd, index, 256 * KiB, 8, /*direct_io=*/true);
+    CHECK(tm.has_value());
+
+    constexpr Size SZ = 200000; // 16 KiB head (RAM) + 48 KiB SSD + ~135 KiB HDD; not a 4 KiB multiple
+    std::string val(SZ, '\0');
+    for (std::size_t i = 0; i < SZ; ++i) val[i] = static_cast<char>((i * 131 + 7) & 0xFF);
+    const auto digest = hash_key("od");
+    CHECK(tm->store(digest, ByteView(reinterpret_cast<const std::byte*>(val.data()), SZ), 0)
+              .has_value());
+
+    const Size cap = align_up(SZ, kDeviceBlock); // page-aligned, 4 KiB-multiple read buffer
+    void* p = std::aligned_alloc(kDeviceBlock, cap);
+    auto* buf = static_cast<std::byte*>(p);
+    auto n = tm->read(*reactor, digest, 0, MutBytes(buf, cap));
+    CHECK(n.has_value() && *n == SZ);
+    if (n) CHECK(std::equal(buf, buf + SZ, reinterpret_cast<const std::byte*>(val.data())));
+    std::free(p);
     fs::remove_all(base);
 }
