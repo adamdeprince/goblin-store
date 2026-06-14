@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(goblincache LANGUAGES CXX VERSION 0.0.1)
+project(goblincache LANGUAGES CXX C VERSION 0.0.1)
 
 # ---- Standard (ADR-0004): C++23, no extensions, modules off for now ----
 set(CMAKE_CXX_STANDARD 23)
@@ -30,6 +30,11 @@ file(GLOB_RECURSE GOBLIN_LIB_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/
 list(REMOVE_ITEM GOBLIN_LIB_SOURCES "${CMAKE_SOURCE_DIR}/src/goblin/main.cpp")
 list(REMOVE_ITEM GOBLIN_LIB_SOURCES "${CMAKE_SOURCE_DIR}/src/goblin/tools/path_prep.cpp")
 
+# ---- third-party: picohttpparser (HTTP/1.1 request parsing) — built without our strict warnings ----
+add_library(picohttpparser STATIC "${CMAKE_SOURCE_DIR}/third_party/picohttpparser/picohttpparser.c")
+target_include_directories(picohttpparser SYSTEM PUBLIC
+  "${CMAKE_SOURCE_DIR}/third_party/picohttpparser")
+
 add_library(goblin_core STATIC ${GOBLIN_LIB_SOURCES})
 target_include_directories(goblin_core PUBLIC "${CMAKE_SOURCE_DIR}/src")
 target_compile_features(goblin_core PUBLIC cxx_std_23)
@@ -40,6 +45,7 @@ if(GOBLIN_WERROR)
   list(APPEND GOBLIN_WARNINGS -Werror)
 endif()
 target_compile_options(goblin_core PUBLIC ${GOBLIN_WARNINGS})
+target_link_libraries(goblin_core PUBLIC picohttpparser)
 
 if(GOBLIN_HAVE_URING)
   target_link_libraries(goblin_core PUBLIC PkgConfig::LIBURING)
