@@ -5,6 +5,8 @@
 #include "goblin/common/config.hpp"
 #include "goblin/common/types.hpp"
 #include "goblin/core/reactor.hpp"
+#include "goblin/http/key_derivation.hpp"
+#include "goblin/http/source_loader.hpp"
 #include "goblin/protocol/memcache/server.hpp"
 #include "goblin/storage/pool_dir.hpp"
 
@@ -209,6 +211,15 @@ int main(int argc, char** argv) {
         return 1;
     }
     // Each worker creates its own reactor + I/O-buffer pool (thread-per-core, ADR-0018).
+
+    // --source preloading (ADR-0015): fill the freshly-wiped pools from disk trees before serving.
+    if (!cfg.sources.empty()) {
+        http::KeyOptions keyopt;
+        keyopt.mode = cfg.http_vhost ? http::KeyMode::vhost : http::KeyMode::path;
+        keyopt.keep_query = cfg.key_on_query;
+        const std::size_t n = http::preload_sources(cfg.sources, keyopt, *tm);
+        std::println("preloaded {} file(s) from {} source dir(s)", n, cfg.sources.size());
+    }
 
     if (cfg.enable_https)
         std::println("note: HTTPS (TLS) not wired yet — serving plaintext listeners only for now");
