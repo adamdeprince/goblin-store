@@ -71,8 +71,8 @@ void print_help() {
         "  --eviction NAME     head-cache eviction policy: s3fifo (only one implemented yet)\n"
         "  --max-objects N     cap on stored objects (0 = unbounded); evicts whole objects over it\n"
         "  --net MODE          network: async (default, io_uring loop) | blocking\n"
-        "  --tls-cert FILE     PEM certificate; enables HTTPS (with --tls-key)\n"
-        "  --tls-key FILE      PEM private key for HTTPS\n"
+        "  --tls-cert FILE     PEM cert chain; enables HTTPS. Repeat per domain — SNI selects\n"
+        "  --tls-key FILE      PEM private key, paired with the preceding --tls-cert\n"
         "  --https-port N      TLS listener port                     [default 8443]\n"
         "  --help");
 }
@@ -115,8 +115,8 @@ int main(int argc, char** argv) {
             auto n = parse_int<std::uint64_t>(*v); if (!n) { bad("max-objects", *v); return 2; }
             cfg.eviction.max_ssd_objects = *n;
         }
-        else if (a == "--tls-cert")  { auto v = take(a); if (!v) return 2; cfg.tls_cert_path = std::string(*v); }
-        else if (a == "--tls-key")   { auto v = take(a); if (!v) return 2; cfg.tls_key_path = std::string(*v); }
+        else if (a == "--tls-cert")  { auto v = take(a); if (!v) return 2; cfg.tls_cert_paths.emplace_back(*v); }
+        else if (a == "--tls-key")   { auto v = take(a); if (!v) return 2; cfg.tls_key_paths.emplace_back(*v); }
         else if (a == "--https-port") { auto v = take(a); if (!v) return 2; auto p = parse_int<std::uint16_t>(*v); if (!p) { bad("port", *v); return 2; } cfg.https_port = *p; }
         else if (a == "--memory" || a == "--block" || a == "--ram-head" || a == "--ssd-prefix" || a == "--io-chunk") {
             auto v = take(a); if (!v) return 2;
@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
         else { std::println(stderr, "error: unknown option '{}' (try --help)", a); return 2; }
     }
 
-    cfg.enable_https = !cfg.tls_cert_path.empty() && !cfg.tls_key_path.empty();
+    cfg.enable_https = !cfg.tls_cert_paths.empty();
 
     if (auto ok = validate(cfg); !ok) {
         std::println(stderr, "config error: {}", ok.error().detail);
@@ -223,15 +223,10 @@ int main(int argc, char** argv) {
         std::println("preloaded {} file(s) from {} source dir(s)", n, cfg.sources.size());
     }
 
-    if (cfg.enable_https)
-        std::println("note: HTTPS (TLS) not wired yet — serving plaintext listeners only for now");
-    if (!cfg.enable_memcache && !cfg.enable_http) {
-        std::println("no plaintext listener enabled (HTTPS not wired yet) — nothing to serve");
-        return 0;
-    }
     std::string listening = "listening:";
     if (cfg.enable_memcache) listening += " memcache/tcp :" + std::to_string(cfg.memcache_port);
     if (cfg.enable_http) listening += " http/tcp :" + std::to_string(cfg.http_port);
+    if (cfg.enable_https) listening += " https/tcp :" + std::to_string(cfg.https_port);
     std::println("{}  (Ctrl-C to stop)", listening);
     if (auto st = memcache::serve(cfg, *tm, index); !st) {
         std::println(stderr, "serve: {}", st.error().detail);

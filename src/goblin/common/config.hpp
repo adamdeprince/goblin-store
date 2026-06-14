@@ -56,9 +56,10 @@ struct ServerConfig {
     std::uint16_t https_port    = 8443;   // TLS listener (ADR-0005)
     bool          enable_memcache = true;
     bool          enable_http     = true;  // serve plaintext HTTP
-    bool          enable_https    = false; // serve TLS (needs cert+key); HTTP+HTTPS may both run
-    std::string   tls_cert_path;           // PEM certificate for HTTPS
-    std::string   tls_key_path;            // PEM private key for HTTPS
+    bool          enable_https    = false; // serve TLS; HTTP+HTTPS may both run
+    // One cert/key pair per domain (SNI selects, ADR-0005); paired by index. Repeat --tls-cert/--tls-key.
+    std::vector<std::string> tls_cert_paths; // PEM certificate chains
+    std::vector<std::string> tls_key_paths;  // PEM private keys
     unsigned      cores = 0;              // 0 => all available
 
     // HTTP key derivation (ADR-0015)

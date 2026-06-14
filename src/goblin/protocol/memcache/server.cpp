@@ -2,6 +2,7 @@
 
 #include "goblin/crypto/sha256.hpp"
 #include "goblin/http/http_loop.hpp"
+#include "goblin/http/https_loop.hpp"
 #include "goblin/protocol/memcache/event_loop.hpp"
 #include "goblin/protocol/memcache/protocol.hpp"
 
@@ -266,6 +267,28 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
     ::close(*lfd);
 }
 
+#if GOBLIN_HAVE_TLS
+// HTTPS object server: own ring + read pool + SO_REUSEPORT listener on the HTTPS port, sharing one
+// tls::Context (per-host certs, SNI selection) across all workers. The handshake runs on the loop;
+// after it, kTLS makes the data path the ordinary HttpLoop flow (ADR-0005/0011).
+void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
+                  tls::Context& ctx, unsigned id) {
+    auto reactor = core::Reactor::create();
+    if (!reactor) { std::println(stderr, "https worker {}: {}", id, reactor.error().detail); return; }
+    auto iobufs =
+        core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory);
+    if (!iobufs) { std::println(stderr, "https worker {}: {}", id, iobufs.error().detail); return; }
+    auto lfd = make_listener(cfg.https_port, /*reuseport=*/true);
+    if (!lfd) { std::println(stderr, "https worker {}: {}", id, lfd.error().detail); return; }
+    http::KeyOptions keyopt;
+    keyopt.mode = cfg.http_vhost ? http::KeyMode::vhost : http::KeyMode::path;
+    keyopt.keep_query = cfg.key_on_query;
+    http::HttpsLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, ctx, cfg.io_timeout_ms);
+    loop.run();
+    ::close(*lfd);
+}
+#endif
+
 } // namespace
 
 Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index) {
@@ -293,6 +316,24 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
         for (unsigned i = 0; i < n; ++i)
             workers.emplace_back([&cfg, &tm, &index, i] { http_worker(cfg, tm, index, i); });
     }
+
+    // HTTPS: build one shared per-host cert context (SNI) and spawn TLS loops on the HTTPS port.
+#if GOBLIN_HAVE_TLS
+    std::optional<tls::Context> https_ctx; // outlives the workers; freed after the join below
+    if (cfg.enable_https) {
+        std::vector<tls::Context::CertKey> certs;
+        for (std::size_t i = 0; i < cfg.tls_cert_paths.size(); ++i)
+            certs.push_back({cfg.tls_cert_paths[i], cfg.tls_key_paths[i]});
+        auto c = tls::Context::create(certs);
+        if (!c) return std::unexpected(c.error());
+        https_ctx.emplace(std::move(*c));
+        tls::Context& ctx = *https_ctx;
+        for (unsigned i = 0; i < n; ++i)
+            workers.emplace_back([&cfg, &tm, &index, &ctx, i] { https_worker(cfg, tm, index, ctx, i); });
+    }
+#else
+    if (cfg.enable_https) return err(Errc::unsupported, "built without OpenSSL — HTTPS unavailable");
+#endif
 
     for (auto& t : workers) t.join();
     if (blocking_lfd >= 0) ::close(blocking_lfd);

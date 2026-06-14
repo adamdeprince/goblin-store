@@ -45,8 +45,10 @@ Status validate(const ServerConfig& c) {
     if (!c.enable_memcache && !c.enable_http && !c.enable_https)
         return err(Errc::invalid_argument,
                    "no listeners enabled (need at least one of memcache, HTTP, HTTPS)");
-    if (c.enable_https && (c.tls_cert_path.empty() || c.tls_key_path.empty()))
-        return err(Errc::invalid_argument, "HTTPS requires --tls-cert and --tls-key");
+    if (c.tls_cert_paths.size() != c.tls_key_paths.size())
+        return err(Errc::invalid_argument, "each --tls-cert needs a matching --tls-key");
+    if (c.enable_https && c.tls_cert_paths.empty())
+        return err(Errc::invalid_argument, "HTTPS requires at least one --tls-cert/--tls-key pair");
 
     return {};
 }
