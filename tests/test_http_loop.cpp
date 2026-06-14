@@ -74,6 +74,7 @@ static bool write_all(int fd, std::string_view s) {
 
 struct HttpResp {
     int status = 0;
+    std::string headers; // the header block (for Content-Range etc.)
     std::string body;
 };
 
@@ -93,6 +94,7 @@ static std::optional<HttpResp> read_http(int fd, bool read_body) {
     const auto sp = buf.find(' ');
     if (sp == std::string::npos) return std::nullopt;
     r.status = std::atoi(buf.c_str() + sp + 1);
+    r.headers = buf.substr(0, hdr_end);
     if (!read_body) return r;
 
     std::string head = buf.substr(0, hdr_end);
@@ -151,6 +153,21 @@ static bool store_http(TierManager& tm, const std::string& path, const std::stri
 static std::string tmp_base(const char* tag) {
     return (fs::temp_directory_path() / ("goblin-http-" + std::string(tag) + std::to_string(::getpid())))
         .string();
+}
+
+// One ranged GET on a fresh connection (Connection: close).
+static std::optional<HttpResp> ranged_get(std::uint16_t port, std::string_view path,
+                                          std::string_view range) {
+    const int c = client_connect(port);
+    if (c < 0) return std::nullopt;
+    std::string req = "GET ";
+    req += path;
+    req += " HTTP/1.1\r\nHost: h\r\nRange: ";
+    req += range;
+    req += "\r\nConnection: close\r\n\r\n";
+    const auto r = http_req(c, req);
+    ::close(c);
+    return r;
 }
 
 TEST("http loop: GET streams the body; HEAD is headers-only; a miss is 404") {
@@ -230,6 +247,49 @@ TEST("http loop: keep-alive serves two GETs on one connection, then 405 for PUT"
              r3 && r3->status == 405;
         ::close(c);
     }
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(ok);
+}
+
+TEST("http loop: Range -> 206 (head / disk / spanning / suffix / open-ended) and 416") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("range");
+    Index index;
+    auto tm = open_tm(base, index);
+    auto io = IoBufferPool::create(128 * KiB, 8, false);
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+    KeyOptions opt;
+    const std::string body = pattern(7, 50 * 1024); // 51200: 4 KiB head + disk tail
+    CHECK(store_http(*tm, "/obj", body, opt));
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    HttpLoop loop(*rc, lfd, *tm, index, *io, opt, 0);
+    std::thread th([&] { loop.run(); });
+
+    bool ok = true;
+    auto expect = [&](std::string_view range, std::size_t off, std::size_t len, std::string_view cr) {
+        const auto r = ranged_get(port, "/obj", range);
+        ok = ok && r && r->status == 206 && r->body == body.substr(off, len) &&
+             r->headers.find(cr) != std::string::npos;
+    };
+    expect("bytes=0-99", 0, 100, "Content-Range: bytes 0-99/51200");      // within the head
+    expect("bytes=10000-10099", 10000, 100, "bytes 10000-10099/51200");   // disk region
+    expect("bytes=4000-4200", 4000, 201, "bytes 4000-4200/51200");        // spans head -> disk
+    expect("bytes=-100", 51100, 100, "bytes 51100-51199/51200");          // suffix
+    expect("bytes=51100-", 51100, 100, "bytes 51100-51199/51200");        // open-ended
+    {
+        const auto r = ranged_get(port, "/obj", "bytes=999999-");         // unsatisfiable
+        ok = ok && r && r->status == 416 && r->headers.find("bytes */51200") != std::string::npos;
+    }
+
     loop.stop();
     th.join();
     ::close(lfd);

@@ -30,9 +30,31 @@ constexpr std::string_view k405 =
 } // namespace
 
 void HttpLoop::frame_get_hit(Conn* c, const std::string&, const storage::ObjectMeta& meta) {
+    const bool keep_alive = !c->quit_after;
+    if (c->req_range) { // a Range header was sent -> resolve against the actual size
+        const auto r = resolve_range(*c->req_range, meta.size);
+        if (!r) { // unsatisfiable -> 416, no body (get_pos == get_size; the shared loop streams nothing)
+            c->get_pos = c->get_size = 0;
+            c->out += "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */";
+            c->out += std::to_string(meta.size);
+            c->out += "\r\nContent-Length: 0\r\n";
+            c->out += keep_alive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
+            return;
+        }
+        const auto [off, len] = *r;
+        c->get_pos = off;
+        c->get_size = off + len;
+        c->out += "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes ";
+        c->out += std::to_string(off) + "-" + std::to_string(off + len - 1) + "/" +
+                  std::to_string(meta.size);
+        c->out += "\r\nContent-Length: " + std::to_string(len) +
+                  "\r\nContent-Type: application/octet-stream\r\n";
+        c->out += keep_alive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
+        return;
+    }
     c->get_pos = 0;
     c->get_size = meta.size; // whole object
-    append_head(c->out, "200 OK", meta.size, !c->quit_after);
+    append_head(c->out, "200 OK", meta.size, keep_alive);
 }
 
 void HttpLoop::frame_get_miss(Conn* c) {
@@ -59,6 +81,7 @@ void HttpLoop::process(Conn* c) {
 
         if (method == Method::get) {
             if (!key) { c->out += k400; c->quit_after = true; break; } // vhost mode without a Host
+            c->req_range = pr.req.range;            // resolved in frame_get_hit against the object size
             if (!begin_get(c, *key)) return;        // read pool exhausted -> parked (ADR-0011)
             if (c->state == St::get_header) break;  // hit -> stream the body before parsing further
             // miss: 404 already queued, state idle -> keep parsing the pipeline

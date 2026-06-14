@@ -233,8 +233,9 @@ void StreamLoop::start_send_piece(Conn* c) {
 
 void StreamLoop::start_send_head(Conn* c) {
     if (c->closing) return;
+    const Size head_hi = std::min<Size>(c->head_pin.len, c->get_size); // head bytes within the range
     const ByteView head = tm_.pinned_bytes(c->head_pin); // zero-copy: straight from the head pool
-    const ByteView rem(head.data() + c->head_sent, c->head_pin.len - c->head_sent);
+    const ByteView rem(head.data() + c->head_sent, head_hi - c->head_sent);
     if (r_.submit_send(c->fd, rem, tag(c, kSend)))
         ++c->inflight;
     else
@@ -257,14 +258,14 @@ void StreamLoop::on_send(Conn* c, int res) {
         return;
     }
     if (c->state == St::get_send_head) {
-        c->head_sent += static_cast<std::size_t>(res);
-        if (c->head_sent < c->head_pin.len) {
-            start_send_head(c); // short send -> remainder of the head
+        c->head_sent += static_cast<std::size_t>(res); // head_sent is an absolute offset into the head
+        const Size head_hi = std::min<Size>(c->head_pin.len, c->get_size);
+        if (c->head_sent < head_hi) {
+            start_send_head(c); // short send -> remainder of the head slice
             return;
         }
-        const Size hl = c->head_pin.len;
-        unpin_if_held(c); // head fully sent -> release the pin
-        c->get_pos = hl;  // stream the disk tail (if any) after the head
+        unpin_if_held(c);     // head slice fully sent -> release the pin
+        c->get_pos = head_hi; // continue (disk tail, if any) from the end of the head slice
         pump_get(c);
         return;
     }
@@ -277,12 +278,15 @@ void StreamLoop::on_send(Conn* c, int res) {
     c->out.clear();
     c->out_sent = 0;
     if (c->state == St::get_header) {
-        if (c->head_pin.valid) { // send the resident head zero-copy straight from the pool
-            c->head_sent = 0;
+        // Send the resident head zero-copy for the part of the range it covers, [get_pos, head_hi).
+        const Size head_hi = c->head_pin.valid ? std::min<Size>(c->head_pin.len, c->get_size) : 0;
+        if (c->get_pos < head_hi) {
+            c->head_sent = c->get_pos; // absolute offset within the head to start from
             c->state = St::get_send_head;
             start_send_head(c);
         } else {
-            pump_get(c); // no resident head -> stream the value from disk
+            unpin_if_held(c); // range is disk-only (or empty) -> drop the unused head pin
+            pump_get(c);
         }
     } else if (c->state == St::get_trailer)
         finish_get(c);

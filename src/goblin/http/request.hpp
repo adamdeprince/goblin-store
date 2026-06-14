@@ -15,13 +15,7 @@ namespace goblin::http {
 
 enum class Method { get, head, other };
 
-// A single RFC 7233 byte-range spec, unresolved (resolve against the object size at serve time).
-struct RangeSpec {
-    enum class Kind { closed, from, suffix };
-    Kind kind = Kind::closed;
-    Offset a = 0; // closed/from: first byte; suffix: number of trailing bytes
-    Offset b = 0; // closed: last byte, inclusive; unused for from/suffix
-};
+using RangeSpec = ByteRange; // RFC 7233 single byte-range (defined in common/types.hpp)
 
 struct Request {
     Method method = Method::other;

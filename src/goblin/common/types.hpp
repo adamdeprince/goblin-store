@@ -25,6 +25,15 @@ inline constexpr Size kMaxObjectSize = 1 * GiB;
 // Device-block / O_DIRECT alignment (ADR-0011) and arena alignment floor (ADR-0008).
 inline constexpr Size kDeviceBlock = 4 * KiB;
 
+// An unresolved RFC 7233 single byte-range (resolved against the object size at serve time). Lives
+// here, not in http/, so the shared streaming loop can carry one without depending on the protocol.
+struct ByteRange {
+    enum class Kind { closed, from, suffix };
+    Kind kind = Kind::closed;
+    Offset a = 0; // closed/from: first byte; suffix: number of trailing bytes
+    Offset b = 0; // closed: last byte, inclusive; unused for from/suffix
+};
+
 constexpr bool is_power_of_two(Size v) noexcept {
     return v != 0 && (v & (v - 1)) == 0;
 }
