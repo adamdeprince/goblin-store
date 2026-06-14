@@ -147,6 +147,7 @@ ParseResult parse_request(std::string_view buf, std::size_t prev_len) {
         const std::string_view value(headers[i].value, headers[i].value_len);
         if (iequals(name, "host")) req.host = trim(value);
         else if (iequals(name, "range")) req.range = parse_range(value);
+        else if (iequals(name, "if-none-match")) req.if_none_match = trim(value);
         else if (iequals(name, "connection")) req.keep_alive = !iequals(trim(value), "close");
     }
 

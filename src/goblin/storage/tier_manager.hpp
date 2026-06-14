@@ -189,6 +189,7 @@ private:
           object_policy_(std::move(object_policy)), max_objects_(max_objects), ssd_(std::move(ssd)),
           hdd_(std::move(hdd)), index_(&ix),
           store_seq_(std::make_unique<std::atomic<std::uint64_t>>(0)),
+          etag_seq_(std::make_unique<std::atomic<std::uint64_t>>(0)),
           mu_(std::make_unique<std::shared_mutex>()) {}
     void drop_object(const Digest&); // free head + unlink files + erase from index & policies
     void enforce_object_bound();     // evict whole objects while over the count limit
@@ -207,6 +208,7 @@ private:
     std::optional<Pool> hdd_;
     Index* index_;
     std::unique_ptr<std::atomic<std::uint64_t>> store_seq_; // unique CoW scratch-file suffixes
+    std::unique_ptr<std::atomic<std::uint64_t>> etag_seq_;  // monotonic store generation -> ETag
     std::unique_ptr<std::shared_mutex> mu_; // rwlock: shared for reads, exclusive for writes (ADR-0018)
     struct RegionPin {
         std::uint32_t len = 0;

@@ -170,6 +170,29 @@ static std::optional<HttpResp> ranged_get(std::uint16_t port, std::string_view p
     return r;
 }
 
+// A GET (or HEAD) with an optional If-None-Match header, on a fresh Connection: close socket.
+static std::optional<HttpResp> cond_get(std::uint16_t port, std::string_view path,
+                                        std::string_view inm, bool head = false) {
+    const int c = client_connect(port);
+    if (c < 0) return std::nullopt;
+    std::string req = head ? "HEAD " : "GET ";
+    req += path;
+    req += " HTTP/1.1\r\nHost: h\r\n";
+    if (!inm.empty()) { req += "If-None-Match: "; req += inm; req += "\r\n"; }
+    req += "Connection: close\r\n\r\n";
+    const auto r = http_req(c, req, /*read_body=*/!head); // HEAD never carries a body
+    ::close(c);
+    return r;
+}
+
+// The quoted ETag value from a response's headers (empty if none).
+static std::string etag_of(const HttpResp& r) {
+    const auto p = r.headers.find("ETag: ");
+    if (p == std::string::npos) return {};
+    const auto start = p + 6;
+    return r.headers.substr(start, r.headers.find("\r\n", start) - start);
+}
+
 TEST("http loop: GET streams the body; HEAD is headers-only; a miss is 404") {
     if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
     auto rc = Reactor::create();
@@ -271,6 +294,60 @@ TEST("http loop: Content-Type comes from the extension (GET, HEAD, and ranged)")
     CHECK(bin_ok);
     CHECK(head_ok);
     CHECK(range_ok);
+}
+
+TEST("http loop: conditional GET/HEAD via ETag -> 304; mismatch -> 200; re-store changes the tag") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("etag");
+    Index index;
+    auto tm = open_tm(base, index);
+    auto io = IoBufferPool::create(128 * KiB, 8, false);
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+    KeyOptions opt; // path mode
+    const std::string body = pattern(7, 2000);
+    CHECK(store_http(*tm, "/page.html", body, opt));
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    HttpLoop loop(*rc, lfd, *tm, index, *io, opt, 0);
+    std::thread th([&] { loop.run(); });
+
+    // 1) plain GET -> 200 carrying an ETag
+    const auto r1 = cond_get(port, "/page.html", "");
+    const std::string etag = r1 ? etag_of(*r1) : "";
+    const bool got = r1 && r1->status == 200 && r1->body == body && !etag.empty();
+    // 2) GET If-None-Match: <etag> -> 304, no body, still advertises the tag
+    const auto r2 = cond_get(port, "/page.html", etag);
+    const bool not_mod = r2 && r2->status == 304 && r2->body.empty() && etag_of(*r2) == etag;
+    // 3) GET with a non-matching tag -> 200 with the body
+    const auto r3 = cond_get(port, "/page.html", "\"deadbeef-9\"");
+    const bool stale = r3 && r3->status == 200 && r3->body == body;
+    // 4) GET If-None-Match: * -> 304 (matches any current representation)
+    const auto r4 = cond_get(port, "/page.html", "*");
+    const bool star = r4 && r4->status == 304;
+    // 5) HEAD If-None-Match: <etag> -> 304
+    const auto r5 = cond_get(port, "/page.html", etag, /*head=*/true);
+    const bool head_nm = r5 && r5->status == 304;
+    // 6) re-store new content -> new generation -> the old tag no longer matches (gets a fresh 200)
+    const std::string body2 = pattern(8, 3000);
+    CHECK(store_http(*tm, "/page.html", body2, opt));
+    const auto r6 = cond_get(port, "/page.html", etag);
+    const bool changed = r6 && r6->status == 200 && r6->body == body2 && etag_of(*r6) != etag;
+
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(got);
+    CHECK(not_mod);
+    CHECK(stale);
+    CHECK(star);
+    CHECK(head_nm);
+    CHECK(changed);
 }
 
 TEST("http loop: keep-alive serves two GETs on one connection, then 405 for PUT") {

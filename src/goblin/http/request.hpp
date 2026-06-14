@@ -22,6 +22,7 @@ struct Request {
     std::string_view target;        // request-target, origin-form "/path?query" (views into the buffer)
     std::string_view host;          // raw Host header (may include :port); empty if absent
     std::optional<RangeSpec> range; // present iff a parseable single "bytes=" Range header was sent
+    std::string_view if_none_match; // raw If-None-Match header (conditional GET); empty if absent
     bool keep_alive = true;         // HTTP/1.1 default; false on "Connection: close"
     int minor_version = 1;          // HTTP/1.<minor>
 };

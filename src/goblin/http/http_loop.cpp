@@ -3,6 +3,7 @@
 #include "goblin/crypto/sha256.hpp"
 #include "goblin/http/request.hpp"
 
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -10,11 +11,26 @@
 namespace goblin::http {
 namespace {
 
-// Append a header-only response (status line + Content-Length + Connection [+ Content-Type]). The
-// body, if any, is streamed separately by the shared loop. Content-Type is emitted only when there
-// is a body to type.
+// Strong ETag for an object: "<size>-<store-generation>" in hex. The generation changes on every
+// (re)store, so the tag is stable for a given stored representation and differs whenever it changes.
+std::string make_etag(const storage::ObjectMeta& m) {
+    return std::format("\"{:x}-{:x}\"", m.size, m.etag);
+}
+
+// RFC 7232 If-None-Match (weak comparison): "*" matches any current representation; otherwise the
+// quoted tag must appear among the listed tags. Searching for the fully-quoted tag (e.g. "7d0-2a")
+// matches both `"7d0-2a"` and `W/"7d0-2a"` and can't prefix-collide with a longer tag.
+bool inm_matches(std::string_view header, std::string_view quoted_etag) {
+    if (header.find('*') != std::string_view::npos) return true;
+    return header.find(quoted_etag) != std::string_view::npos;
+}
+
+// Append a header-only response (status line + Content-Length + Connection [+ Content-Type] [+ ETag]).
+// The body, if any, is streamed separately by the shared loop. Content-Type is emitted only when
+// there is a body to type; ETag whenever one is supplied.
 void append_head(std::string& out, std::string_view status, Size content_length, bool keep_alive,
-                 std::string_view content_type = "application/octet-stream") {
+                 std::string_view content_type = "application/octet-stream",
+                 std::string_view etag = {}) {
     out += "HTTP/1.1 ";
     out += status;
     out += "\r\nContent-Length: ";
@@ -23,6 +39,11 @@ void append_head(std::string& out, std::string_view status, Size content_length,
     if (content_length > 0) {
         out += "Content-Type: ";
         out += content_type;
+        out += "\r\n";
+    }
+    if (!etag.empty()) {
+        out += "ETag: ";
+        out += etag;
         out += "\r\n";
     }
     out += keep_alive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
@@ -39,6 +60,17 @@ constexpr std::string_view k421 =
 
 void HttpLoop::frame_get_hit(Conn* c, const std::string& key, const storage::ObjectMeta& meta) {
     const bool keep_alive = !c->quit_after;
+    const std::string etag = make_etag(meta);
+    // Conditional GET: If-None-Match hit -> 304 Not Modified, no body (get_pos == get_size streams
+    // nothing, like the 416 path), still advertising the validator so the client refreshes its TTL.
+    if (!c->inm.empty() && inm_matches(c->inm, etag)) {
+        c->get_pos = c->get_size = 0;
+        c->out += "HTTP/1.1 304 Not Modified\r\nETag: ";
+        c->out += etag;
+        c->out += "\r\n";
+        c->out += keep_alive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
+        return;
+    }
     const std::string_view ct = content_type_for(key); // from the served object's extension
     if (c->req_range) { // a Range header was sent -> resolve against the actual size
         const auto r = resolve_range(*c->req_range, meta.size);
@@ -58,13 +90,15 @@ void HttpLoop::frame_get_hit(Conn* c, const std::string& key, const storage::Obj
                   std::to_string(meta.size);
         c->out += "\r\nContent-Length: " + std::to_string(len) + "\r\nContent-Type: ";
         c->out += ct;
+        c->out += "\r\nETag: ";
+        c->out += etag;
         c->out += "\r\n";
         c->out += keep_alive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
         return;
     }
     c->get_pos = 0;
     c->get_size = meta.size; // whole object
-    append_head(c->out, "200 OK", meta.size, keep_alive, ct);
+    append_head(c->out, "200 OK", meta.size, keep_alive, ct, etag);
 }
 
 void HttpLoop::frame_get_miss(Conn* c) {
@@ -91,6 +125,9 @@ void HttpLoop::process(Conn* c) {
         // a connection opened for one tenant can't fetch another's content (plaintext has no sni).
         // Evaluate it BEFORE erasing `in` — pr.req.host is a view into it.
         const bool host_ok = c->sni.empty() || normalize_host(pr.req.host) == c->sni;
+        // Copy If-None-Match out before erasing `in` (it views into the buffer); used by the GET hit
+        // (frame_get_hit) and the HEAD below for conditional 304s. Reassigned every request.
+        c->inm.assign(pr.req.if_none_match.data(), pr.req.if_none_match.size());
         c->in.erase(0, pr.consumed); // request head consumed; GET/HEAD carry no body
         if (!host_ok) {
             c->out += k421;
@@ -107,8 +144,17 @@ void HttpLoop::process(Conn* c) {
         } else if (method == Method::head) {
             if (!key) { c->out += k400; c->quit_after = true; break; }
             const auto meta = index_.lookup(crypto::hash_key(*key)); // headers only, no body/stream
-            if (meta) append_head(c->out, "200 OK", meta->size, !c->quit_after, content_type_for(*key));
-            else append_head(c->out, "404 Not Found", 0, !c->quit_after);
+            if (!meta) {
+                append_head(c->out, "404 Not Found", 0, !c->quit_after);
+            } else {
+                const std::string etag = make_etag(*meta);
+                if (!c->inm.empty() && inm_matches(c->inm, etag)) { // conditional HEAD -> 304
+                    c->out += "HTTP/1.1 304 Not Modified\r\nETag: " + etag + "\r\n";
+                    c->out += !c->quit_after ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
+                } else {
+                    append_head(c->out, "200 OK", meta->size, !c->quit_after, content_type_for(*key), etag);
+                }
+            }
         } else {
             c->out += k405; // PUT/POST/DELETE/... not served yet
             c->quit_after = true;

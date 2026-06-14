@@ -57,6 +57,7 @@ protected:
         // GET streaming state:
         std::string get_key;        // final (post-derivation) key, kept to re-open_snapshot when parked
         std::optional<ByteRange> req_range; // requested sub-range (HTTP Range), resolved in frame_get_hit
+        std::string inm;            // HTTP If-None-Match (conditional GET), used in frame_get_hit; empty=absent
         std::optional<storage::TierManager::ReadStream> rs; // open object files for this GET
         MutBytes iobuf;             // borrowed I/O-pool buffer (value pieces land here)
         bool have_iobuf = false;

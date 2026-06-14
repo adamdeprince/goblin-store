@@ -31,6 +31,7 @@ struct ObjectMeta {
     Size size = 0;            // total object size in bytes
     std::uint32_t flags = 0;  // opaque memcache flags
     std::uint32_t expiry = 0; // unix seconds; 0 = never (TTL swept separately, ADR-0007)
+    std::uint64_t etag = 0;   // store generation -> HTTP ETag validator; changes on every (re)store
     HeadLoc head;             // RAM-head cache locator
     // eviction bookkeeping (SIEVE visited bit, etc.) lands with the eviction module (ADR-0012)
 };

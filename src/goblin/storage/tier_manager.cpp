@@ -350,6 +350,7 @@ Status TierManager::StoreHandle::commit(std::uint32_t flags) {
     ObjectMeta meta;
     meta.size = layout_.size;
     meta.flags = flags;
+    meta.etag = tm_->etag_seq_->fetch_add(1, std::memory_order_relaxed) + 1; // unique per (re)store
     if (head_) meta.head = HeadLoc{head_->block, head_->offset, head_->len};
     tm_->index_->set(digest_, meta);
     if (head_) tm_->policy_->insert(digest_);
