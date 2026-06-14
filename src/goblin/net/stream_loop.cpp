@@ -1,6 +1,7 @@
 #include "goblin/net/stream_loop.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -245,7 +246,17 @@ void StreamLoop::start_send_head(Conn* c) {
 }
 
 void StreamLoop::on_send(Conn* c, int res) {
-    if (res <= 0) {
+    if (res < 0) {
+        if (res == -EAGAIN || res == -EWOULDBLOCK) { // non-blocking fd (kTLS/HTTPS): buffer full -> retry
+            if (c->state == St::get_send_piece) start_send_piece(c);
+            else if (c->state == St::get_send_head) start_send_head(c);
+            else start_send(c);
+            return;
+        }
+        close_conn(c);
+        return;
+    }
+    if (res == 0) { // peer closed
         close_conn(c);
         return;
     }

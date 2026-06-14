@@ -11,6 +11,7 @@
 #include "goblin/storage/pool_dir.hpp"
 
 #include <charconv>
+#include <csignal>
 #include <cstdio>
 #include <optional>
 #include <print>
@@ -78,6 +79,7 @@ void print_help() {
 } // namespace
 
 int main(int argc, char** argv) {
+    std::signal(SIGPIPE, SIG_IGN); // a peer that closes mid-write must not kill us (TLS BIO writes)
     ServerConfig cfg;
     std::span<char*> args(argv + 1, argc > 0 ? static_cast<std::size_t>(argc - 1) : 0);
 

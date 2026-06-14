@@ -79,11 +79,12 @@ void HttpLoop::process(Conn* c) {
         const Method method = pr.req.method;
         const std::optional<std::string> key = derive_key(pr.req.host, pr.req.target, keyopt_);
         c->quit_after = !pr.req.keep_alive;
-        c->in.erase(0, pr.consumed); // request head consumed; GET/HEAD carry no body
-
         // Strict per-tenant isolation (HTTPS only): the request Host must match the handshake SNI, so
-        // a connection opened for one tenant can't fetch another's content. Plaintext has no sni.
-        if (!c->sni.empty() && normalize_host(pr.req.host) != c->sni) {
+        // a connection opened for one tenant can't fetch another's content (plaintext has no sni).
+        // Evaluate it BEFORE erasing `in` — pr.req.host is a view into it.
+        const bool host_ok = c->sni.empty() || normalize_host(pr.req.host) == c->sni;
+        c->in.erase(0, pr.consumed); // request head consumed; GET/HEAD carry no body
+        if (!host_ok) {
             c->out += k421;
             c->quit_after = true;
             break;
