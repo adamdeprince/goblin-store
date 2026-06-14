@@ -1,6 +1,7 @@
 #include "goblin/protocol/memcache/server.hpp"
 
 #include "goblin/crypto/sha256.hpp"
+#include "goblin/http/http_loop.hpp"
 #include "goblin/protocol/memcache/event_loop.hpp"
 #include "goblin/protocol/memcache/protocol.hpp"
 
@@ -246,30 +247,55 @@ void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     ::close(*lfd);
 }
 
+// HTTP object server (ADR-0005/0015): its own io_uring ring + read pool + SO_REUSEPORT listener on
+// the HTTP port, so slow HTTP downloads draw from a separate buffer budget and can't starve memcache.
+void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
+                 unsigned id) {
+    auto reactor = core::Reactor::create();
+    if (!reactor) { std::println(stderr, "http worker {}: {}", id, reactor.error().detail); return; }
+    auto iobufs =
+        core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory);
+    if (!iobufs) { std::println(stderr, "http worker {}: {}", id, iobufs.error().detail); return; }
+    auto lfd = make_listener(cfg.http_port, /*reuseport=*/true);
+    if (!lfd) { std::println(stderr, "http worker {}: {}", id, lfd.error().detail); return; }
+    http::KeyOptions keyopt;
+    keyopt.mode = cfg.http_vhost ? http::KeyMode::vhost : http::KeyMode::path;
+    keyopt.keep_query = cfg.key_on_query;
+    http::HttpLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, cfg.io_timeout_ms);
+    loop.run();
+    ::close(*lfd);
+}
+
 } // namespace
 
 Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index) {
     unsigned n = cfg.cores ? cfg.cores : std::thread::hardware_concurrency();
     if (n == 0) n = 1;
     std::vector<std::thread> workers;
-    workers.reserve(n);
+    int blocking_lfd = -1; // shared listener for blocking-mode memcache; closed after join
 
-    if (cfg.net == NetMode::async) {
-        // Each worker: its own io_uring ring + I/O pool + SO_REUSEPORT listener (ADR-0002).
+    // memcache: async io_uring loops, or the blocking thread-per-core fallback (--net blocking).
+    if (cfg.enable_memcache) {
+        if (cfg.net == NetMode::async) {
+            for (unsigned i = 0; i < n; ++i)
+                workers.emplace_back([&cfg, &tm, &index, i] { async_worker(cfg, tm, index, i); });
+        } else {
+            auto lfd = make_listener(cfg.memcache_port); // one shared listener, kernel load-balances
+            if (!lfd) return std::unexpected(lfd.error());
+            blocking_lfd = *lfd;
+            for (unsigned i = 0; i < n; ++i)
+                workers.emplace_back(
+                    [&cfg, &tm, &index, i, fd = blocking_lfd] { worker_loop(fd, cfg, tm, index, i); });
+        }
+    }
+    // HTTP: always async, on its own loops + read pool (per-protocol isolation, ADR-0011).
+    if (cfg.enable_http) {
         for (unsigned i = 0; i < n; ++i)
-            workers.emplace_back([&cfg, &tm, &index, i] { async_worker(cfg, tm, index, i); });
-        for (auto& t : workers) t.join();
-        return {};
+            workers.emplace_back([&cfg, &tm, &index, i] { http_worker(cfg, tm, index, i); });
     }
 
-    // Blocking thread-per-core: one shared listener, the kernel hands each conn to a free worker.
-    auto lfd = make_listener(cfg.memcache_port);
-    if (!lfd) return std::unexpected(lfd.error());
-    const int fd = *lfd;
-    for (unsigned i = 0; i < n; ++i)
-        workers.emplace_back([fd, &cfg, &tm, &index, i] { worker_loop(fd, cfg, tm, index, i); });
     for (auto& t : workers) t.join();
-    ::close(fd);
+    if (blocking_lfd >= 0) ::close(blocking_lfd);
     return {};
 }
 

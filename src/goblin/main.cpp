@@ -210,16 +210,18 @@ int main(int argc, char** argv) {
     }
     // Each worker creates its own reactor + I/O-buffer pool (thread-per-core, ADR-0018).
 
-    if (cfg.enable_http || cfg.enable_https)
-        std::println("note: HTTP/HTTPS listener not wired yet — serving memcache only for now");
-
-    if (!cfg.enable_memcache) {
-        std::println("no memcache listener and HTTP not implemented yet — nothing to serve");
+    if (cfg.enable_https)
+        std::println("note: HTTPS (TLS) not wired yet — serving plaintext listeners only for now");
+    if (!cfg.enable_memcache && !cfg.enable_http) {
+        std::println("no plaintext listener enabled (HTTPS not wired yet) — nothing to serve");
         return 0;
     }
-    std::println("listening: memcache/tcp :{}  (Ctrl-C to stop)", cfg.memcache_port);
+    std::string listening = "listening:";
+    if (cfg.enable_memcache) listening += " memcache/tcp :" + std::to_string(cfg.memcache_port);
+    if (cfg.enable_http) listening += " http/tcp :" + std::to_string(cfg.http_port);
+    std::println("{}  (Ctrl-C to stop)", listening);
     if (auto st = memcache::serve(cfg, *tm, index); !st) {
-        std::println(stderr, "memcache: {}", st.error().detail);
+        std::println(stderr, "serve: {}", st.error().detail);
         return 1;
     }
     return 0;
