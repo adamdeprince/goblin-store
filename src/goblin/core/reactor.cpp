@@ -48,6 +48,14 @@ bool Reactor::submit_accept(int listen_fd, std::uint64_t user_data) {
     return true;
 }
 
+bool Reactor::submit_poll(int fd, unsigned poll_mask, std::uint64_t user_data) {
+    io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
+    if (!sqe) return false;
+    io_uring_prep_poll_add(sqe, fd, poll_mask);
+    io_uring_sqe_set_data64(sqe, user_data);
+    return true;
+}
+
 int Reactor::submit() {
     const int n = io_uring_submit(ring_.get());
     return n < 0 ? 0 : n;
@@ -108,6 +116,7 @@ bool Reactor::submit_read(int, std::uint64_t, MutBytes, std::uint64_t) { return 
 bool Reactor::submit_recv(int, MutBytes, std::uint64_t) { return false; }
 bool Reactor::submit_send(int, ByteView, std::uint64_t) { return false; }
 bool Reactor::submit_accept(int, std::uint64_t) { return false; }
+bool Reactor::submit_poll(int, unsigned, std::uint64_t) { return false; }
 int Reactor::submit() { return 0; }
 int Reactor::submit_and_wait(unsigned) { return 0; }
 void Reactor::submit_and_wait_timeout(unsigned) {}

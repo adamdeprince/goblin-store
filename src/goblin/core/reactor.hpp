@@ -43,6 +43,9 @@ public:
     bool submit_recv(int fd, MutBytes buf, std::uint64_t user_data);
     bool submit_send(int fd, ByteView buf, std::uint64_t user_data);
     bool submit_accept(int listen_fd, std::uint64_t user_data);
+    // One-shot readiness poll (POLLIN/POLLOUT): the Completion's `res` is the ready events. Used to
+    // drive OpenSSL's non-blocking handshake/read on the loop (ADR-0005).
+    bool submit_poll(int fd, unsigned poll_mask, std::uint64_t user_data);
 
     int submit();                          // flush queued SQEs; returns count submitted
     int submit_and_wait(unsigned min_complete); // flush + block until >= min_complete completions

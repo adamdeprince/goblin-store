@@ -51,6 +51,7 @@ protected:
         std::string in;           // accumulated unparsed request bytes
         std::string out;          // response header / status line / trailer pending send
         std::size_t out_sent = 0; // partial-send progress into out
+        std::string sni;          // TLS SNI, set after the handshake (empty = plaintext); HTTPS enforces Host==sni
 
         // GET streaming state:
         std::string get_key;        // final (post-derivation) key, kept to re-open_snapshot when parked
@@ -83,13 +84,19 @@ protected:
     virtual void frame_get_miss(Conn*) = 0;           // queue the miss response (END / 404), state -> idle
     virtual void on_value_sent(Conn*) = 0;            // value fully streamed: trailer (memcache) or finish (HTTP)
 
+    // ---- optional seams (default to plaintext); HTTPS overrides them to drive the TLS handshake/read ----
+    virtual void on_connection(Conn* c) { start_recv(c); } // first action after accept (TLS: handshake)
+    virtual void on_poll(Conn* c, int /*revents*/) { close_conn(c); } // a readiness poll fired (TLS only)
+    virtual void on_destroy(Conn*) {}                      // conn retiring -> free any per-conn TLS state
+
     // ---- shared machinery the subclass drives ----
     bool begin_get(Conn*, const std::string& key); // open the GET; false if parked on read-pool exhaustion
-    void start_recv(Conn*);                         // post a recv for the next request bytes
+    virtual void start_recv(Conn*);                 // post a recv (HTTPS overrides: poll-driven SSL_read)
     void start_send(Conn*);                         // (re)send the pending `out`
     void close_conn(Conn*);
     void finish_get(Conn*); // GET fully served -> release buffers, resume parsing
 
+    enum Op : unsigned { kRecv = 1, kSend = 2, kRead = 3, kPoll = 4 }; // user_data low 3 bits
     static std::uint64_t tag(Conn* c, unsigned op) { return reinterpret_cast<std::uint64_t>(c) | op; }
 
     core::Reactor& r_;
@@ -101,7 +108,6 @@ protected:
 
 private:
     static constexpr std::uint64_t kAccept = 0; // user_data for the listener accept (no Conn)
-    enum Op : unsigned { kRecv = 1, kSend = 2, kRead = 3 };
 
     void arm_accept();
     void on_accept(int res);

@@ -26,6 +26,8 @@ constexpr std::string_view k400 =
     "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 constexpr std::string_view k405 =
     "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nAllow: GET, HEAD\r\nConnection: close\r\n\r\n";
+constexpr std::string_view k421 =
+    "HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 } // namespace
 
@@ -78,6 +80,14 @@ void HttpLoop::process(Conn* c) {
         const std::optional<std::string> key = derive_key(pr.req.host, pr.req.target, keyopt_);
         c->quit_after = !pr.req.keep_alive;
         c->in.erase(0, pr.consumed); // request head consumed; GET/HEAD carry no body
+
+        // Strict per-tenant isolation (HTTPS only): the request Host must match the handshake SNI, so
+        // a connection opened for one tenant can't fetch another's content. Plaintext has no sni.
+        if (!c->sni.empty() && normalize_host(pr.req.host) != c->sni) {
+            c->out += k421;
+            c->quit_after = true;
+            break;
+        }
 
         if (method == Method::get) {
             if (!key) { c->out += k400; c->quit_after = true; break; } // vhost mode without a Host

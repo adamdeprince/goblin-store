@@ -43,6 +43,8 @@ void StreamLoop::run_once() {
             on_send(c, res);
         else if (op == kRead)
             on_read(c, res);
+        else if (op == kPoll)
+            on_poll(c, res);
         retire(c);
     }
     // After dispatch (incl. any write commits / GET completions that freed buffers this tick), wake
@@ -71,7 +73,7 @@ void StreamLoop::on_accept(int res) {
     up->last_progress = std::chrono::steady_clock::now();
     Conn* c = up.get();
     conns_.emplace(c, std::move(up));
-    start_recv(c);
+    on_connection(c); // plaintext: start_recv; HTTPS: begin the TLS handshake
 }
 
 void StreamLoop::start_recv(Conn* c) {
@@ -335,6 +337,7 @@ void StreamLoop::retire(Conn* c) {
     if (c->closing && c->inflight == 0) {
         release_iobuf(c);  // in case we closed mid-GET
         unpin_if_held(c);  // release the head pin if a send was interrupted
+        on_destroy(c);     // free any per-conn TLS state before the Conn goes away
         conns_.erase(c);
     }
 }
