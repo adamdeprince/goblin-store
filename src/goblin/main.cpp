@@ -65,6 +65,7 @@ void print_help() {
         "  --source DIR        preload a directory tree at startup (repeatable)\n"
         "  --http-vhost        HTTP key = Host + URI (default: key = URI path)\n"
         "  --key-on-query      include the query string in the key (default: strip)\n"
+        "  --key-strip-slash   drop the leading '/' from path-mode keys (memcache 'set foo' == GET /foo)\n"
         "  --no-http           disable the plaintext HTTP listener\n"
         "  --no-memcache       disable the memcache/TCP listener\n"
         "  --no-mlock          don't mlock the RAM pool (dev; raise RLIMIT_MEMLOCK in prod)\n"
@@ -100,8 +101,9 @@ int main(int argc, char** argv) {
         else if (a == "--ssd-dir") { auto v = take(a); if (!v) return 2; cfg.ssd.dirs.emplace_back(*v); }
         else if (a == "--hdd-dir") { auto v = take(a); if (!v) return 2; cfg.hdd.dirs.emplace_back(*v); }
         else if (a == "--source")  { auto v = take(a); if (!v) return 2; cfg.sources.emplace_back(*v); }
-        else if (a == "--http-vhost")   { cfg.http_vhost = true; }
-        else if (a == "--key-on-query") { cfg.key_on_query = true; }
+        else if (a == "--http-vhost")     { cfg.http_vhost = true; }
+        else if (a == "--key-on-query")   { cfg.key_on_query = true; }
+        else if (a == "--key-strip-slash") { cfg.key_strip_slash = true; }
         else if (a == "--no-http")     { cfg.enable_http = false; }
         else if (a == "--no-memcache") { cfg.enable_memcache = false; }
         else if (a == "--no-mlock")    { cfg.memory.lock_memory = false; }
@@ -219,6 +221,7 @@ int main(int argc, char** argv) {
         http::KeyOptions keyopt;
         keyopt.mode = cfg.http_vhost ? http::KeyMode::vhost : http::KeyMode::path;
         keyopt.keep_query = cfg.key_on_query;
+        keyopt.strip_leading_slash = cfg.key_strip_slash;
         const std::size_t n = http::preload_sources(cfg.sources, keyopt, *tm);
         std::println("preloaded {} file(s) from {} source dir(s)", n, cfg.sources.size());
     }

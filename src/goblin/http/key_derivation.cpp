@@ -87,6 +87,7 @@ std::optional<std::string> derive_key(std::string_view host, std::string_view ur
         if (h.empty()) return std::nullopt; // vhost requires a Host header
         return h + key;                     // host first; `key` carries the leading '/'
     }
+    if (opt.strip_leading_slash) return key.substr(1); // 'foo' instead of '/foo' (canonical_path => '/...')
     return key;
 }
 
@@ -103,7 +104,9 @@ std::string derive_key_from_relpath(std::string_view relpath, const KeyOptions& 
     }
     std::string p = "/";
     p.append(relpath.data(), relpath.size());
-    return canonical_path(p, /*decode=*/false); // filesystem names are literal — never percent-decode
+    std::string key = canonical_path(p, /*decode=*/false); // filesystem names are literal — never percent-decode
+    if (opt.strip_leading_slash) return key.substr(1); // line up with HTTP `GET /<relpath>` under the same flag
+    return key;
 }
 
 } // namespace goblin::http

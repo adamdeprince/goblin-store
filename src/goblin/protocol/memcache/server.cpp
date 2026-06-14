@@ -263,6 +263,7 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
     http::KeyOptions keyopt;
     keyopt.mode = cfg.http_vhost ? http::KeyMode::vhost : http::KeyMode::path;
     keyopt.keep_query = cfg.key_on_query;
+    keyopt.strip_leading_slash = cfg.key_strip_slash;
     http::HttpLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, cfg.io_timeout_ms, &reg);
     loop.run();
     ::close(*lfd);
@@ -284,6 +285,7 @@ void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     http::KeyOptions keyopt;
     keyopt.mode = cfg.http_vhost ? http::KeyMode::vhost : http::KeyMode::path;
     keyopt.keep_query = cfg.key_on_query;
+    keyopt.strip_leading_slash = cfg.key_strip_slash;
     http::HttpsLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, ctx, cfg.io_timeout_ms, &reg);
     loop.run();
     ::close(*lfd);

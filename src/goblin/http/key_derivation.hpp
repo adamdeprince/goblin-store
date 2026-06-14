@@ -17,6 +17,10 @@ enum class KeyMode {
 struct KeyOptions {
     KeyMode mode = KeyMode::path;
     bool keep_query = false; // false => strip the query string (default, ADR-0015)
+    // path mode only: drop the canonical key's leading '/', so HTTP `GET /foo` and a raw memcache
+    // `set foo` resolve to the same key (default off => key is the literal path, '/foo'). vhost mode
+    // is unaffected — there the leading '/' separates host from path (`example.com/foo`).
+    bool strip_leading_slash = false;
 };
 
 // Derive the key for an HTTP request. `host` is the raw Host header (may carry a port); it is
