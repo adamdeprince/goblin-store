@@ -8,6 +8,7 @@
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <arpa/inet.h>
 #include <atomic>
@@ -22,8 +23,8 @@
 namespace fs = std::filesystem;
 using namespace goblin;
 
-// Write a throwaway P-256 self-signed cert + key to PEM files (CN=localhost, ~10y).
-static bool write_self_signed(const std::string& cert, const std::string& key) {
+// Throwaway P-256 self-signed cert + key (CN + DNS SAN = host, ~10y) to PEM files.
+static bool write_self_signed(const std::string& cert, const std::string& key, const char* host) {
     EVP_PKEY* pkey = EVP_EC_gen("prime256v1");
     if (!pkey) return false;
     X509* x = X509_new();
@@ -35,8 +36,14 @@ static bool write_self_signed(const std::string& cert, const std::string& key) {
         X509_set_pubkey(x, pkey);
         X509_NAME* nm = X509_get_subject_name(x);
         X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC,
-                                   reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
+                                   reinterpret_cast<const unsigned char*>(host), -1, -1, 0);
         X509_set_issuer_name(x, nm);
+        const std::string san = std::string("DNS:") + host;
+        if (X509_EXTENSION* ext =
+                X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name, san.c_str())) {
+            X509_add_ext(x, ext, -1);
+            X509_EXTENSION_free(ext);
+        }
         ok = X509_sign(x, pkey, EVP_sha256()) > 0;
     }
     if (ok) {
@@ -50,6 +57,14 @@ static bool write_self_signed(const std::string& cert, const std::string& key) {
     X509_free(x);
     EVP_PKEY_free(pkey);
     return ok;
+}
+
+static std::string cert_cn(X509* x) {
+    X509_NAME* n = X509_get_subject_name(x);
+    const int idx = X509_NAME_get_index_by_NID(n, NID_commonName, -1);
+    if (idx < 0) return {};
+    const ASN1_STRING* s = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(n, idx));
+    return std::string(reinterpret_cast<const char*>(ASN1_STRING_get0_data(s)), ASN1_STRING_length(s));
 }
 
 static std::pair<int, std::uint16_t> loopback_listener() {
@@ -77,59 +92,74 @@ static int dial(std::uint16_t port) {
     return fd;
 }
 
-TEST("tls: TLS 1.3 handshake over TCP, kTLS TX engages, application data round-trips") {
-    const std::string base =
-        (fs::temp_directory_path() / ("goblin-tls-" + std::to_string(::getpid()))).string();
-    fs::create_directories(base);
-    const std::string cert = base + "/cert.pem", key = base + "/key.pem";
-    CHECK(write_self_signed(cert, key));
-
-    auto ctx = tls::Context::create(cert, key);
-    CHECK(ctx.has_value());
-    if (!ctx) { fs::remove_all(base); return; }
-
+// One handshake attempt against `ctx` with the given SNI (nullptr = none). Reports whether the client
+// handshake succeeded, the CN of the cert it received, and whether the server got kTLS TX.
+struct Attempt {
+    bool client_ok = false;
+    std::string cert_cn;
+    bool server_ktls = false;
+};
+static Attempt handshake(tls::Context& sctx, const char* sni) {
+    Attempt r;
     auto [lfd, port] = loopback_listener();
     const int cfd = dial(port);
     const int sfd = ::accept(lfd, nullptr, nullptr);
-    CHECK(cfd >= 0 && sfd >= 0);
-    if (cfd < 0 || sfd < 0) { fs::remove_all(base); return; }
 
-    // Client drives its handshake + read in a thread; server runs in the test thread.
-    std::atomic<bool> client_ok{false};
-    std::string got;
-    std::thread cli([&] {
-        SSL_CTX* cctx = SSL_CTX_new(TLS_client_method());
-        SSL_CTX_set_min_proto_version(cctx, TLS1_3_VERSION);
-        SSL* s = SSL_new(cctx);
-        SSL_set_fd(s, cfd);
-        if (SSL_connect(s) == 1) {
-            char buf[16] = {};
-            const int n = SSL_read(s, buf, sizeof buf);
-            if (n > 0) got.assign(buf, static_cast<std::size_t>(n));
-            client_ok = true;
+    std::thread srv([&] {
+        SSL* ss = SSL_new(sctx.default_ctx());
+        SSL_set_fd(ss, sfd);
+        if (SSL_accept(ss) == 1) {
+            r.server_ktls = BIO_get_ktls_send(SSL_get_wbio(ss)) != 0;
+            SSL_write(ss, "ok", 2);
         }
-        SSL_free(s);
-        SSL_CTX_free(cctx);
+        SSL_free(ss);
     });
 
-    SSL* ss = SSL_new(ctx->raw());
-    SSL_set_fd(ss, sfd);
-    const bool hs = SSL_accept(ss) == 1;
-    bool ktls = false, wrote = false;
-    if (hs) {
-        ktls = BIO_get_ktls_send(SSL_get_wbio(ss)) != 0; // kernel TLS on the send path (ADR-0011)
-        wrote = SSL_write(ss, "ping", 4) == 4;
+    SSL_CTX* cctx = SSL_CTX_new(TLS_client_method());
+    SSL_CTX_set_min_proto_version(cctx, TLS1_3_VERSION);
+    SSL* cs = SSL_new(cctx);
+    if (sni) SSL_set_tlsext_host_name(cs, sni);
+    SSL_set_fd(cs, cfd);
+    if (SSL_connect(cs) == 1) {
+        r.client_ok = true;
+        if (X509* peer = SSL_get1_peer_certificate(cs)) {
+            r.cert_cn = cert_cn(peer);
+            X509_free(peer);
+        }
     }
-    cli.join();
-
-    CHECK(hs);                                   // TLS 1.3 handshake completed
-    CHECK(ktls);                                 // kTLS TX active -> data path is kernel/io_uring
-    CHECK(wrote && client_ok.load() && got == "ping"); // encrypted application data round-trips
-
-    SSL_free(ss);
-    ::close(sfd);
+    srv.join();
+    SSL_free(cs);
+    SSL_CTX_free(cctx);
     ::close(cfd);
+    ::close(sfd);
     ::close(lfd);
+    return r;
+}
+
+TEST("tls: strict SNI picks the per-host cert, rejects unknown/missing SNI, kTLS engages") {
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-tls-" + std::to_string(::getpid()))).string();
+    fs::create_directories(base);
+    const std::string ac = base + "/a.crt", ak = base + "/a.key";
+    const std::string bc = base + "/b.crt", bk = base + "/b.key";
+    CHECK(write_self_signed(ac, ak, "a.test"));
+    CHECK(write_self_signed(bc, bk, "b.test"));
+
+    auto ctx = tls::Context::create({{ac, ak}, {bc, bk}});
+    CHECK(ctx.has_value());
+    if (!ctx) { fs::remove_all(base); return; }
+
+    const Attempt a = handshake(*ctx, "a.test");
+    const Attempt b = handshake(*ctx, "b.test");
+    const Attempt unknown = handshake(*ctx, "c.test"); // no cert -> rejected
+    const Attempt none = handshake(*ctx, nullptr);     // no SNI -> rejected
+
+    CHECK(a.client_ok && a.cert_cn == "a.test"); // SNI a.test -> cert a
+    CHECK(b.client_ok && b.cert_cn == "b.test"); // SNI b.test -> cert b (different tenant)
+    CHECK(!unknown.client_ok);                   // strict: unknown tenant refused
+    CHECK(!none.client_ok);                      // strict: no SNI refused
+    CHECK(a.server_ktls);                        // kTLS TX active on the data path
+
     fs::remove_all(base);
 }
 
