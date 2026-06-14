@@ -7,6 +7,7 @@ using namespace goblin::http;
 static KeyOptions path_mode(bool q = false) { return KeyOptions{KeyMode::path, q}; }
 static KeyOptions vhost_mode(bool q = false) { return KeyOptions{KeyMode::vhost, q}; }
 static KeyOptions path_strip(bool q = false) { return KeyOptions{KeyMode::path, q, true}; }
+static KeyOptions path_index() { return KeyOptions{KeyMode::path, false, false, "index.html"}; }
 
 TEST("derive_key: path mode = canonical URI path (leading slash)") {
     const auto k = derive_key("ignored", "/foo/bar.tar.gz", path_mode());
@@ -74,4 +75,23 @@ TEST("duality holds under --key-strip-slash: HTTP request == --source file") {
     CHECK(http_p.has_value());
     CHECK(*http_p == derive_key_from_relpath("bar/baz.txt", path_strip()));
     CHECK(derive_key_from_relpath("bar/baz.txt", path_strip()) == "bar/baz.txt");
+}
+
+TEST("derive_key: directory index appends index.html for paths ending in '/'") {
+    CHECK(*derive_key("h", "/", path_index()) == "/index.html");
+    CHECK(*derive_key("h", "/blog/", path_index()) == "/blog/index.html");
+    CHECK(*derive_key("h", "/blog", path_index()) == "/blog");           // no trailing slash -> untouched
+    CHECK(*derive_key("h", "/a/../", path_index()) == "/index.html");    // appended before canonicalization
+}
+
+TEST("derive_key: directory index applies in vhost mode and composes with --key-strip-slash") {
+    const KeyOptions vidx{KeyMode::vhost, false, false, "index.html"};
+    CHECK(*derive_key("example.com", "/", vidx) == "example.com/index.html");
+    const KeyOptions sidx{KeyMode::path, false, /*strip=*/true, "index.html"};
+    CHECK(*derive_key("h", "/blog/", sidx) == "blog/index.html"); // index, then leading slash dropped
+}
+
+TEST("derive_key_from_relpath ignores index_name (preload stores literal filenames)") {
+    // --source files are literal; the dir-index mapping is request-only, so a relpath is unchanged.
+    CHECK(derive_key_from_relpath("blog/index.html", path_index()) == "/blog/index.html");
 }

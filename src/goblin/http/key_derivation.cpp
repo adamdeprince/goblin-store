@@ -79,7 +79,16 @@ std::optional<std::string> derive_key(std::string_view host, std::string_view ur
         query_part = u.substr(q); // includes the leading '?'
     }
 
-    std::string key = canonical_path(path_part, /*decode=*/true);
+    // Directory index: a path ending in '/' (or an empty target) names a directory -> serve the
+    // configured index file. Appended before canonicalization so dot-segments still resolve.
+    std::string key;
+    if (!opt.index_name.empty() && (path_part.empty() || path_part.back() == '/')) {
+        std::string dir(path_part);
+        dir += opt.index_name; // '/' -> '/index.html', '/blog/' -> '/blog/index.html'
+        key = canonical_path(dir, /*decode=*/true);
+    } else {
+        key = canonical_path(path_part, /*decode=*/true);
+    }
     if (opt.keep_query && !query_part.empty()) key.append(query_part.data(), query_part.size());
 
     if (opt.mode == KeyMode::vhost) {

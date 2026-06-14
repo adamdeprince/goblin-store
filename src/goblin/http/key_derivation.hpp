@@ -21,6 +21,12 @@ struct KeyOptions {
     // `set foo` resolve to the same key (default off => key is the literal path, '/foo'). vhost mode
     // is unaffected — there the leading '/' separates host from path (`example.com/foo`).
     bool strip_leading_slash = false;
+    // HTTP directory index (request path only): when non-empty, a request whose path ends in '/'
+    // (e.g. '/' or '/blog/') has this filename appended before canonicalization, so `GET /` resolves
+    // to the `<index_name>` object. Honoured only in derive_key, which the HTTP/HTTPS loops call —
+    // memcache uses raw keys (never derive_key) and the --source preloader leaves this empty, so the
+    // mapping is HTTP-request-only.
+    std::string index_name = {}; // default member init so partial aggregate inits don't warn
 };
 
 // Derive the key for an HTTP request. `host` is the raw Host header (may carry a port); it is

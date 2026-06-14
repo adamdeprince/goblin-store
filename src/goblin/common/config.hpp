@@ -66,6 +66,7 @@ struct ServerConfig {
     bool          http_vhost   = false;   // key = Host + URI  (default: key = URI path)
     bool          key_on_query = false;   // include the query string in the key (default: strip)
     bool          key_strip_slash = false; // path mode: drop the key's leading '/' (so `set foo` == GET /foo)
+    std::string   http_index = "index.html"; // HTTP-only dir index for paths ending in '/'; empty = off
     std::vector<std::string> sources;     // --source dirs preloaded at startup
 
     // Streaming I/O buffers (ADR-0017) — separate from the head pool. io_buffers applies per worker

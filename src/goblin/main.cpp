@@ -66,6 +66,8 @@ void print_help() {
         "  --http-vhost        HTTP key = Host + URI (default: key = URI path)\n"
         "  --key-on-query      include the query string in the key (default: strip)\n"
         "  --key-strip-slash   drop the leading '/' from path-mode keys (memcache 'set foo' == GET /foo)\n"
+        "  --http-index NAME   index file for HTTP paths ending in '/'  [default index.html]\n"
+        "  --no-http-index     disable HTTP directory-index mapping\n"
         "  --no-http           disable the plaintext HTTP listener\n"
         "  --no-memcache       disable the memcache/TCP listener\n"
         "  --no-mlock          don't mlock the RAM pool (dev; raise RLIMIT_MEMLOCK in prod)\n"
@@ -104,6 +106,8 @@ int main(int argc, char** argv) {
         else if (a == "--http-vhost")     { cfg.http_vhost = true; }
         else if (a == "--key-on-query")   { cfg.key_on_query = true; }
         else if (a == "--key-strip-slash") { cfg.key_strip_slash = true; }
+        else if (a == "--http-index")     { auto v = take(a); if (!v) return 2; cfg.http_index = std::string(*v); }
+        else if (a == "--no-http-index")  { cfg.http_index.clear(); }
         else if (a == "--no-http")     { cfg.enable_http = false; }
         else if (a == "--no-memcache") { cfg.enable_memcache = false; }
         else if (a == "--no-mlock")    { cfg.memory.lock_memory = false; }
