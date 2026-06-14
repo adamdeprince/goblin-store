@@ -66,9 +66,11 @@ struct ServerConfig {
     bool          key_on_query = false;   // include the query string in the key (default: strip)
     std::vector<std::string> sources;     // --source dirs preloaded at startup
 
-    // Streaming I/O buffers (ADR-0017) — small, separate from the head pool
+    // Streaming I/O buffers (ADR-0017) — separate from the head pool. io_buffers applies per worker
+    // to the read pool and (once) to the write-staging pool; each is io_chunk_bytes.
     Size          io_chunk_bytes = 256 * KiB; // per-chunk streaming buffer size
-    unsigned      io_buffers     = 8;          // number of streaming chunk buffers
+    unsigned      io_buffers     = 64;         // streaming chunk buffers (read pool/worker; write staging)
+    unsigned      io_timeout_ms  = 30000;      // drop a stalled in-flight transfer (slow client); 0 = off
     NetMode       net = NetMode::async;        // async io_uring loop (default); --net blocking falls back
 
     MemoryConfig   memory;

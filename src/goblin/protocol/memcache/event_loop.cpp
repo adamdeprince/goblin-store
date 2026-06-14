@@ -4,14 +4,17 @@
 #include "goblin/protocol/memcache/protocol.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <string_view>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace goblin::memcache {
 
 EventLoop::EventLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm,
-                     storage::Index& index, core::IoBufferPool& iobufs)
-    : r_(reactor), lfd_(listen_fd), tm_(tm), index_(index), iobufs_(iobufs) {}
+                     storage::Index& index, core::IoBufferPool& iobufs, unsigned io_timeout_ms)
+    : r_(reactor), lfd_(listen_fd), tm_(tm), index_(index), iobufs_(iobufs),
+      io_timeout_ms_(io_timeout_ms), last_sweep_(std::chrono::steady_clock::now()) {}
 
 void EventLoop::stop() noexcept { stop_.store(true, std::memory_order_relaxed); }
 
@@ -24,6 +27,7 @@ void EventLoop::run() {
 
 void EventLoop::run_once() {
     r_.submit_and_wait_timeout(200);
+    const auto now = std::chrono::steady_clock::now();
     std::array<core::Completion, 256> cqes{};
     const unsigned n = r_.reap(cqes);
     for (unsigned i = 0; i < n; ++i) {
@@ -36,6 +40,7 @@ void EventLoop::run_once() {
         auto* c = reinterpret_cast<Conn*>(ud & ~std::uint64_t{7});
         const std::uint64_t op = ud & 7;
         if (c->inflight) --c->inflight;
+        if (res > 0) c->last_progress = now; // bytes moved -> this conn is making progress
         if (op == kRecv)
             on_recv(c, res);
         else if (op == kSend)
@@ -49,6 +54,15 @@ void EventLoop::run_once() {
     // pool is per-loop, so its frees are always local.
     if (!set_waiters_.empty()) drain_set_waiters();
     if (!get_waiters_.empty()) drain_get_waiters();
+    // Periodically drop connections whose in-flight transfer has stalled (slow client) and reclaim
+    // their buffers. Sweep frequency is bounded so it stays cheap with many connections.
+    if (io_timeout_ms_) {
+        const auto interval = std::chrono::milliseconds(std::min(io_timeout_ms_, 250u));
+        if (now - last_sweep_ >= interval) {
+            last_sweep_ = now;
+            sweep_stalled(now);
+        }
+    }
 }
 
 void EventLoop::arm_accept() { r_.submit_accept(lfd_, kAccept); }
@@ -58,6 +72,7 @@ void EventLoop::on_accept(int res) {
     if (res < 0) return;
     auto up = std::make_unique<Conn>();
     up->fd = res;
+    up->last_progress = std::chrono::steady_clock::now();
     Conn* c = up.get();
     conns_.emplace(c, std::move(up));
     start_recv(c);
@@ -436,6 +451,30 @@ void EventLoop::retire(Conn* c) {
         release_iobuf(c);  // in case we closed mid-GET
         unpin_if_held(c);  // release the head pin if a send was interrupted
         conns_.erase(c);
+    }
+}
+
+// Abortive close: SO_LINGER{1,0} makes ::close send a RST, which discards unsent data and promptly
+// completes any pending io_uring send/recv on the socket with an error -- so the in-flight op drains
+// and retire() reclaims the buffer. A graceful FIN could leave a send parked indefinitely on a
+// dead-but-open peer (exactly the slow-reader case we're reclaiming from).
+void EventLoop::abort_conn(Conn* c) {
+    if (c->closing) return;
+    const linger lo{1, 0};
+    ::setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &lo, sizeof lo);
+    close_conn(c);
+}
+
+// Drop connections whose in-flight transfer has gone idle past io_timeout_ms_ while holding a scarce
+// buffer: a slow reader pinning a read buffer / head, or a slow writer pinning a staging buffer
+// (ADR-0011). We sweep only resource-holders -- an idle keepalive conn between commands holds nothing
+// and is left alone. Reclaiming an active slow reader's buffer also unblocks any parked GETs behind it.
+void EventLoop::sweep_stalled(std::chrono::steady_clock::time_point now) {
+    const auto deadline = std::chrono::milliseconds(io_timeout_ms_);
+    for (auto& [c, up] : conns_) {
+        if (c->closing) continue;
+        const bool holds_buffer = c->have_iobuf || c->head_pin.valid || c->sh.has_value();
+        if (holds_buffer && now - c->last_progress >= deadline) abort_conn(c);
     }
 }
 

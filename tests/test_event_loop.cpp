@@ -674,3 +674,50 @@ TEST("event loop: GET backpressure — one read buffer, many concurrent disk-tai
     fs::remove_all(base);
     CHECK_EQ(good.load(), kN);
 }
+
+TEST("event loop: a stalled slow reader is disconnected, freeing its buffer for a waiting GET") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("slowrd");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    auto io = IoBufferPool::create(64 * KiB, /*count=*/1, false); // a single read buffer
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+    const std::string val = pattern(42, 1 * MiB); // disk tail, far larger than any socket buffer
+    CHECK(store_obj(*tm, "obj", val));
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    EventLoop loop(*rc, lfd, *tm, index, *io, /*io_timeout_ms=*/300);
+    std::thread th([&] { loop.run(); });
+
+    // Slow reader: ask for the object but never read the response. With a tiny receive buffer its
+    // send stalls almost immediately, pinning the lone read buffer.
+    const int slow = client_connect(port);
+    if (slow >= 0) {
+        int rcvbuf = 2048;
+        ::setsockopt(slow, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+        const std::string req = "get obj\r\n";
+        write_all(slow, req.data(), req.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // let its GET grab the buffer
+    }
+
+    // A normal reader: its GET parks (no buffer) until the slow reader is swept (~300 ms), then is
+    // served. The 8 s client recv timeout is the safety net if the buffer were never reclaimed.
+    bool ok = false;
+    const int c = client_connect(port);
+    if (c >= 0) {
+        const auto g = get_value(c, "obj");
+        ok = g && *g == val;
+        ::close(c);
+    }
+    if (slow >= 0) ::close(slow);
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(ok);
+}

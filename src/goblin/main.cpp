@@ -54,7 +54,8 @@ void print_help() {
         "  --ram-head SIZE     per-object RAM head                   [default 256K]\n"
         "  --ssd-prefix SIZE   per-object SSD prefix                 [default 32M]\n"
         "  --io-chunk SIZE     streaming I/O chunk size              [default 256K]\n"
-        "  --io-buffers N      streaming I/O buffers per worker      [default 8]\n"
+        "  --io-buffers N      streaming I/O buffers per worker      [default 64]\n"
+        "  --io-timeout MS     drop a stalled transfer (slow client) [default 30000, 0=off]\n"
         "  --memcache-port N   memcache/TCP port                     [default 11211]\n"
         "  --http-port N       HTTP port                             [default 8080]\n"
         "  --cores N           worker cores, 0=all                   [default 0]\n"
@@ -143,6 +144,11 @@ int main(int argc, char** argv) {
             auto n = parse_int<unsigned>(*v); if (!n || *n == 0) { bad("io-buffers", *v); return 2; }
             cfg.io_buffers = *n;
         }
+        else if (a == "--io-timeout") {
+            auto v = take(a); if (!v) return 2;
+            auto n = parse_int<unsigned>(*v); if (!n) { bad("io-timeout", *v); return 2; }
+            cfg.io_timeout_ms = *n;
+        }
         else { std::println(stderr, "error: unknown option '{}' (try --help)", a); return 2; }
     }
 
@@ -171,6 +177,9 @@ int main(int argc, char** argv) {
     std::println("│ net         : {}, {} workers",
                  cfg.net == NetMode::async ? "async (io_uring loop)" : "blocking (thread-per-core)",
                  cfg.cores ? std::to_string(cfg.cores) : std::string("auto"));
+    std::println("│ io bufs     : {} x {} KiB / worker, stall timeout {}", cfg.io_buffers,
+                 cfg.io_chunk_bytes / KiB,
+                 cfg.io_timeout_ms ? std::to_string(cfg.io_timeout_ms) + "ms" : std::string("off"));
     std::println("└─────────────────────────────────────────────");
     // Blank-slate the pool dirs (ADR-0013): wipe requires the .goblin-store-marker
     // (run goblin-store-path-prep first), else we refuse to start.

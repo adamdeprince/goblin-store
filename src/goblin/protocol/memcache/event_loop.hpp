@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -27,7 +28,7 @@ namespace goblin::memcache {
 class EventLoop {
 public:
     EventLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm, storage::Index& index,
-              core::IoBufferPool& iobufs);
+              core::IoBufferPool& iobufs, unsigned io_timeout_ms = 0);
 
     void run();           // arm accept, then loop until stop()
     void run_once();      // one submit -> wait(timeout) -> reap -> dispatch (steppable, tests)
@@ -43,6 +44,7 @@ private:
         bool closing = false;    // freed once inflight hits 0
         bool quit_after = false; // close once the pending response is sent
         St state = St::idle;
+        std::chrono::steady_clock::time_point last_progress{}; // last completion that moved bytes (stall timeout)
         std::array<std::byte, 16 * 1024> rbuf;
         std::string in;           // accumulated unparsed request bytes
         std::string out;          // status line / VALUE header / trailer pending send
@@ -89,6 +91,8 @@ private:
     bool begin_get(Conn*, const std::string& key); // open the GET; false if parked on read-pool exhaustion
     void drain_set_waiters();     // retry parked SETs (set_wait) once a write-staging buffer may be free
     void drain_get_waiters();     // retry parked GETs (get_wait) once a read I/O buffer may be free
+    void sweep_stalled(std::chrono::steady_clock::time_point now); // drop buffer-holding conns gone idle
+    void abort_conn(Conn*);       // abortive close (RST) so a stalled conn's pending op completes -> buffer freed
     void pump_get(Conn*);         // produce + send the next value piece, or the trailer
     void start_send_piece(Conn*); // (re)send the current piece from iobuf (partial-aware)
     void finish_get(Conn*);       // GET fully sent -> release buffers, resume parsing
@@ -102,6 +106,8 @@ private:
     storage::TierManager& tm_;
     storage::Index& index_;
     core::IoBufferPool& iobufs_;
+    unsigned io_timeout_ms_; // drop a stalled in-flight transfer after this many ms (0 = off, ADR-0011)
+    std::chrono::steady_clock::time_point last_sweep_{}; // last stall sweep, to bound sweep frequency
     std::atomic<bool> stop_{false};
     std::unordered_map<Conn*, std::unique_ptr<Conn>> conns_;
     std::deque<Conn*> set_waiters_; // SETs parked on write-staging exhaustion (ADR-0011 backpressure)

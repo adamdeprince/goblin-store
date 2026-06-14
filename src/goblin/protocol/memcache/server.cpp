@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -217,6 +218,13 @@ void worker_loop(int lfd, const ServerConfig& cfg, storage::TierManager& tm, sto
             if (errno == EINTR) continue;
             break;
         }
+        if (cfg.io_timeout_ms) { // a slow client errors out instead of blocking this worker forever
+            timeval tv{};
+            tv.tv_sec = cfg.io_timeout_ms / 1000;
+            tv.tv_usec = (cfg.io_timeout_ms % 1000) * 1000;
+            ::setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+            ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        }
         handle_conn(cfd, tm, index, *reactor, *iobufs);
         ::close(cfd);
     }
@@ -233,7 +241,7 @@ void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     if (!iobufs) { std::println(stderr, "worker {}: {}", id, iobufs.error().detail); return; }
     auto lfd = make_listener(cfg.memcache_port, /*reuseport=*/true);
     if (!lfd) { std::println(stderr, "worker {}: {}", id, lfd.error().detail); return; }
-    EventLoop loop(*reactor, *lfd, tm, index, *iobufs);
+    EventLoop loop(*reactor, *lfd, tm, index, *iobufs, cfg.io_timeout_ms);
     loop.run();
     ::close(*lfd);
 }
