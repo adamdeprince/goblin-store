@@ -627,3 +627,50 @@ TEST("event loop: SET backpressure — one staging buffer, many concurrent SETs 
     fs::remove_all(base);
     CHECK_EQ(good.load(), kN);
 }
+
+TEST("event loop: GET backpressure — one read buffer, many concurrent disk-tail GETs all served") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("getbp");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    // One read I/O buffer: concurrent GETs with a disk tail must park (queue) and drain when it frees
+    // (ADR-0011 backpressure) — never dropped/closed mid-protocol.
+    auto io = IoBufferPool::create(64 * KiB, /*count=*/1, false);
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+
+    constexpr int kN = 16;
+    std::vector<std::string> vals(kN);
+    for (int i = 0; i < kN; ++i) {
+        // > ram_head (4 KiB) so each GET needs the buffer, and > the 64 KiB buffer so it streams in
+        // several pieces — the holder keeps the lone buffer across ticks, forcing the others to park.
+        vals[i] = pattern(3000 + i, 150 * 1024 + static_cast<std::size_t>(i) * 128);
+        CHECK(store_obj(*tm, "gp" + std::to_string(i), vals[i]));
+    }
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    EventLoop loop(*rc, lfd, *tm, index, *io);
+    std::thread th([&] { loop.run(); });
+
+    std::atomic<int> good{0};
+    std::vector<std::thread> clients;
+    for (int i = 0; i < kN; ++i) {
+        clients.emplace_back([&, i] {
+            const int c = client_connect(port);
+            if (c < 0) return;
+            const auto g = get_value(c, "gp" + std::to_string(i));
+            if (g && *g == vals[i]) good.fetch_add(1);
+            ::close(c);
+        });
+    }
+    for (auto& t : clients) t.join();
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK_EQ(good.load(), kN);
+}

@@ -35,7 +35,7 @@ public:
     std::size_t live_conns() const noexcept { return conns_.size(); }
 
 private:
-    enum class St { idle, set_body, set_wait, get_header, get_send_head, get_reading, get_send_piece, get_trailer };
+    enum class St { idle, set_body, set_wait, get_wait, get_header, get_send_head, get_reading, get_send_piece, get_trailer };
 
     struct Conn {
         int fd = -1;
@@ -49,6 +49,7 @@ private:
         std::size_t out_sent = 0; // partial-send progress into out
 
         // GET streaming state:
+        std::string get_key;        // key, kept to re-open_snapshot when parked (get_wait)
         std::optional<storage::TierManager::ReadStream> rs; // open object files for this GET
         MutBytes iobuf;             // borrowed I/O-pool buffer (value pieces land here)
         bool have_iobuf = false;
@@ -85,7 +86,9 @@ private:
     void start_send_head(Conn*); // send the pinned head region zero-copy (partial-aware)
     void unpin_if_held(Conn*);   // release the head pin if this conn holds one
     void process(Conn*);          // parse commands out of `in`, act, queue replies / start streams
+    bool begin_get(Conn*, const std::string& key); // open the GET; false if parked on read-pool exhaustion
     void drain_set_waiters();     // retry parked SETs (set_wait) once a write-staging buffer may be free
+    void drain_get_waiters();     // retry parked GETs (get_wait) once a read I/O buffer may be free
     void pump_get(Conn*);         // produce + send the next value piece, or the trailer
     void start_send_piece(Conn*); // (re)send the current piece from iobuf (partial-aware)
     void finish_get(Conn*);       // GET fully sent -> release buffers, resume parsing
@@ -102,6 +105,7 @@ private:
     std::atomic<bool> stop_{false};
     std::unordered_map<Conn*, std::unique_ptr<Conn>> conns_;
     std::deque<Conn*> set_waiters_; // SETs parked on write-staging exhaustion (ADR-0011 backpressure)
+    std::deque<Conn*> get_waiters_; // GETs parked on read I/O-pool exhaustion (per-loop; queue, never shed)
 };
 
 } // namespace goblin::memcache

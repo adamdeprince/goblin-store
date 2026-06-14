@@ -49,8 +49,13 @@ bool stream_value(int fd, storage::TierManager& tm, core::Reactor& reactor,
                   core::IoBufferPool& iobufs, const crypto::Digest& digest,
                   const storage::ObjectMeta& meta) {
     if (meta.size == 0) return true;
-    const auto chunk = iobufs.acquire();
-    if (!chunk) return false; // no free I/O buffer
+    // Backpressure (ADR-0011): wait for a read buffer rather than dropping the GET. A blocking worker
+    // serves one conn at a time, so io_buffers >= cores means this never spins.
+    std::optional<MutBytes> chunk = iobufs.acquire();
+    while (!chunk) {
+        std::this_thread::yield();
+        chunk = iobufs.acquire();
+    }
     bool ok = true;
     Size pos = 0;
     while (pos < meta.size) {

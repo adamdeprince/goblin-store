@@ -44,9 +44,11 @@ void EventLoop::run_once() {
             on_read(c, res);
         retire(c);
     }
-    // After dispatch (incl. any SET commits that freed buffers this tick), wake parked SETs. Also
-    // runs on idle timeout ticks, which is how a buffer freed on another loop gets picked up.
+    // After dispatch (incl. any SET commits / GET completions that freed buffers this tick), wake
+    // parked ops. SET also runs on idle timeout ticks (a buffer freed on another loop); GET's read
+    // pool is per-loop, so its frees are always local.
     if (!set_waiters_.empty()) drain_set_waiters();
+    if (!get_waiters_.empty()) drain_get_waiters();
 }
 
 void EventLoop::arm_accept() { r_.submit_accept(lfd_, kAccept); }
@@ -147,33 +149,9 @@ void EventLoop::process(Conn* c) {
             const bool erased = tm_.remove(crypto::hash_key(key));
             if (!noreply) c->out += (erased ? kDeleted : kNotFound);
         } else if (verb == Verb::get || verb == Verb::gets) {
-            const auto digest = crypto::hash_key(key);
-            // One consistent snapshot (ADR-0018): metadata + pinned head + open files, captured
-            // under one lock so a concurrent copy-on-write replace can't split head from body.
-            auto snap = tm_.open_snapshot(digest);
-            if (!snap) {
-                c->out += kEnd; // miss (or files vanished)
-                continue;
-            }
-            const Size head_len = snap->pin.valid ? snap->pin.len : 0;
-            if (snap->meta.size > head_len) { // a disk tail remains -> need an I/O buffer
-                auto buf = iobufs_.acquire();
-                if (!buf) {
-                    if (snap->pin.valid) tm_.unpin_head(snap->pin);
-                    close_conn(c); // out of I/O buffers (size the pool; backpressure is a TODO)
-                    return;
-                }
-                c->rs.emplace(std::move(*snap->rs));
-                c->iobuf = *buf;
-                c->have_iobuf = true;
-            }
-            c->head_pin = snap->pin;
-            c->head_sent = 0;
-            c->get_size = snap->meta.size;
-            c->get_pos = 0;
-            c->out += value_header(key, snap->meta.flags, snap->meta.size);
-            c->state = St::get_header;
-            break; // stream the value before parsing any further command
+            if (!begin_get(c, key)) return;        // read I/O pool exhausted -> parked (ADR-0011)
+            if (c->state == St::get_header) break; // hit -> stream the value before parsing further
+            // miss: kEnd already queued and state is idle -> keep parsing the pipeline
         } else if (verb == Verb::set || verb == Verb::add || verb == Verb::replace) {
             const auto digest = crypto::hash_key(key);
             const bool reject = (verb == Verb::add && index_.contains(digest)) ||
@@ -218,6 +196,42 @@ void EventLoop::process(Conn* c) {
         start_recv(c);
 }
 
+// Open a GET for `key`: take a consistent snapshot (ADR-0018: metadata + pinned head + open files
+// under one lock, so a concurrent copy-on-write replace can't split head from body) and, if a disk
+// tail remains, borrow a read I/O buffer. Returns false when the read pool is exhausted -> the conn
+// parks in get_wait with the snapshot released (re-taken on retry; ADR-0011 backpressure -- queue,
+// never shed, since HTTP downloads can't be retried). On a hit, state becomes get_header with the
+// VALUE header queued; on a miss, kEnd is queued and state returns to idle.
+bool EventLoop::begin_get(Conn* c, const std::string& key) {
+    auto snap = tm_.open_snapshot(crypto::hash_key(key));
+    if (!snap) {
+        c->out += kEnd; // miss (or files vanished)
+        c->state = St::idle;
+        return true;
+    }
+    const Size head_len = snap->pin.valid ? snap->pin.len : 0;
+    if (snap->meta.size > head_len) { // a disk tail remains -> need a read I/O buffer
+        auto buf = iobufs_.acquire();
+        if (!buf) { // pool exhausted -> park: drop the snapshot now, re-take it when a buffer frees
+            if (snap->pin.valid) tm_.unpin_head(snap->pin);
+            c->get_key = key;
+            c->state = St::get_wait;
+            get_waiters_.push_back(c);
+            return false;
+        }
+        c->rs.emplace(std::move(*snap->rs));
+        c->iobuf = *buf;
+        c->have_iobuf = true;
+    }
+    c->head_pin = snap->pin;
+    c->head_sent = 0;
+    c->get_size = snap->meta.size;
+    c->get_pos = 0;
+    c->out += value_header(key, snap->meta.flags, snap->meta.size);
+    c->state = St::get_header;
+    return true;
+}
+
 // Retry SETs parked on write-staging exhaustion. Runs every run_once tick: a SET that commits on
 // THIS loop frees a buffer that's picked up the same tick; a buffer freed on ANOTHER loop is caught
 // on the next ~200 ms wait (no cross-thread wakeup). FIFO; stops at the first conn that still can't
@@ -239,6 +253,24 @@ void EventLoop::drain_set_waiters() {
         set_waiters_.pop_front();
         c->state = St::set_body;
         process(c); // drive the body already buffered in `in`, then resume recv (or reply if rejected)
+    }
+}
+
+// Retry GETs parked on read I/O-pool exhaustion. The read pool is per-loop, so a buffer freed by a
+// finishing GET on this loop is always observed here -- no cross-loop case (cf. drain_set_waiters).
+// FIFO; begin_get re-parks (pushes to the back) the first conn that still can't get a buffer, which
+// returns false and stops the drain until the next tick.
+void EventLoop::drain_get_waiters() {
+    while (!get_waiters_.empty()) {
+        Conn* c = get_waiters_.front();
+        if (c->closing) { // parked conns have no in-flight op, but stay defensive
+            get_waiters_.pop_front();
+            continue;
+        }
+        get_waiters_.pop_front();
+        if (!begin_get(c, c->get_key)) return;         // re-parked -> pool still empty, retry next tick
+        if (c->state == St::get_header) start_send(c); // hit -> stream the value (header first)
+        else process(c);                                // miss while parked (removed) -> flush kEnd + resume
     }
 }
 
