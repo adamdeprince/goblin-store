@@ -82,6 +82,44 @@ std::optional<std::pair<Offset, Size>> resolve_range(const RangeSpec& r, Size si
     return std::nullopt;
 }
 
+std::string_view content_type_for(std::string_view key) {
+    if (const auto q = key.find('?'); q != std::string_view::npos) key = key.substr(0, q); // drop query
+    if (const auto s = key.rfind('/'); s != std::string_view::npos) key = key.substr(s + 1); // last segment
+    const auto dot = key.rfind('.');
+    if (dot == std::string_view::npos || dot == 0 || dot + 1 == key.size())
+        return "application/octet-stream"; // no extension, dotfile, or trailing dot
+    const std::string_view ext_raw = key.substr(dot + 1);
+    if (ext_raw.size() > 8) return "application/octet-stream"; // no known type is this long
+    std::array<char, 8> buf{};
+    for (std::size_t i = 0; i < ext_raw.size(); ++i) buf[i] = lower(ext_raw[i]);
+    const std::string_view ext(buf.data(), ext_raw.size());
+
+    struct Entry { std::string_view ext, type; };
+    static constexpr Entry kTable[] = {
+        {"html", "text/html; charset=utf-8"},   {"htm", "text/html; charset=utf-8"},
+        {"css", "text/css; charset=utf-8"},      {"js", "text/javascript; charset=utf-8"},
+        {"mjs", "text/javascript; charset=utf-8"}, {"json", "application/json; charset=utf-8"},
+        {"map", "application/json; charset=utf-8"}, {"xml", "application/xml; charset=utf-8"},
+        {"txt", "text/plain; charset=utf-8"},    {"csv", "text/csv; charset=utf-8"},
+        {"md", "text/markdown; charset=utf-8"},  {"svg", "image/svg+xml; charset=utf-8"},
+        {"png", "image/png"},                    {"jpg", "image/jpeg"},
+        {"jpeg", "image/jpeg"},                  {"gif", "image/gif"},
+        {"webp", "image/webp"},                  {"avif", "image/avif"},
+        {"ico", "image/x-icon"},                 {"bmp", "image/bmp"},
+        {"woff", "font/woff"},                   {"woff2", "font/woff2"},
+        {"ttf", "font/ttf"},                     {"otf", "font/otf"},
+        {"eot", "application/vnd.ms-fontobject"}, {"wasm", "application/wasm"},
+        {"pdf", "application/pdf"},               {"zip", "application/zip"},
+        {"gz", "application/gzip"},               {"mp4", "video/mp4"},
+        {"webm", "video/webm"},                  {"ogg", "audio/ogg"},
+        {"mp3", "audio/mpeg"},                    {"wav", "audio/wav"},
+        {"ics", "text/calendar; charset=utf-8"},
+    };
+    for (const auto& e : kTable)
+        if (e.ext == ext) return e.type;
+    return "application/octet-stream";
+}
+
 ParseResult parse_request(std::string_view buf, std::size_t prev_len) {
     const char* method = nullptr;
     const char* path = nullptr;

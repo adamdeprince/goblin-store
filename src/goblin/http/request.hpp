@@ -46,4 +46,9 @@ std::optional<RangeSpec> parse_range(std::string_view value);
 // nullopt means unsatisfiable (the caller answers 416). Exposed for testing; used by the serving path.
 std::optional<std::pair<Offset, Size>> resolve_range(const RangeSpec&, Size object_size);
 
+// Content-Type for an object, derived from its key's file extension (case-insensitive; any query
+// suffix and directory part are ignored). The key already reflects the directory-index mapping, so
+// `GET /blog/` -> `.../index.html` -> text/html. Unknown/missing extension -> application/octet-stream.
+std::string_view content_type_for(std::string_view key);
+
 } // namespace goblin::http

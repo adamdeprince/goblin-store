@@ -11,14 +11,20 @@ namespace goblin::http {
 namespace {
 
 // Append a header-only response (status line + Content-Length + Connection [+ Content-Type]). The
-// body, if any, is streamed separately by the shared loop.
-void append_head(std::string& out, std::string_view status, Size content_length, bool keep_alive) {
+// body, if any, is streamed separately by the shared loop. Content-Type is emitted only when there
+// is a body to type.
+void append_head(std::string& out, std::string_view status, Size content_length, bool keep_alive,
+                 std::string_view content_type = "application/octet-stream") {
     out += "HTTP/1.1 ";
     out += status;
     out += "\r\nContent-Length: ";
     out += std::to_string(content_length);
     out += "\r\n";
-    if (content_length > 0) out += "Content-Type: application/octet-stream\r\n";
+    if (content_length > 0) {
+        out += "Content-Type: ";
+        out += content_type;
+        out += "\r\n";
+    }
     out += keep_alive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
 }
 
@@ -31,8 +37,9 @@ constexpr std::string_view k421 =
 
 } // namespace
 
-void HttpLoop::frame_get_hit(Conn* c, const std::string&, const storage::ObjectMeta& meta) {
+void HttpLoop::frame_get_hit(Conn* c, const std::string& key, const storage::ObjectMeta& meta) {
     const bool keep_alive = !c->quit_after;
+    const std::string_view ct = content_type_for(key); // from the served object's extension
     if (c->req_range) { // a Range header was sent -> resolve against the actual size
         const auto r = resolve_range(*c->req_range, meta.size);
         if (!r) { // unsatisfiable -> 416, no body (get_pos == get_size; the shared loop streams nothing)
@@ -49,14 +56,15 @@ void HttpLoop::frame_get_hit(Conn* c, const std::string&, const storage::ObjectM
         c->out += "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes ";
         c->out += std::to_string(off) + "-" + std::to_string(off + len - 1) + "/" +
                   std::to_string(meta.size);
-        c->out += "\r\nContent-Length: " + std::to_string(len) +
-                  "\r\nContent-Type: application/octet-stream\r\n";
+        c->out += "\r\nContent-Length: " + std::to_string(len) + "\r\nContent-Type: ";
+        c->out += ct;
+        c->out += "\r\n";
         c->out += keep_alive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
         return;
     }
     c->get_pos = 0;
     c->get_size = meta.size; // whole object
-    append_head(c->out, "200 OK", meta.size, keep_alive);
+    append_head(c->out, "200 OK", meta.size, keep_alive, ct);
 }
 
 void HttpLoop::frame_get_miss(Conn* c) {
@@ -99,7 +107,7 @@ void HttpLoop::process(Conn* c) {
         } else if (method == Method::head) {
             if (!key) { c->out += k400; c->quit_after = true; break; }
             const auto meta = index_.lookup(crypto::hash_key(*key)); // headers only, no body/stream
-            if (meta) append_head(c->out, "200 OK", meta->size, !c->quit_after);
+            if (meta) append_head(c->out, "200 OK", meta->size, !c->quit_after, content_type_for(*key));
             else append_head(c->out, "404 Not Found", 0, !c->quit_after);
         } else {
             c->out += k405; // PUT/POST/DELETE/... not served yet

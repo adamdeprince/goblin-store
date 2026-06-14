@@ -77,3 +77,22 @@ TEST("http range: resolve against object size (clamp + 416)") {
     CHECK(end_clamp && end_clamp->first == 990 && end_clamp->second == 10);
     CHECK(!resolve_range(*parse_range("bytes=2000-3000"), sz).has_value()); // start past EOF -> 416
 }
+
+TEST("http content-type: extension mapping, case-insensitive, query/dir stripped") {
+    CHECK(content_type_for("/style.css") == "text/css; charset=utf-8");
+    CHECK(content_type_for("/app.js") == "text/javascript; charset=utf-8");
+    CHECK(content_type_for("/a/b/logo.PNG") == "image/png");          // case-insensitive
+    CHECK(content_type_for("/photo.jpeg") == "image/jpeg");
+    CHECK(content_type_for("/font.woff2") == "font/woff2");
+    CHECK(content_type_for("/archive.tar.gz") == "application/gzip"); // last extension wins
+    CHECK(content_type_for("/app.js?v=2") == "text/javascript; charset=utf-8"); // query ignored
+    CHECK(content_type_for("example.com/blog/index.html") == "text/html; charset=utf-8"); // vhost key
+}
+
+TEST("http content-type: unknown / missing extension -> octet-stream") {
+    CHECK(content_type_for("/data.bin") == "application/octet-stream");  // unknown ext
+    CHECK(content_type_for("/README") == "application/octet-stream");    // no extension
+    CHECK(content_type_for("/.bashrc") == "application/octet-stream");   // dotfile, no extension
+    CHECK(content_type_for("/archive.") == "application/octet-stream");  // trailing dot
+    CHECK(content_type_for("/") == "application/octet-stream");          // root / empty segment
+}

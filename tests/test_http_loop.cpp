@@ -216,6 +216,63 @@ TEST("http loop: GET streams the body; HEAD is headers-only; a miss is 404") {
     CHECK(miss_ok);
 }
 
+TEST("http loop: Content-Type comes from the extension (GET, HEAD, and ranged)") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("ctype");
+    Index index;
+    auto tm = open_tm(base, index);
+    auto io = IoBufferPool::create(128 * KiB, 8, false);
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+    KeyOptions opt; // path mode (default)
+    const std::string css = pattern(3, 2000);
+    const std::string bin = pattern(4, 2000);
+    CHECK(store_http(*tm, "/style.css", css, opt));
+    CHECK(store_http(*tm, "/data.bin", bin, opt));
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    HttpLoop loop(*rc, lfd, *tm, index, *io, opt, 0);
+    std::thread th([&] { loop.run(); });
+
+    auto hdr_has = [](const std::optional<HttpResp>& r, std::string_view h) {
+        return r && r->headers.find(h) != std::string::npos;
+    };
+    bool css_ok = false, bin_ok = false, head_ok = false, range_ok = false;
+    if (const int c = client_connect(port); c >= 0) {
+        const auto r = http_req(c, "GET /style.css HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+        css_ok = r && r->status == 200 && r->body == css &&
+                 hdr_has(r, "Content-Type: text/css; charset=utf-8");
+        ::close(c);
+    }
+    if (const int c = client_connect(port); c >= 0) {
+        const auto r = http_req(c, "GET /data.bin HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+        bin_ok = r && r->status == 200 && hdr_has(r, "Content-Type: application/octet-stream");
+        ::close(c);
+    }
+    if (const int c = client_connect(port); c >= 0) {
+        const auto r =
+            http_req(c, "HEAD /style.css HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n", false);
+        head_ok = r && r->status == 200 && hdr_has(r, "Content-Type: text/css; charset=utf-8");
+        ::close(c);
+    }
+    {
+        const auto r = ranged_get(port, "/style.css", "bytes=0-99"); // 206 keeps the object's type
+        range_ok = r && r->status == 206 && hdr_has(r, "Content-Type: text/css; charset=utf-8");
+    }
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(css_ok);
+    CHECK(bin_ok);
+    CHECK(head_ok);
+    CHECK(range_ok);
+}
+
 TEST("http loop: keep-alive serves two GETs on one connection, then 405 for PUT") {
     if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
     auto rc = Reactor::create();
