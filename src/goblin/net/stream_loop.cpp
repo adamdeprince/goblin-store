@@ -8,10 +8,21 @@
 
 namespace goblin::net {
 
+namespace {
+constexpr auto rlx = std::memory_order_relaxed;
+}
+
 StreamLoop::StreamLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm,
-                       storage::Index& index, core::IoBufferPool& iobufs, unsigned io_timeout_ms)
-    : r_(reactor), tm_(tm), index_(index), iobufs_(iobufs), lfd_(listen_fd),
-      io_timeout_ms_(io_timeout_ms), last_sweep_(std::chrono::steady_clock::now()) {}
+                       storage::Index& index, core::IoBufferPool& iobufs, unsigned io_timeout_ms,
+                       core::StatsRegistry* reg)
+    : r_(reactor), tm_(tm), index_(index), iobufs_(iobufs), reg_(reg), lfd_(listen_fd),
+      io_timeout_ms_(io_timeout_ms), last_sweep_(std::chrono::steady_clock::now()) {
+    if (reg_) reg_->add(&stats_);
+}
+
+StreamLoop::~StreamLoop() {
+    if (reg_) reg_->remove(&stats_);
+}
 
 void StreamLoop::stop() noexcept { stop_.store(true, std::memory_order_relaxed); }
 
@@ -74,6 +85,8 @@ void StreamLoop::on_accept(int res) {
     up->last_progress = std::chrono::steady_clock::now();
     Conn* c = up.get();
     conns_.emplace(c, std::move(up));
+    stats_.conns.fetch_add(1, rlx);
+    stats_.curr_conns.fetch_add(1, rlx);
     on_connection(c); // plaintext: start_recv; HTTPS: begin the TLS handshake
 }
 
@@ -112,6 +125,7 @@ void StreamLoop::on_recv(Conn* c, int res) {
 bool StreamLoop::begin_get(Conn* c, const std::string& key) {
     auto snap = tm_.open_snapshot(crypto::hash_key(key));
     if (!snap) {
+        stats_.get_misses.fetch_add(1, rlx);
         frame_get_miss(c);
         return true;
     }
@@ -120,6 +134,7 @@ bool StreamLoop::begin_get(Conn* c, const std::string& key) {
         auto buf = iobufs_.acquire();
         if (!buf) { // pool exhausted -> park: drop the snapshot now, re-take it when a buffer frees
             if (snap->pin.valid) tm_.unpin_head(snap->pin);
+            stats_.get_backpressure.fetch_add(1, rlx);
             c->get_key = key;
             c->state = St::get_wait;
             get_waiters_.push_back(c);
@@ -131,6 +146,7 @@ bool StreamLoop::begin_get(Conn* c, const std::string& key) {
     }
     c->head_pin = snap->pin;
     c->head_sent = 0;
+    stats_.get_hits.fetch_add(1, rlx);
     frame_get_hit(c, key, snap->meta); // protocol header + get_pos/get_size
     c->state = St::get_header;
     return true;
@@ -260,6 +276,7 @@ void StreamLoop::on_send(Conn* c, int res) {
         close_conn(c);
         return;
     }
+    stats_.bytes_served.fetch_add(static_cast<std::uint64_t>(res), rlx); // header/head/piece/trailer
     if (c->state == St::get_send_piece) {
         c->piece_sent += static_cast<std::size_t>(res);
         if (c->piece_sent < c->piece_len) {
@@ -349,6 +366,7 @@ void StreamLoop::retire(Conn* c) {
         release_iobuf(c);  // in case we closed mid-GET
         unpin_if_held(c);  // release the head pin if a send was interrupted
         on_destroy(c);     // free any per-conn TLS state before the Conn goes away
+        stats_.curr_conns.fetch_sub(1, rlx);
         conns_.erase(c);
     }
 }
@@ -359,6 +377,7 @@ void StreamLoop::retire(Conn* c) {
 // dead-but-open peer (exactly the slow-client case we're reclaiming from).
 void StreamLoop::abort_conn(Conn* c) {
     if (c->closing) return;
+    stats_.slow_drops.fetch_add(1, rlx);
     const linger lo{1, 0};
     ::setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &lo, sizeof lo);
     close_conn(c);

@@ -14,8 +14,9 @@ namespace goblin::http {
 class HttpLoop : public net::StreamLoop {
 public:
     HttpLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm, storage::Index& index,
-             core::IoBufferPool& iobufs, KeyOptions keyopt, unsigned io_timeout_ms = 0)
-        : net::StreamLoop(reactor, listen_fd, tm, index, iobufs, io_timeout_ms), keyopt_(keyopt) {}
+             core::IoBufferPool& iobufs, KeyOptions keyopt, unsigned io_timeout_ms = 0,
+             core::StatsRegistry* reg = nullptr)
+        : net::StreamLoop(reactor, listen_fd, tm, index, iobufs, io_timeout_ms, reg), keyopt_(keyopt) {}
 
 protected:
     void process(Conn*) override;

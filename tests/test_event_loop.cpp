@@ -2,6 +2,7 @@
 
 #include "goblin/core/buffer_pool.hpp"
 #include "goblin/core/reactor.hpp"
+#include "goblin/core/stats.hpp"
 #include "goblin/crypto/sha256.hpp"
 #include "goblin/protocol/memcache/event_loop.hpp"
 #include "goblin/storage/index.hpp"
@@ -715,6 +716,64 @@ TEST("event loop: a stalled slow reader is disconnected, freeing its buffer for 
         ::close(c);
     }
     if (slow >= 0) ::close(slow);
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(ok);
+}
+
+// ----------------------------------------------------------------------------- Step 5: stats
+
+// Pull the integer value of a `STAT <name> <value>` line out of a stats reply (nullopt if absent).
+static std::optional<std::uint64_t> stat_u64(const std::string& reply, std::string_view name) {
+    const std::string key = "STAT " + std::string(name) + " ";
+    const auto p = reply.find(key);
+    if (p == std::string::npos) return std::nullopt;
+    const auto vs = p + key.size();
+    const auto ve = reply.find("\r\n", vs);
+    if (ve == std::string::npos) return std::nullopt;
+    return std::stoull(reply.substr(vs, ve - vs));
+}
+
+TEST("event loop: stats reports connections, hits/misses, sets and bytes") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("stats");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    auto io = make_iopool();
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    StatsRegistry reg; // the loop registers its slot; the `stats` command aggregates it
+    EventLoop loop(*rc, lfd, *tm, index, *io, /*io_timeout_ms=*/0, &reg);
+    std::thread th([&] { loop.run(); });
+
+    bool ok = false;
+    const int c = client_connect(port);
+    if (c >= 0) {
+        const std::string val = pattern(9, 1000);
+        const bool stored = set_value(c, "skey", val) == "STORED\r\n";
+        const auto hit = get_value(c, "skey");  // one hit
+        const auto miss = get_value(c, "nope"); // one miss
+        std::string reply;
+        if (write_all(c, "stats\r\n", 7)) reply = read_until(c, "END\r\n");
+        ok = stored && hit && *hit == val && !miss &&
+             reply.find("STAT pid ") != std::string::npos &&
+             reply.find("STAT version goblincache 0.0.1\r\n") != std::string::npos &&
+             stat_u64(reply, "get_hits") == 1 && stat_u64(reply, "get_misses") == 1 &&
+             stat_u64(reply, "cmd_get") == 2 && stat_u64(reply, "sets_stored") == 1 &&
+             stat_u64(reply, "cmd_set") == 1 && stat_u64(reply, "bytes_stored") == val.size() &&
+             stat_u64(reply, "total_connections").value_or(0) >= 1 &&
+             stat_u64(reply, "curr_connections").value_or(0) >= 1 &&
+             stat_u64(reply, "bytes_served").value_or(0) >= val.size();
+        ::close(c);
+    }
     loop.stop();
     th.join();
     ::close(lfd);

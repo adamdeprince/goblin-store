@@ -11,7 +11,7 @@
 
 namespace goblin::memcache {
 
-enum class Verb { get, gets, set, add, replace, del, version, quit, unknown };
+enum class Verb { get, gets, set, add, replace, del, version, quit, stats, unknown };
 
 struct Command {
     Verb verb = Verb::unknown;

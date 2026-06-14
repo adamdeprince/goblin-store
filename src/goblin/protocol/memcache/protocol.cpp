@@ -16,6 +16,7 @@ Verb verb_of(std::string_view t) {
     if (t == "delete") return Verb::del;
     if (t == "version") return Verb::version;
     if (t == "quit") return Verb::quit;
+    if (t == "stats") return Verb::stats;
     return Verb::unknown;
 }
 
@@ -66,6 +67,7 @@ Result<Command> parse_command(std::string_view line) {
             return c;
         case Verb::version:
         case Verb::quit:
+        case Verb::stats: // optional sub-command (e.g. `stats items`) is accepted but ignored (v1)
             return c;
         case Verb::unknown:
             return err(Errc::invalid_protocol, "unknown command");

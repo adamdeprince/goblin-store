@@ -9,6 +9,7 @@
 
 #include "goblin/core/buffer_pool.hpp"
 #include "goblin/core/reactor.hpp"
+#include "goblin/core/stats.hpp"
 #include "goblin/crypto/sha256.hpp"
 #include "goblin/storage/index.hpp"
 #include "goblin/storage/tier_manager.hpp"
@@ -29,8 +30,8 @@ namespace goblin::net {
 class StreamLoop {
 public:
     StreamLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm, storage::Index& index,
-               core::IoBufferPool& iobufs, unsigned io_timeout_ms = 0);
-    virtual ~StreamLoop() = default;
+               core::IoBufferPool& iobufs, unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr);
+    virtual ~StreamLoop();
 
     void run();           // arm accept, then loop until stop()
     void run_once();      // one submit -> wait(timeout) -> reap -> dispatch (steppable, tests)
@@ -103,6 +104,8 @@ protected:
     storage::TierManager& tm_;
     storage::Index& index_;
     core::IoBufferPool& iobufs_;
+    core::Stats stats_;                 // this worker's counters (single-writer; aggregated via reg_)
+    core::StatsRegistry* reg_ = nullptr; // registry to aggregate on `stats` (memcache only); may be null
     std::deque<Conn*> set_waiters_; // writes parked on staging exhaustion (ADR-0011 backpressure)
     std::deque<Conn*> get_waiters_; // GETs parked on read I/O-pool exhaustion (per-loop; queue, never shed)
 

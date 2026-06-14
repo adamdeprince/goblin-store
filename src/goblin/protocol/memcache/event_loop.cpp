@@ -4,10 +4,47 @@
 #include "goblin/protocol/memcache/protocol.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <format>
 #include <string>
 #include <string_view>
+#include <unistd.h>
 
 namespace goblin::memcache {
+
+namespace {
+constexpr auto rlx = std::memory_order_relaxed;
+}
+
+// Build the `stats` reply: STAT <name> <value> lines + END. Aggregates every worker's slot via the
+// shared registry (reg_), so one memcache `stats` reports the whole process (memcache + HTTP + HTTPS
+// GETs included). Falls back to this worker's own counters if no registry is wired (e.g. unit tests).
+std::string EventLoop::format_stats() const {
+    const core::StatsSnapshot s = reg_ ? reg_->aggregate() : stats_.snapshot();
+    const std::uint64_t uptime = reg_ ? reg_->uptime_secs() : 0;
+    std::string o;
+    auto line = [&o](std::string_view name, std::uint64_t v) {
+        o += std::format("STAT {} {}\r\n", name, v);
+    };
+    o += std::format("STAT pid {}\r\n", ::getpid());
+    line("uptime", uptime);
+    o += "STAT version goblincache 0.0.1\r\n"; // keep in sync with kVersion
+    line("curr_connections", s.curr_conns);
+    line("total_connections", s.conns);
+    line("cmd_get", s.get_hits + s.get_misses);
+    line("cmd_set", s.sets + s.set_rejected);
+    line("get_hits", s.get_hits);
+    line("get_misses", s.get_misses);
+    line("sets_stored", s.sets);
+    line("sets_rejected", s.set_rejected);
+    line("bytes_served", s.bytes_served);
+    line("bytes_stored", s.bytes_stored);
+    line("get_backpressure", s.get_backpressure);
+    line("set_backpressure", s.set_backpressure);
+    line("slow_drops", s.slow_drops);
+    o += kEnd; // "END\r\n"
+    return o;
+}
 
 // ---- the four protocol seams ----
 
@@ -42,6 +79,7 @@ void EventLoop::process(Conn* c) {
                 if (c->sh && !c->set_failed) {
                     const ByteView chunk(reinterpret_cast<const std::byte*>(c->in.data()), take);
                     if (auto st = c->sh->write(chunk); !st) c->set_failed = true;
+                    else stats_.bytes_stored.fetch_add(take, rlx);
                 }
                 c->in.erase(0, take);
                 c->set_remaining -= take;
@@ -60,6 +98,10 @@ void EventLoop::process(Conn* c) {
             else
                 reply = kStored;
             c->sh.reset();
+            if (reply == kStored)
+                stats_.sets.fetch_add(1, rlx);
+            else if (reply == kNotStored)
+                stats_.set_rejected.fetch_add(1, rlx);
             if (!c->set_noreply) c->out += reply;
             c->state = St::idle;
             continue;
@@ -113,6 +155,7 @@ void EventLoop::process(Conn* c) {
                     // Write-staging pool exhausted (ADR-0011/0016): park without posting a recv, so
                     // the kernel's socket buffer fills and TCP backpressures this client. The body is
                     // NOT drained into RAM. drain_set_waiters() retries begin_store once a buffer frees.
+                    stats_.set_backpressure.fetch_add(1, rlx);
                     c->state = St::set_wait;
                     set_waiters_.push_back(c);
                     return;
@@ -122,6 +165,8 @@ void EventLoop::process(Conn* c) {
             }
             c->state = St::set_body;
             continue; // consume the body in the set_body branch
+        } else if (verb == Verb::stats) {
+            c->out += format_stats(); // aggregated STAT lines (memcache channel only)
         } else {
             c->out += kError;
         }

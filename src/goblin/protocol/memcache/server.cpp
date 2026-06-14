@@ -1,5 +1,6 @@
 #include "goblin/protocol/memcache/server.hpp"
 
+#include "goblin/core/stats.hpp"
 #include "goblin/crypto/sha256.hpp"
 #include "goblin/http/http_loop.hpp"
 #include "goblin/http/https_loop.hpp"
@@ -235,7 +236,7 @@ void worker_loop(int lfd, const ServerConfig& cfg, storage::TierManager& tm, sto
 // Async worker (ADR-0002): its own io_uring ring + I/O pool + SO_REUSEPORT listener; the EventLoop
 // multiplexes many connections on the one ring (accept / recv+parse / GET stream / SET ingest / send).
 void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-                  unsigned id) {
+                  core::StatsRegistry& reg, unsigned id) {
     auto reactor = core::Reactor::create();
     if (!reactor) { std::println(stderr, "worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
@@ -243,7 +244,7 @@ void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     if (!iobufs) { std::println(stderr, "worker {}: {}", id, iobufs.error().detail); return; }
     auto lfd = make_listener(cfg.memcache_port, /*reuseport=*/true);
     if (!lfd) { std::println(stderr, "worker {}: {}", id, lfd.error().detail); return; }
-    EventLoop loop(*reactor, *lfd, tm, index, *iobufs, cfg.io_timeout_ms);
+    EventLoop loop(*reactor, *lfd, tm, index, *iobufs, cfg.io_timeout_ms, &reg);
     loop.run();
     ::close(*lfd);
 }
@@ -251,7 +252,7 @@ void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
 // HTTP object server (ADR-0005/0015): its own io_uring ring + read pool + SO_REUSEPORT listener on
 // the HTTP port, so slow HTTP downloads draw from a separate buffer budget and can't starve memcache.
 void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-                 unsigned id) {
+                 core::StatsRegistry& reg, unsigned id) {
     auto reactor = core::Reactor::create();
     if (!reactor) { std::println(stderr, "http worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
@@ -262,7 +263,7 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
     http::KeyOptions keyopt;
     keyopt.mode = cfg.http_vhost ? http::KeyMode::vhost : http::KeyMode::path;
     keyopt.keep_query = cfg.key_on_query;
-    http::HttpLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, cfg.io_timeout_ms);
+    http::HttpLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, cfg.io_timeout_ms, &reg);
     loop.run();
     ::close(*lfd);
 }
@@ -272,7 +273,7 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
 // tls::Context (per-host certs, SNI selection) across all workers. The handshake runs on the loop;
 // after it, kTLS makes the data path the ordinary HttpLoop flow (ADR-0005/0011).
 void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-                  tls::Context& ctx, unsigned id) {
+                  tls::Context& ctx, core::StatsRegistry& reg, unsigned id) {
     auto reactor = core::Reactor::create();
     if (!reactor) { std::println(stderr, "https worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
@@ -283,7 +284,7 @@ void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     http::KeyOptions keyopt;
     keyopt.mode = cfg.http_vhost ? http::KeyMode::vhost : http::KeyMode::path;
     keyopt.keep_query = cfg.key_on_query;
-    http::HttpsLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, ctx, cfg.io_timeout_ms);
+    http::HttpsLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, ctx, cfg.io_timeout_ms, &reg);
     loop.run();
     ::close(*lfd);
 }
@@ -296,12 +297,16 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
     if (n == 0) n = 1;
     std::vector<std::thread> workers;
     int blocking_lfd = -1; // shared listener for blocking-mode memcache; closed after join
+    // One registry shared by every async loop (memcache + HTTP + HTTPS). Each loop registers its own
+    // per-worker Stats slot; the memcache `stats` command aggregates them. Outlives the workers.
+    core::StatsRegistry stats_reg;
 
     // memcache: async io_uring loops, or the blocking thread-per-core fallback (--net blocking).
     if (cfg.enable_memcache) {
         if (cfg.net == NetMode::async) {
             for (unsigned i = 0; i < n; ++i)
-                workers.emplace_back([&cfg, &tm, &index, i] { async_worker(cfg, tm, index, i); });
+                workers.emplace_back(
+                    [&cfg, &tm, &index, &stats_reg, i] { async_worker(cfg, tm, index, stats_reg, i); });
         } else {
             auto lfd = make_listener(cfg.memcache_port); // one shared listener, kernel load-balances
             if (!lfd) return std::unexpected(lfd.error());
@@ -314,7 +319,8 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
     // HTTP: always async, on its own loops + read pool (per-protocol isolation, ADR-0011).
     if (cfg.enable_http) {
         for (unsigned i = 0; i < n; ++i)
-            workers.emplace_back([&cfg, &tm, &index, i] { http_worker(cfg, tm, index, i); });
+            workers.emplace_back(
+                [&cfg, &tm, &index, &stats_reg, i] { http_worker(cfg, tm, index, stats_reg, i); });
     }
 
     // HTTPS: build one shared per-host cert context (SNI) and spawn TLS loops on the HTTPS port.
@@ -329,7 +335,9 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
         https_ctx.emplace(std::move(*c));
         tls::Context& ctx = *https_ctx;
         for (unsigned i = 0; i < n; ++i)
-            workers.emplace_back([&cfg, &tm, &index, &ctx, i] { https_worker(cfg, tm, index, ctx, i); });
+            workers.emplace_back([&cfg, &tm, &index, &ctx, &stats_reg, i] {
+                https_worker(cfg, tm, index, ctx, stats_reg, i);
+            });
     }
 #else
     if (cfg.enable_https) return err(Errc::unsupported, "built without OpenSSL — HTTPS unavailable");

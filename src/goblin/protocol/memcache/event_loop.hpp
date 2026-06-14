@@ -19,6 +19,9 @@ protected:
     void frame_get_hit(Conn*, const std::string& key, const storage::ObjectMeta&) override;
     void frame_get_miss(Conn*) override;
     void on_value_sent(Conn*) override;
+
+private:
+    std::string format_stats() const; // STAT lines for the memcache `stats` command (aggregated)
 };
 
 } // namespace goblin::memcache
