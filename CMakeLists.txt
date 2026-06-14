@@ -24,6 +24,15 @@ if(PkgConfig_FOUND)
   endif()
 endif()
 
+# ---- OpenSSL (TLS/HTTPS, ADR-0005; kTLS data path, ADR-0011): optional; HTTPS off when absent.
+# System libssl by default — the kTLS speed win is the kernel's, identical to a vendored build, so
+# swapping in a pinned OpenSSL submodule later is a CMake-only change. ----
+set(GOBLIN_HAVE_TLS 0)
+find_package(OpenSSL 3.0 QUIET)
+if(OpenSSL_FOUND)
+  set(GOBLIN_HAVE_TLS 1)
+endif()
+
 # ---- core library (everything under src/goblin except main.cpp) ----
 # GLOB is used deliberately for a fast-moving scaffold (CONFIGURE_DEPENDS re-globs on build).
 file(GLOB_RECURSE GOBLIN_LIB_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/goblin/*.cpp")
@@ -39,6 +48,7 @@ add_library(goblin_core STATIC ${GOBLIN_LIB_SOURCES})
 target_include_directories(goblin_core PUBLIC "${CMAKE_SOURCE_DIR}/src")
 target_compile_features(goblin_core PUBLIC cxx_std_23)
 target_compile_definitions(goblin_core PUBLIC GOBLIN_HAVE_URING=${GOBLIN_HAVE_URING})
+target_compile_definitions(goblin_core PUBLIC GOBLIN_HAVE_TLS=${GOBLIN_HAVE_TLS})
 
 set(GOBLIN_WARNINGS -Wall -Wextra -Wpedantic)
 if(GOBLIN_WERROR)
@@ -49,6 +59,10 @@ target_link_libraries(goblin_core PUBLIC picohttpparser)
 
 if(GOBLIN_HAVE_URING)
   target_link_libraries(goblin_core PUBLIC PkgConfig::LIBURING)
+endif()
+
+if(GOBLIN_HAVE_TLS)
+  target_link_libraries(goblin_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 if(GOBLIN_SANITIZE)
