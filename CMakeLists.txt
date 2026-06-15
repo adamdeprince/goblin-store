@@ -38,6 +38,7 @@ endif()
 file(GLOB_RECURSE GOBLIN_LIB_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/goblin/*.cpp")
 list(REMOVE_ITEM GOBLIN_LIB_SOURCES "${CMAKE_SOURCE_DIR}/src/goblin/main.cpp")
 list(REMOVE_ITEM GOBLIN_LIB_SOURCES "${CMAKE_SOURCE_DIR}/src/goblin/tools/path_prep.cpp")
+list(REMOVE_ITEM GOBLIN_LIB_SOURCES "${CMAKE_SOURCE_DIR}/src/goblin/tools/bench.cpp")
 
 # ---- third-party: picohttpparser (HTTP/1.1 request parsing) — built without our strict warnings ----
 add_library(picohttpparser STATIC "${CMAKE_SOURCE_DIR}/third_party/picohttpparser/picohttpparser.c")
@@ -79,6 +80,12 @@ target_link_libraries(goblincache PRIVATE goblin_core)
 # CLI helper that blesses a directory as a Goblin pool store (ADR-0013).
 add_executable(goblin-store-path-prep "${CMAKE_SOURCE_DIR}/src/goblin/tools/path_prep.cpp")
 target_link_libraries(goblin-store-path-prep PRIVATE goblin_core)
+
+# Load generator for large-object GET throughput/latency (memcache + HTTP); pure socket client.
+find_package(Threads REQUIRED)
+add_executable(goblin-bench "${CMAKE_SOURCE_DIR}/src/goblin/tools/bench.cpp")
+target_compile_features(goblin-bench PRIVATE cxx_std_23)
+target_link_libraries(goblin-bench PRIVATE Threads::Threads)
 
 # ---- tests (dependency-free; see tests/mini_test.hpp) ----
 include(CTest)

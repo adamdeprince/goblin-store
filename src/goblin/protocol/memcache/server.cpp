@@ -251,6 +251,7 @@ void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     auto lfd = make_listener(cfg.memcache_port, /*reuseport=*/true);
     if (!lfd) { std::println(stderr, "worker {}: {}", id, lfd.error().detail); return; }
     EventLoop loop(*reactor, *lfd, tm, index, *iobufs, cfg.io_timeout_ms, &reg);
+    loop.set_read_ahead(cfg.read_ahead);
     loop.run();
     ::close(*lfd);
 }
@@ -272,6 +273,7 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
     keyopt.strip_leading_slash = cfg.key_strip_slash;
     keyopt.index_name = cfg.http_index; // HTTP-only directory index (memcache + --source unaffected)
     http::HttpLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, cfg.io_timeout_ms, &reg);
+    loop.set_read_ahead(cfg.read_ahead);
     loop.run();
     ::close(*lfd);
 }
@@ -295,6 +297,7 @@ void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     keyopt.strip_leading_slash = cfg.key_strip_slash;
     keyopt.index_name = cfg.http_index; // HTTP-only directory index (memcache + --source unaffected)
     http::HttpsLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, ctx, cfg.io_timeout_ms, &reg);
+    loop.set_read_ahead(cfg.read_ahead);
     loop.run();
     ::close(*lfd);
 }

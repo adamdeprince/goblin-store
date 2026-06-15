@@ -71,6 +71,7 @@ void print_help() {
         "  --no-http           disable the plaintext HTTP listener\n"
         "  --no-memcache       disable the memcache/TCP listener\n"
         "  --no-mlock          don't mlock the RAM pool (dev; raise RLIMIT_MEMLOCK in prod)\n"
+        "  --no-read-ahead     disable double-buffered GET read-ahead (serial; for A/B benchmarking)\n"
         "  --eviction NAME     head-cache eviction policy: s3fifo (only one implemented yet)\n"
         "  --max-objects N     cap on stored objects (0 = unbounded); evicts whole objects over it\n"
         "  --net MODE          network: async (default, io_uring loop) | blocking\n"
@@ -110,6 +111,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-http-index")  { cfg.http_index.clear(); }
         else if (a == "--no-http")     { cfg.enable_http = false; }
         else if (a == "--no-memcache") { cfg.enable_memcache = false; }
+        else if (a == "--no-read-ahead") { cfg.read_ahead = false; }
         else if (a == "--no-mlock")    { cfg.memory.lock_memory = false; }
         else if (a == "--eviction") {
             auto v = take(a); if (!v) return 2;

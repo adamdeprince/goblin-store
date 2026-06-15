@@ -37,6 +37,7 @@ public:
     void run_once();      // one submit -> wait(timeout) -> reap -> dispatch (steppable, tests)
     void stop() noexcept; // ask run() to exit (thread-safe)
     std::size_t live_conns() const noexcept { return conns_.size(); }
+    void set_read_ahead(bool on) noexcept { read_ahead_ = on; } // double-buffered GET pipeline (A/B knob)
 
 protected:
     enum class St { idle, set_body, set_wait, get_wait, get_header, get_send_head, get_stream, get_trailer };
@@ -125,6 +126,7 @@ protected:
     core::IoBufferPool& iobufs_;
     core::Stats stats_;                 // this worker's counters (single-writer; aggregated via reg_)
     core::StatsRegistry* reg_ = nullptr; // registry to aggregate on `stats` (memcache only); may be null
+    bool read_ahead_ = true;             // acquire a 2nd read lane for pipelining in begin_get (A/B knob)
     std::deque<Conn*> set_waiters_; // writes parked on staging exhaustion (ADR-0011 backpressure)
     std::deque<Conn*> get_waiters_; // GETs parked on read I/O-pool exhaustion (per-loop; queue, never shed)
 

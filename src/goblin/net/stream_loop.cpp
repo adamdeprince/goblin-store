@@ -144,10 +144,12 @@ bool StreamLoop::begin_get(Conn* c, const std::string& key) {
         c->lane[0].buf = *buf;
         c->lane[0].have = true;
         c->n_lanes = 1;
-        if (auto buf2 = iobufs_.acquire()) { // opportunistic 2nd buffer -> read-ahead (best-effort)
-            c->lane[1].buf = *buf2;
-            c->lane[1].have = true;
-            c->n_lanes = 2;
+        if (read_ahead_) {
+            if (auto buf2 = iobufs_.acquire()) { // opportunistic 2nd buffer -> read-ahead (best-effort)
+                c->lane[1].buf = *buf2;
+                c->lane[1].have = true;
+                c->n_lanes = 2;
+            }
         }
         c->read_lane = c->send_lane = -1;
         c->fill_i = c->send_i = 0;

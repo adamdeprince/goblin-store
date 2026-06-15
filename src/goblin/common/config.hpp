@@ -75,6 +75,7 @@ struct ServerConfig {
     unsigned      io_buffers     = 64;         // streaming chunk buffers (read pool/worker; write staging)
     unsigned      io_timeout_ms  = 30000;      // drop a stalled in-flight transfer (slow client); 0 = off
     unsigned      ttl_reap_ms    = 1000;       // TTL reaper sweep period (ms); 0 = off (lazy-skip only)
+    bool          read_ahead     = true;       // double-buffered GET read-ahead; off => serial (A/B knob)
     NetMode       net = NetMode::async;        // async io_uring loop (default); --net blocking falls back
 
     MemoryConfig   memory;
