@@ -10,10 +10,14 @@
 #include "goblin/storage/index.hpp"
 #include "goblin/storage/tier_manager.hpp"
 
+#include <atomic>
 #include <cstdint>
 
 namespace goblin::memcache {
 
-Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index);
+// Blocks until `shutdown` is set (e.g. by a SIGTERM/SIGINT handler), then drains in-flight transfers
+// and returns. Pass a never-set flag to run forever.
+Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
+             const std::atomic<bool>& shutdown);
 
 } // namespace goblin::memcache

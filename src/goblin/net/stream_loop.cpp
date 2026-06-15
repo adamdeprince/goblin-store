@@ -28,9 +28,29 @@ void StreamLoop::stop() noexcept { stop_.store(true, std::memory_order_relaxed);
 
 void StreamLoop::run() {
     arm_accept();
-    while (!stop_.load(std::memory_order_relaxed)) run_once();
-    for (auto& [c, up] : conns_) ::close(c->fd);
+    while (!stop_.load(std::memory_order_relaxed)) {
+        if (shutdown_ && shutdown_->load(std::memory_order_relaxed)) { drain(); break; }
+        run_once();
+    }
+    for (auto& [c, up] : conns_) ::close(c->fd); // hard-close anything left after the drain / on stop()
     conns_.clear();
+}
+
+// Graceful shutdown: stop accepting, let in-flight transfers (GET streams / SET ingests) finish, and
+// retire connections idle between requests. Bounded by shutdown_grace_ms_; run() hard-closes whatever
+// outlasts it. Idle conns get shutdown(SHUT_RDWR) -- a HALF-close, not an RST: SHUT_WR drains the
+// kernel send buffer to the client (FIN only after it empties, so a response still in flight isn't
+// truncated), and SHUT_RD completes the conn's pending recv with EOF so on_recv()/retire() reclaim it.
+void StreamLoop::drain() {
+    draining_ = true;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(shutdown_grace_ms_);
+    while (!conns_.empty() && std::chrono::steady_clock::now() < deadline) {
+        for (auto& [c, up] : conns_)
+            if (!c->closing && c->state == St::idle && c->out.empty()) // active conns finish on their own
+                ::shutdown(c->fd, SHUT_RDWR);
+        run_once(); // dispatch completions; active conns advance, half-closed idle ones retire
+    }
 }
 
 void StreamLoop::run_once() {
@@ -78,8 +98,9 @@ void StreamLoop::run_once() {
 void StreamLoop::arm_accept() { r_.submit_accept(lfd_, kAccept); }
 
 void StreamLoop::on_accept(int res) {
-    arm_accept();
+    if (!draining_) arm_accept();            // once draining, stop accepting new connections
     if (res < 0) return;
+    if (draining_) { ::close(res); return; } // reject a connection that slipped in during the drain
     auto up = std::make_unique<Conn>();
     up->fd = res;
     up->last_progress = std::chrono::steady_clock::now();

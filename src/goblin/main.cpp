@@ -10,6 +10,7 @@
 #include "goblin/protocol/memcache/server.hpp"
 #include "goblin/storage/pool_dir.hpp"
 
+#include <atomic>
 #include <charconv>
 #include <csignal>
 #include <cstdio>
@@ -20,6 +21,9 @@
 
 namespace {
 using namespace goblin;
+
+std::atomic<bool> g_shutdown{false};
+void on_term(int) { g_shutdown.store(true, std::memory_order_relaxed); } // async-signal-safe (atomic store)
 
 std::optional<Size> parse_size(std::string_view s) {
     if (s.empty()) return std::nullopt;
@@ -84,6 +88,8 @@ void print_help() {
 
 int main(int argc, char** argv) {
     std::signal(SIGPIPE, SIG_IGN); // a peer that closes mid-write must not kill us (TLS BIO writes)
+    std::signal(SIGTERM, on_term); // graceful shutdown: drain in-flight transfers, then exit
+    std::signal(SIGINT, on_term);
     ServerConfig cfg;
     std::span<char*> args(argv + 1, argc > 0 ? static_cast<std::size_t>(argc - 1) : 0);
 
@@ -237,9 +243,10 @@ int main(int argc, char** argv) {
     if (cfg.enable_http) listening += " http/tcp :" + std::to_string(cfg.http_port);
     if (cfg.enable_https) listening += " https/tcp :" + std::to_string(cfg.https_port);
     std::println("{}  (Ctrl-C to stop)", listening);
-    if (auto st = memcache::serve(cfg, *tm, index); !st) {
+    if (auto st = memcache::serve(cfg, *tm, index, g_shutdown); !st) {
         std::println(stderr, "serve: {}", st.error().detail);
         return 1;
     }
+    std::println("shutdown: in-flight transfers drained, exiting cleanly");
     return 0;
 }

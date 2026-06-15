@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <poll.h>
 #include <netinet/in.h>
 #include <optional>
 #include <print>
@@ -228,14 +230,17 @@ Result<int> make_listener(std::uint16_t port, bool reuseport = false) {
 // manager are shared and thread-safe. (SO_REUSEPORT per-core listeners return with the io_uring
 // multishot-accept async loop, where a worker multiplexes many connections.)
 void worker_loop(int lfd, const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-                 unsigned id) {
+                 const std::atomic<bool>& shutdown, unsigned id) {
     auto reactor = core::Reactor::create();
     if (!reactor) { std::println(stderr, "worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
         core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory);
     if (!iobufs) { std::println(stderr, "worker {}: {}", id, iobufs.error().detail); return; }
 
-    while (true) {
+    while (!shutdown.load(std::memory_order_relaxed)) {
+        pollfd pfd{lfd, POLLIN, 0};
+        const int pr = ::poll(&pfd, 1, 200); // wake every 200 ms to observe shutdown (blocking path)
+        if (pr <= 0) continue;
         const int cfd = ::accept(lfd, nullptr, nullptr);
         if (cfd < 0) {
             if (errno == EINTR) continue;
@@ -256,7 +261,7 @@ void worker_loop(int lfd, const ServerConfig& cfg, storage::TierManager& tm, sto
 // Async worker (ADR-0002): its own io_uring ring + I/O pool + SO_REUSEPORT listener; the EventLoop
 // multiplexes many connections on the one ring (accept / recv+parse / GET stream / SET ingest / send).
 void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-                  core::StatsRegistry& reg, unsigned id) {
+                  core::StatsRegistry& reg, const std::atomic<bool>& shutdown, unsigned id) {
     auto reactor = core::Reactor::create();
     if (!reactor) { std::println(stderr, "worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
@@ -266,6 +271,7 @@ void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     if (!lfd) { std::println(stderr, "worker {}: {}", id, lfd.error().detail); return; }
     EventLoop loop(*reactor, *lfd, tm, index, *iobufs, cfg.io_timeout_ms, &reg);
     loop.set_read_ahead(cfg.read_ahead);
+    loop.set_shutdown(&shutdown, cfg.shutdown_grace_ms);
     loop.run();
     ::close(*lfd);
 }
@@ -273,7 +279,7 @@ void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
 // HTTP object server (ADR-0005/0015): its own io_uring ring + read pool + SO_REUSEPORT listener on
 // the HTTP port, so slow HTTP downloads draw from a separate buffer budget and can't starve memcache.
 void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-                 core::StatsRegistry& reg, unsigned id) {
+                 core::StatsRegistry& reg, const std::atomic<bool>& shutdown, unsigned id) {
     auto reactor = core::Reactor::create();
     if (!reactor) { std::println(stderr, "http worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
@@ -288,6 +294,7 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
     keyopt.index_name = cfg.http_index; // HTTP-only directory index (memcache + --source unaffected)
     http::HttpLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, cfg.io_timeout_ms, &reg);
     loop.set_read_ahead(cfg.read_ahead);
+    loop.set_shutdown(&shutdown, cfg.shutdown_grace_ms);
     loop.run();
     ::close(*lfd);
 }
@@ -297,7 +304,8 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
 // tls::Context (per-host certs, SNI selection) across all workers. The handshake runs on the loop;
 // after it, kTLS makes the data path the ordinary HttpLoop flow (ADR-0005/0011).
 void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-                  tls::Context& ctx, core::StatsRegistry& reg, unsigned id) {
+                  tls::Context& ctx, core::StatsRegistry& reg, const std::atomic<bool>& shutdown,
+                  unsigned id) {
     auto reactor = core::Reactor::create();
     if (!reactor) { std::println(stderr, "https worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
@@ -312,6 +320,7 @@ void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     keyopt.index_name = cfg.http_index; // HTTP-only directory index (memcache + --source unaffected)
     http::HttpsLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, ctx, cfg.io_timeout_ms, &reg);
     loop.set_read_ahead(cfg.read_ahead);
+    loop.set_shutdown(&shutdown, cfg.shutdown_grace_ms);
     loop.run();
     ::close(*lfd);
 }
@@ -319,7 +328,8 @@ void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
 
 } // namespace
 
-Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index) {
+Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
+             const std::atomic<bool>& shutdown) {
     unsigned n = cfg.cores ? cfg.cores : std::thread::hardware_concurrency();
     if (n == 0) n = 1;
     std::vector<std::thread> workers;
@@ -332,22 +342,25 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
     if (cfg.enable_memcache) {
         if (cfg.net == NetMode::async) {
             for (unsigned i = 0; i < n; ++i)
-                workers.emplace_back(
-                    [&cfg, &tm, &index, &stats_reg, i] { async_worker(cfg, tm, index, stats_reg, i); });
+                workers.emplace_back([&cfg, &tm, &index, &stats_reg, &shutdown, i] {
+                    async_worker(cfg, tm, index, stats_reg, shutdown, i);
+                });
         } else {
             auto lfd = make_listener(cfg.memcache_port); // one shared listener, kernel load-balances
             if (!lfd) return std::unexpected(lfd.error());
             blocking_lfd = *lfd;
             for (unsigned i = 0; i < n; ++i)
-                workers.emplace_back(
-                    [&cfg, &tm, &index, i, fd = blocking_lfd] { worker_loop(fd, cfg, tm, index, i); });
+                workers.emplace_back([&cfg, &tm, &index, &shutdown, i, fd = blocking_lfd] {
+                    worker_loop(fd, cfg, tm, index, shutdown, i);
+                });
         }
     }
     // HTTP: always async, on its own loops + read pool (per-protocol isolation, ADR-0011).
     if (cfg.enable_http) {
         for (unsigned i = 0; i < n; ++i)
-            workers.emplace_back(
-                [&cfg, &tm, &index, &stats_reg, i] { http_worker(cfg, tm, index, stats_reg, i); });
+            workers.emplace_back([&cfg, &tm, &index, &stats_reg, &shutdown, i] {
+                http_worker(cfg, tm, index, stats_reg, shutdown, i);
+            });
     }
 
     // HTTPS: build one shared per-host cert context (SNI) and spawn TLS loops on the HTTPS port.
@@ -362,8 +375,8 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
         https_ctx.emplace(std::move(*c));
         tls::Context& ctx = *https_ctx;
         for (unsigned i = 0; i < n; ++i)
-            workers.emplace_back([&cfg, &tm, &index, &ctx, &stats_reg, i] {
-                https_worker(cfg, tm, index, ctx, stats_reg, i);
+            workers.emplace_back([&cfg, &tm, &index, &ctx, &stats_reg, &shutdown, i] {
+                https_worker(cfg, tm, index, ctx, stats_reg, shutdown, i);
             });
     }
 #else
@@ -373,10 +386,13 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
     // TTL reaper: periodically reclaim expired objects (reads already lazy-skip them). Runs for the
     // process lifetime alongside the workers; a no-op until some object is stored with a TTL.
     if (cfg.ttl_reap_ms > 0)
-        workers.emplace_back([&cfg, &tm] {
-            for (;;) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(cfg.ttl_reap_ms));
-                tm.reap_expired();
+        workers.emplace_back([&cfg, &tm, &shutdown] {
+            while (!shutdown.load(std::memory_order_relaxed)) { // sleep the interval in slices to exit promptly
+                for (unsigned slept = 0;
+                     slept < cfg.ttl_reap_ms && !shutdown.load(std::memory_order_relaxed); slept += 100)
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(std::min(100u, cfg.ttl_reap_ms - slept)));
+                if (!shutdown.load(std::memory_order_relaxed)) tm.reap_expired();
             }
         });
 

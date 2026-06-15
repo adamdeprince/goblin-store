@@ -1034,3 +1034,46 @@ TEST("event loop: cas — gets returns a CAS; match stores, stale -> EXISTS, mis
     fs::remove_all(base);
     CHECK(ok);
 }
+
+// ----------------------------------------------------------------------------- Step 9: graceful shutdown
+
+TEST("event loop: graceful shutdown drains the idle keepalive conn, run() returns") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("shutdown");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    auto io = make_iopool();
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+    const std::string val = pattern(15, 2048);
+    CHECK(store_obj(*tm, "obj", val));
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    std::atomic<bool> shutdown{false};
+    EventLoop loop(*rc, lfd, *tm, index, *io);
+    loop.set_shutdown(&shutdown, /*grace_ms=*/1000);
+    std::thread th([&] { loop.run(); }); // returns once shutdown is observed + drained
+
+    bool got = false, conn_closed = false;
+    const int c = client_connect(port);
+    if (c >= 0) {
+        const auto g = get_value(c, "obj"); // a GET completes; the conn stays open (keepalive, idle)
+        got = g && *g == val;
+        shutdown.store(true, std::memory_order_relaxed); // trigger graceful shutdown
+        th.join();                                       // run() drains the idle conn, then returns
+        char buf[1];
+        conn_closed = ::recv(c, buf, 1, 0) <= 0; // the drain RST-closed our idle keepalive conn
+        ::close(c);
+    } else {
+        shutdown.store(true);
+        th.join();
+    }
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(got);
+    CHECK(conn_closed);
+}

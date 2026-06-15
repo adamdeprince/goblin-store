@@ -38,6 +38,10 @@ public:
     void stop() noexcept; // ask run() to exit (thread-safe)
     std::size_t live_conns() const noexcept { return conns_.size(); }
     void set_read_ahead(bool on) noexcept { read_ahead_ = on; } // double-buffered GET pipeline (A/B knob)
+    void set_shutdown(const std::atomic<bool>* flag, unsigned grace_ms) noexcept {
+        shutdown_ = flag; // observed in run(): once set, stop accepting, drain in-flight, then return
+        shutdown_grace_ms_ = grace_ms;
+    }
 
 protected:
     enum class St { idle, set_body, set_wait, get_wait, get_header, get_send_head, get_stream, get_trailer };
@@ -157,6 +161,7 @@ private:
     void drain_get_waiters();     // retry parked GETs once a read I/O buffer may be free
     void sweep_stalled(std::chrono::steady_clock::time_point now); // drop buffer-holding conns gone idle
     void abort_conn(Conn*);       // abortive close (RST) so a stalled conn's pending op completes
+    void drain();                 // graceful shutdown: finish in-flight transfers, drop idle conns
     void unpin_if_held(Conn*);
     void release_lanes(Conn*); // release all held read buffers + reset lane state
     void retire(Conn*);
@@ -165,6 +170,9 @@ private:
     unsigned io_timeout_ms_; // drop a stalled in-flight transfer after this many ms (0 = off, ADR-0011)
     std::chrono::steady_clock::time_point last_sweep_{}; // last stall sweep, to bound sweep frequency
     std::atomic<bool> stop_{false};
+    const std::atomic<bool>* shutdown_ = nullptr; // external SIGTERM flag; null = run until stop()
+    unsigned shutdown_grace_ms_ = 5000;           // drain deadline for in-flight transfers
+    bool draining_ = false;                        // shutdown observed -> stop accepting, finish in-flight
     std::unordered_map<Conn*, std::unique_ptr<Conn>> conns_;
 };
 
