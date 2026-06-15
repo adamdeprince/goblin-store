@@ -39,7 +39,7 @@ void append_head(std::string& out, std::string_view status, Size content_length,
     if (content_length > 0) {
         out += "Content-Type: ";
         out += content_type;
-        out += "\r\n";
+        out += "\r\nAccept-Ranges: bytes\r\n"; // advertise range support so clients resume/parallelize
     }
     if (!etag.empty()) {
         out += "ETag: ";

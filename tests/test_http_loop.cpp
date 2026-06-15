@@ -214,20 +214,24 @@ TEST("http loop: GET streams the body; HEAD is headers-only; a miss is 404") {
     std::thread th([&] { loop.run(); });
 
     bool get_ok = false, head_ok = false, miss_ok = false;
+    auto has = [](const std::optional<HttpResp>& r, std::string_view h) {
+        return r && r->headers.find(h) != std::string::npos;
+    };
     if (const int c = client_connect(port); c >= 0) {
         const auto r = http_req(c, "GET /big/obj HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
-        get_ok = r && r->status == 200 && r->body == body;
+        get_ok = r && r->status == 200 && r->body == body && has(r, "Accept-Ranges: bytes");
         ::close(c);
     }
     if (const int c = client_connect(port); c >= 0) {
         const auto r =
             http_req(c, "HEAD /big/obj HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n", false);
-        head_ok = r && r->status == 200 && r->body.empty(); // 200 + Content-Length, no body
+        head_ok = r && r->status == 200 && r->body.empty() && // 200 + Content-Length, no body
+                  has(r, "Accept-Ranges: bytes");
         ::close(c);
     }
     if (const int c = client_connect(port); c >= 0) {
         const auto r = http_req(c, "GET /nope HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
-        miss_ok = r && r->status == 404 && r->body.empty();
+        miss_ok = r && r->status == 404 && r->body.empty() && !has(r, "Accept-Ranges"); // no body to range
         ::close(c);
     }
     loop.stop();
