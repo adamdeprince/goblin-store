@@ -93,7 +93,9 @@ void EventLoop::process(Conn* c) {
                 reply = kBadDataChunk;
             else if (c->set_reject || c->set_failed || !c->sh)
                 reply = kNotStored;
-            else if (auto st = c->sh->commit(c->set_flags); !st)
+            else if (auto st = c->sh->commit(c->set_flags,
+                                             exptime_to_expiry(c->set_exptime, storage::now_unix()));
+                     !st)
                 reply = kNotStored;
             else
                 reply = kStored;
@@ -120,6 +122,7 @@ void EventLoop::process(Conn* c) {
         const Verb verb = cmd->verb;
         const bool noreply = cmd->noreply;
         const std::uint32_t flags = cmd->flags;
+        const std::uint32_t exptime = cmd->exptime;
         const std::uint64_t nbytes = cmd->bytes;
         const std::string key(cmd->key);
         c->in.erase(0, eol + 2);
@@ -138,12 +141,16 @@ void EventLoop::process(Conn* c) {
             // miss: kEnd already queued and state is idle -> keep parsing the pipeline
         } else if (verb == Verb::set || verb == Verb::add || verb == Verb::replace) {
             const auto digest = crypto::hash_key(key);
-            const bool reject = (verb == Verb::add && index_.contains(digest)) ||
-                                (verb == Verb::replace && !index_.contains(digest));
+            // add/replace admission treats an expired item as absent (lazy expiry, ADR-0007).
+            const auto exist = index_.lookup(digest);
+            const bool present = exist && !storage::is_expired(*exist, storage::now_unix());
+            const bool reject =
+                (verb == Verb::add && present) || (verb == Verb::replace && !present);
             c->sh.reset();
             c->set_digest = digest;
             c->set_remaining = nbytes;
             c->set_flags = flags;
+            c->set_exptime = exptime;
             c->set_noreply = noreply;
             c->set_reject = reject;
             c->set_failed = false;

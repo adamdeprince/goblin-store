@@ -80,4 +80,14 @@ void Index::clear() {
     }
 }
 
+std::vector<Digest> Index::expired_keys(std::uint32_t now) const {
+    std::vector<Digest> out;
+    for (std::size_t i = 0; i < nshards_; ++i) {
+        std::shared_lock lk(shards_[i].mu);
+        for (const auto& [d, m] : shards_[i].map)
+            if (is_expired(m, now)) out.push_back(d);
+    }
+    return out;
+}
+
 } // namespace goblin::storage

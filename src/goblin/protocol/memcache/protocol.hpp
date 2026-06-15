@@ -29,6 +29,10 @@ struct Command {
 // Parse a single command line (WITHOUT the trailing CRLF). `key` views into `line`.
 Result<Command> parse_command(std::string_view line);
 
+// Convert a memcache exptime to an absolute Unix expiry (0 = never): 0 -> never; <= 30 days ->
+// relative (now + exptime); larger -> already an absolute Unix timestamp.
+std::uint32_t exptime_to_expiry(std::uint32_t exptime, std::uint32_t now);
+
 // Fixed text-protocol responses.
 inline constexpr std::string_view kStored = "STORED\r\n";
 inline constexpr std::string_view kNotStored = "NOT_STORED\r\n";

@@ -152,11 +152,23 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
     return tm;
 }
 
-Status TierManager::store(const Digest& digest, ByteView data, std::uint32_t flags) {
+Status TierManager::store(const Digest& digest, ByteView data, std::uint32_t flags,
+                          std::uint32_t expiry) {
     auto h = begin_store(digest, data.size());
     if (!h) return std::unexpected(h.error());
     if (auto st = h->write(data); !st) return st;
-    return h->commit(flags);
+    return h->commit(flags, expiry);
+}
+
+// Drop every object whose TTL has passed. Lazy-skip already hides expired objects from reads; this
+// reclaims their RAM head + disk files. O(1) when no TTL has ever been set (the common cache case).
+std::size_t TierManager::reap_expired() {
+    if (!any_ttl_->load(std::memory_order_relaxed)) return 0;
+    const auto keys = index_->expired_keys(now_unix());
+    std::size_t n = 0;
+    for (const auto& d : keys)
+        if (remove(d)) ++n;
+    return n;
 }
 
 Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, Size size) {
@@ -323,7 +335,7 @@ Status TierManager::StoreHandle::flush_block(Size n) {
     return {};
 }
 
-Status TierManager::StoreHandle::commit(std::uint32_t flags) {
+Status TierManager::StoreHandle::commit(std::uint32_t flags, std::uint32_t expiry) {
     if (off_ != layout_.size)
         return err(Errc::invalid_argument, "commit before the full value was written");
 
@@ -350,8 +362,10 @@ Status TierManager::StoreHandle::commit(std::uint32_t flags) {
     ObjectMeta meta;
     meta.size = layout_.size;
     meta.flags = flags;
+    meta.expiry = expiry; // absolute Unix time; 0 = never (ADR-0007)
     meta.etag = tm_->etag_seq_->fetch_add(1, std::memory_order_relaxed) + 1; // unique per (re)store
     if (head_) meta.head = HeadLoc{head_->block, head_->offset, head_->len};
+    if (expiry != 0) tm_->any_ttl_->store(true, std::memory_order_relaxed); // arm the reaper
     tm_->index_->set(digest_, meta);
     if (head_) tm_->policy_->insert(digest_);
     if (!old) tm_->object_policy_->insert(digest_); // only new objects count toward the SSD bound
@@ -570,6 +584,7 @@ std::optional<TierManager::Snapshot> TierManager::open_snapshot(const Digest& di
     std::unique_lock<std::shared_mutex> lk(*mu_); // capture meta + head-pin + fds atomically
     const auto m = index_->lookup(digest);
     if (!m) return std::nullopt;
+    if (is_expired(*m, now_unix())) return std::nullopt; // TTL passed -> lazy miss (reaper reclaims)
     object_policy_->touch(digest); // the whole object was accessed
     const Size head_len = m->head.resident() ? m->head.len : 0;
 

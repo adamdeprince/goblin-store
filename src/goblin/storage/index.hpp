@@ -7,11 +7,13 @@
 #include "goblin/common/types.hpp"
 #include "goblin/crypto/sha256.hpp" // Digest
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace goblin::storage {
 
@@ -42,6 +44,16 @@ struct DigestHash {
     }
 };
 
+// memcache TTL is stored as an absolute Unix expiry (0 = never). uint32 seconds suffices to 2106.
+inline std::uint32_t now_unix() {
+    return static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                          std::chrono::system_clock::now().time_since_epoch())
+                                          .count());
+}
+inline bool is_expired(const ObjectMeta& m, std::uint32_t now) {
+    return m.expiry != 0 && m.expiry <= now;
+}
+
 class Index {
 public:
     explicit Index(unsigned shard_bits = 8); // 2^shard_bits shards
@@ -58,6 +70,9 @@ public:
 
     std::size_t size() const; // live object count across shards
     void clear();             // blank slate (startup, ADR-0013)
+
+    // Digests of objects whose absolute expiry has passed `now` (TTL reaper, lazy-skip is elsewhere).
+    std::vector<Digest> expired_keys(std::uint32_t now) const;
 
 private:
     struct Shard {

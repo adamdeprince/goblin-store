@@ -94,7 +94,8 @@ public:
         ~StoreHandle();
 
         Status write(ByteView chunk);       // append the next bytes (sequential, from offset 0)
-        Status commit(std::uint32_t flags); // publish to the index + cache the head
+        // publish to the index + cache the head. expiry is an absolute Unix time (0 = never, ADR-0007).
+        Status commit(std::uint32_t flags, std::uint32_t expiry = 0);
 
     private:
         friend class TierManager;
@@ -118,7 +119,8 @@ public:
     };
 
     Result<StoreHandle> begin_store(const Digest&, Size size);
-    Status store(const Digest&, ByteView data, std::uint32_t flags); // begin + write + commit
+    Status store(const Digest&, ByteView data, std::uint32_t flags, std::uint32_t expiry = 0); // begin+write+commit
+    std::size_t reap_expired(); // drop objects past their TTL; returns count (O(1) when no TTLs are set)
     Result<std::size_t> read(core::Reactor&, const Digest&, Offset offset, MutBytes out);
     bool remove(const Digest&); // erase from index + free the cached head
     // Resident RAM head bytes for a zero-copy send, or nullopt if not cached (ADR-0017).
@@ -190,6 +192,7 @@ private:
           hdd_(std::move(hdd)), index_(&ix),
           store_seq_(std::make_unique<std::atomic<std::uint64_t>>(0)),
           etag_seq_(std::make_unique<std::atomic<std::uint64_t>>(0)),
+          any_ttl_(std::make_unique<std::atomic<bool>>(false)),
           mu_(std::make_unique<std::shared_mutex>()) {}
     void drop_object(const Digest&); // free head + unlink files + erase from index & policies
     void enforce_object_bound();     // evict whole objects while over the count limit
@@ -209,6 +212,7 @@ private:
     Index* index_;
     std::unique_ptr<std::atomic<std::uint64_t>> store_seq_; // unique CoW scratch-file suffixes
     std::unique_ptr<std::atomic<std::uint64_t>> etag_seq_;  // monotonic store generation -> ETag
+    std::unique_ptr<std::atomic<bool>> any_ttl_; // a TTL has been set -> reaper scans (else O(1) skip)
     std::unique_ptr<std::shared_mutex> mu_; // rwlock: shared for reads, exclusive for writes (ADR-0018)
     struct RegionPin {
         std::uint32_t len = 0;

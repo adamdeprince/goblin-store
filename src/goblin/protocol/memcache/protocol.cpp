@@ -75,6 +75,13 @@ Result<Command> parse_command(std::string_view line) {
     return err(Errc::invalid_protocol, "unhandled command");
 }
 
+std::uint32_t exptime_to_expiry(std::uint32_t exptime, std::uint32_t now) {
+    constexpr std::uint32_t kRelativeMax = 60u * 60u * 24u * 30u; // 30 days (memcache convention)
+    if (exptime == 0) return 0;                 // never expires
+    if (exptime > kRelativeMax) return exptime; // already an absolute Unix timestamp
+    return now + exptime;                       // relative to now
+}
+
 std::string value_header(std::string_view key, std::uint32_t flags, std::uint64_t bytes) {
     return std::format("VALUE {} {} {}\r\n", key, flags, bytes);
 }

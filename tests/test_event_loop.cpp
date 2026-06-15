@@ -780,3 +780,78 @@ TEST("event loop: stats reports connections, hits/misses, sets and bytes") {
     fs::remove_all(base);
     CHECK(ok);
 }
+
+// ----------------------------------------------------------------------------- Step 6: TTL
+
+// "set <key> 0 <exptime> <len>\r\n<val>\r\n" — exercises memcache TTLs.
+static std::string set_ttl(int fd, const std::string& key, const std::string& val,
+                           std::uint32_t exptime) {
+    std::string req = "set " + key + " 0 " + std::to_string(exptime) + " " +
+                      std::to_string(val.size()) + "\r\n";
+    req += val;
+    req += "\r\n";
+    if (!write_all(fd, req.data(), req.size())) return {};
+    return read_until(fd, "\r\n");
+}
+
+TEST("event loop: TTL — expired GET misses, live hits; add over an expired key succeeds") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("ttl");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    auto io = make_iopool();
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    EventLoop loop(*rc, lfd, *tm, index, *io);
+    std::thread th([&] { loop.run(); });
+
+    bool ok = false;
+    const int c = client_connect(port);
+    if (c >= 0) {
+        const std::string v = pattern(11, 64);
+        // exptime > 30 days is an absolute Unix time: 1e9 is the past (2001), 4e9 the future (2096).
+        const bool se = set_ttl(c, "exp", v, 1000000000u) == "STORED\r\n";
+        const bool sl = set_ttl(c, "live", v, 4000000000u) == "STORED\r\n";
+        const bool sn = set_value(c, "never", v) == "STORED\r\n"; // exptime 0 = never
+        const auto ge = get_value(c, "exp");    // expired -> lazy miss
+        const auto gl = get_value(c, "live");   // hit
+        const auto gn = get_value(c, "never");  // hit
+        const bool add = set_value(c, "exp", v, "add") == "STORED\r\n"; // expired counts as absent
+        const auto gr = get_value(c, "exp");    // re-added (no TTL) -> hit
+        ok = se && sl && sn && !ge && gl && *gl == v && gn && *gn == v && add && gr && *gr == v;
+        ::close(c);
+    }
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(ok);
+}
+
+TEST("tier_manager: reap_expired drops past-TTL objects, keeps live ones") {
+    const std::string base = tmp_base("reap");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    CHECK(tm.has_value());
+    if (!tm) { fs::remove_all(base); return; }
+    const std::string v = pattern(12, 128);
+    auto bytes = [&](const std::string& s) {
+        return ByteView(reinterpret_cast<const std::byte*>(s.data()), s.size());
+    };
+    CHECK(tm->store(hash_key("a"), bytes(v), 0, 1u).has_value());          // expiry=1 -> long expired
+    CHECK(tm->store(hash_key("b"), bytes(v), 0, 0u).has_value());          // never
+    CHECK(tm->store(hash_key("c"), bytes(v), 0, 4000000000u).has_value()); // future
+    CHECK_EQ(index.size(), std::size_t(3));
+    CHECK_EQ(tm->reap_expired(), std::size_t(1)); // only "a" is past its TTL
+    CHECK_EQ(index.size(), std::size_t(2));
+    CHECK(!index.lookup(hash_key("a")).has_value());
+    CHECK(index.lookup(hash_key("b")).has_value());
+    CHECK(index.lookup(hash_key("c")).has_value());
+    fs::remove_all(base);
+}

@@ -92,6 +92,7 @@ protected:
         crypto::Digest set_digest{}; // key digest; kept to retry begin_store while parked (set_wait)
         Size set_remaining = 0;     // body bytes still to receive (== full nbytes while parked)
         std::uint32_t set_flags = 0;
+        std::uint32_t set_exptime = 0; // raw memcache exptime; -> absolute expiry at commit time
         bool set_noreply = false;
         bool set_reject = false; // admission failed -> drain the body, then reject
         bool set_failed = false; // a disk write failed -> don't commit

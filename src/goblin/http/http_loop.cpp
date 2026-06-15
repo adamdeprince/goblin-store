@@ -144,7 +144,7 @@ void HttpLoop::process(Conn* c) {
         } else if (method == Method::head) {
             if (!key) { c->out += k400; c->quit_after = true; break; }
             const auto meta = index_.lookup(crypto::hash_key(*key)); // headers only, no body/stream
-            if (!meta) {
+            if (!meta || storage::is_expired(*meta, storage::now_unix())) { // lazy TTL skip
                 append_head(c->out, "404 Not Found", 0, !c->quit_after);
             } else {
                 const std::string etag = make_etag(*meta);

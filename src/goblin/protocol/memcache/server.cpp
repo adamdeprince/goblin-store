@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
 #include <netinet/in.h>
 #include <optional>
 #include <print>
@@ -92,14 +93,17 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
         if (cmd->is_storage()) {
             const Verb verb = cmd->verb;
             const std::uint32_t flags = cmd->flags;
+            const std::uint32_t exptime = cmd->exptime;
             const std::uint64_t nbytes = cmd->bytes;
             const bool noreply = cmd->noreply;
             const auto digest = crypto::hash_key(cmd->key); // key still valid (buf intact here)
             buf.erase(0, eol + 2);                          // drop command line; data block follows
 
-            // ADD/REPLACE admission, before opening files or writing anything.
-            const bool admit = !((verb == Verb::add && index.contains(digest)) ||
-                                 (verb == Verb::replace && !index.contains(digest)));
+            // ADD/REPLACE admission, before opening files or writing anything. An expired item counts
+            // as absent (lazy TTL, ADR-0007).
+            const auto exist = index.lookup(digest);
+            const bool present = exist && !storage::is_expired(*exist, storage::now_unix());
+            const bool admit = !((verb == Verb::add && present) || (verb == Verb::replace && !present));
             std::optional<storage::TierManager::StoreHandle> handle;
             if (admit) {
                 // Blocking-mode backpressure (ADR-0011/0016): if the write-staging pool is exhausted,
@@ -140,7 +144,9 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
             if (!admit) reply = kNotStored;
             else if (!crlf_ok) reply = kBadDataChunk;
             else if (!handle || !write_ok) reply = kNotStored;
-            else if (auto st = handle->commit(flags); !st) reply = kNotStored;
+            else if (auto st = handle->commit(flags, exptime_to_expiry(exptime, storage::now_unix()));
+                     !st)
+                reply = kNotStored;
             else reply = kStored;
             // (An uncommitted handle aborts on scope exit — the object stays unindexed/invisible.)
             if (!noreply && !send_all(fd, reply)) return;
@@ -152,8 +158,8 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
             case Verb::gets: {
                 const auto digest = crypto::hash_key(cmd->key);
                 const auto meta = index.lookup(digest);
-                if (!meta) {
-                    if (!send_all(fd, kEnd)) return; // miss
+                if (!meta || storage::is_expired(*meta, storage::now_unix())) {
+                    if (!send_all(fd, kEnd)) return; // miss (or expired)
                     break;
                 }
                 tm.touch(digest); // record the hit for eviction (no-op if head not cached)
@@ -346,6 +352,16 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
 #else
     if (cfg.enable_https) return err(Errc::unsupported, "built without OpenSSL — HTTPS unavailable");
 #endif
+
+    // TTL reaper: periodically reclaim expired objects (reads already lazy-skip them). Runs for the
+    // process lifetime alongside the workers; a no-op until some object is stored with a TTL.
+    if (cfg.ttl_reap_ms > 0)
+        workers.emplace_back([&cfg, &tm] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(cfg.ttl_reap_ms));
+                tm.reap_expired();
+            }
+        });
 
     for (auto& t : workers) t.join();
     if (blocking_lfd >= 0) ::close(blocking_lfd);

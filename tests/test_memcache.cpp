@@ -49,3 +49,13 @@ TEST("memcache: VALUE header formatting") {
     CHECK(value_header("foo", 7, 5) == "VALUE foo 7 5\r\n");
     CHECK(value_header("a/b.bin", 0, 1048576) == "VALUE a/b.bin 0 1048576\r\n");
 }
+
+TEST("memcache: exptime -> absolute expiry (never / relative / absolute, 30-day boundary)") {
+    const std::uint32_t now = 1'000'000;
+    CHECK_EQ(exptime_to_expiry(0, now), std::uint32_t(0));            // 0 = never
+    CHECK_EQ(exptime_to_expiry(60, now), now + 60);                  // small -> relative
+    constexpr std::uint32_t kMonth = 60u * 60u * 24u * 30u;          // 2592000
+    CHECK_EQ(exptime_to_expiry(kMonth, now), now + kMonth);          // exactly 30 days = still relative
+    CHECK_EQ(exptime_to_expiry(kMonth + 1, now), kMonth + 1);        // just over -> absolute, unchanged
+    CHECK_EQ(exptime_to_expiry(2'000'000'000u, now), 2'000'000'000u); // large absolute Unix time
+}
