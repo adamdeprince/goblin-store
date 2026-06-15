@@ -51,7 +51,10 @@ std::string EventLoop::format_stats() const {
 void EventLoop::frame_get_hit(Conn* c, const std::string& key, const storage::ObjectMeta& meta) {
     c->get_pos = 0;
     c->get_size = meta.size; // whole object
-    c->out += value_header(key, meta.flags, meta.size);
+    if (c->get_with_cas)
+        c->out += value_header_cas(key, meta.flags, meta.size, meta.etag); // gets: VALUE k f n <cas>
+    else
+        c->out += value_header(key, meta.flags, meta.size);
 }
 
 void EventLoop::frame_get_miss(Conn* c) {
@@ -91,19 +94,22 @@ void EventLoop::process(Conn* c) {
             std::string_view reply;
             if (!crlf)
                 reply = kBadDataChunk;
-            else if (c->set_reject || c->set_failed || !c->sh)
+            else if (c->set_reject)
+                reply = c->set_reply; // admission reply: NOT_STORED / NOT_FOUND / EXISTS
+            else if (c->set_failed || !c->sh)
                 reply = kNotStored;
             else if (auto st = c->sh->commit(c->set_flags,
-                                             exptime_to_expiry(c->set_exptime, storage::now_unix()));
+                                             exptime_to_expiry(c->set_exptime, storage::now_unix()),
+                                             c->set_cas);
                      !st)
-                reply = kNotStored;
+                reply = (st.error().code == Errc::cas_mismatch) ? kExists : kNotStored; // race lost
             else
                 reply = kStored;
             c->sh.reset();
             if (reply == kStored)
                 stats_.sets.fetch_add(1, rlx);
-            else if (reply == kNotStored)
-                stats_.set_rejected.fetch_add(1, rlx);
+            else if (reply != kBadDataChunk)
+                stats_.set_rejected.fetch_add(1, rlx); // NOT_STORED / NOT_FOUND / EXISTS
             if (!c->set_noreply) c->out += reply;
             c->state = St::idle;
             continue;
@@ -124,6 +130,7 @@ void EventLoop::process(Conn* c) {
         const std::uint32_t flags = cmd->flags;
         const std::uint32_t exptime = cmd->exptime;
         const std::uint64_t nbytes = cmd->bytes;
+        const std::uint64_t cmd_cas = cmd->cas;
         const std::string key(cmd->key);
         c->in.erase(0, eol + 2);
 
@@ -136,21 +143,33 @@ void EventLoop::process(Conn* c) {
             const bool erased = tm_.remove(crypto::hash_key(key));
             if (!noreply) c->out += (erased ? kDeleted : kNotFound);
         } else if (verb == Verb::get || verb == Verb::gets) {
+            c->get_with_cas = (verb == Verb::gets); // gets -> include the CAS in the VALUE header
             if (!begin_get(c, key)) return;        // read I/O pool exhausted -> parked (ADR-0011)
             if (c->state == St::get_header) break; // hit -> stream the value before parsing further
             // miss: kEnd already queued and state is idle -> keep parsing the pipeline
-        } else if (verb == Verb::set || verb == Verb::add || verb == Verb::replace) {
+        } else if (verb == Verb::set || verb == Verb::add || verb == Verb::replace ||
+                   verb == Verb::cas) {
             const auto digest = crypto::hash_key(key);
-            // add/replace admission treats an expired item as absent (lazy expiry, ADR-0007).
+            // Admission (an expired item counts as absent, lazy TTL, ADR-0007):
             const auto exist = index_.lookup(digest);
             const bool present = exist && !storage::is_expired(*exist, storage::now_unix());
-            const bool reject =
-                (verb == Verb::add && present) || (verb == Verb::replace && !present);
+            bool reject = false;
+            std::string_view reply = kNotStored;
+            std::uint64_t cas_check = 0;
+            if (verb == Verb::add && present) reject = true;           // add: only if absent
+            else if (verb == Verb::replace && !present) reject = true; // replace: only if present
+            else if (verb == Verb::cas) {
+                if (!present) { reject = true; reply = kNotFound; }                  // cas on missing
+                else if (exist->etag != cmd_cas) { reject = true; reply = kExists; } // cas mismatch
+                else cas_check = cmd_cas;                                            // cas matched
+            }
             c->sh.reset();
             c->set_digest = digest;
             c->set_remaining = nbytes;
             c->set_flags = flags;
             c->set_exptime = exptime;
+            c->set_cas = cas_check;
+            c->set_reply = reply;
             c->set_noreply = noreply;
             c->set_reject = reject;
             c->set_failed = false;

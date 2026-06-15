@@ -13,6 +13,7 @@ enum class Errc : std::uint16_t {
     ok = 0,
     not_found,
     already_exists,
+    cas_mismatch,         // cas store: the object's CAS changed under us (-> EXISTS)
     out_of_space,         // a disk tier is full (relevant in BLOCK mode, ADR-0010)
     out_of_memory,        // RAM budget exhausted (ADR-0008)
     too_large,            // object exceeds the configured maximum

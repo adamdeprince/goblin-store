@@ -13,6 +13,7 @@ Verb verb_of(std::string_view t) {
     if (t == "set") return Verb::set;
     if (t == "add") return Verb::add;
     if (t == "replace") return Verb::replace;
+    if (t == "cas") return Verb::cas;
     if (t == "delete") return Verb::del;
     if (t == "version") return Verb::version;
     if (t == "quit") return Verb::quit;
@@ -30,7 +31,7 @@ bool to_int(std::string_view s, T& out) {
 } // namespace
 
 Result<Command> parse_command(std::string_view line) {
-    std::array<std::string_view, 6> tok{};
+    std::array<std::string_view, 7> tok{}; // cas needs up to 7: cas <key> <f> <e> <b> <cas> [noreply]
     std::size_t ntok = 0;
     std::size_t i = 0;
     while (i < line.size() && ntok < tok.size()) {
@@ -65,6 +66,15 @@ Result<Command> parse_command(std::string_view line) {
                 return err(Errc::invalid_protocol, "bad numeric field");
             c.noreply = (ntok >= 6 && tok[5] == "noreply");
             return c;
+        case Verb::cas: // cas <key> <flags> <exptime> <bytes> <cas> [noreply]
+            if (ntok < 6)
+                return err(Errc::invalid_protocol, "cas needs <key> <flags> <exptime> <bytes> <cas>");
+            c.key = tok[1];
+            if (!to_int(tok[2], c.flags) || !to_int(tok[3], c.exptime) || !to_int(tok[4], c.bytes) ||
+                !to_int(tok[5], c.cas))
+                return err(Errc::invalid_protocol, "bad numeric field");
+            c.noreply = (ntok >= 7 && tok[6] == "noreply");
+            return c;
         case Verb::version:
         case Verb::quit:
         case Verb::stats: // optional sub-command (e.g. `stats items`) is accepted but ignored (v1)
@@ -84,6 +94,11 @@ std::uint32_t exptime_to_expiry(std::uint32_t exptime, std::uint32_t now) {
 
 std::string value_header(std::string_view key, std::uint32_t flags, std::uint64_t bytes) {
     return std::format("VALUE {} {} {}\r\n", key, flags, bytes);
+}
+
+std::string value_header_cas(std::string_view key, std::uint32_t flags, std::uint64_t bytes,
+                             std::uint64_t cas) {
+    return std::format("VALUE {} {} {} {}\r\n", key, flags, bytes, cas);
 }
 
 } // namespace goblin::memcache

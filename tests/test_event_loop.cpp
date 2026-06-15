@@ -855,3 +855,80 @@ TEST("tier_manager: reap_expired drops past-TTL objects, keeps live ones") {
     CHECK(index.lookup(hash_key("c")).has_value());
     fs::remove_all(base);
 }
+
+// ----------------------------------------------------------------------------- Step 7: CAS
+
+// `gets <key>` -> parse "VALUE k f n <cas>\r\n<n bytes>\r\nEND\r\n"; returns the CAS (nullopt on miss).
+static std::optional<std::uint64_t> gets_cas(int fd, const std::string& key) {
+    const std::string req = "gets " + key + "\r\n";
+    if (!write_all(fd, req.data(), req.size())) return std::nullopt;
+    std::string buf;
+    char tmp[4096];
+    while (buf.find("\r\n") == std::string::npos) {
+        const ssize_t k = ::recv(fd, tmp, sizeof tmp, 0);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) return std::nullopt;
+        buf.append(tmp, static_cast<std::size_t>(k));
+    }
+    const auto hdr_end = buf.find("\r\n");
+    const std::string hdr = buf.substr(0, hdr_end);
+    if (hdr.rfind("VALUE ", 0) != 0) return std::nullopt; // miss (just "END")
+    const auto sp_cas = hdr.rfind(' ');                   // VALUE key flags bytes cas
+    const std::uint64_t cas = std::stoull(hdr.substr(sp_cas + 1));
+    const auto sp_bytes = hdr.rfind(' ', sp_cas - 1);
+    const std::size_t bytes = std::stoul(hdr.substr(sp_bytes + 1, sp_cas - sp_bytes - 1));
+    const std::size_t need = hdr_end + 2 + bytes + 7; // drain header CRLF + data + "\r\nEND\r\n"
+    while (buf.size() < need) {
+        const ssize_t k = ::recv(fd, tmp, sizeof tmp, 0);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) return std::nullopt;
+        buf.append(tmp, static_cast<std::size_t>(k));
+    }
+    return cas;
+}
+
+// "cas <key> 0 0 <len> <cas>\r\n<val>\r\n" -> reply line.
+static std::string cas_cmd(int fd, const std::string& key, const std::string& val, std::uint64_t cas) {
+    std::string req = "cas " + key + " 0 0 " + std::to_string(val.size()) + " " + std::to_string(cas) +
+                      "\r\n" + val + "\r\n";
+    if (!write_all(fd, req.data(), req.size())) return {};
+    return read_until(fd, "\r\n");
+}
+
+TEST("event loop: cas — gets returns a CAS; match stores, stale -> EXISTS, missing -> NOT_FOUND") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("cas");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    auto io = make_iopool();
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    EventLoop loop(*rc, lfd, *tm, index, *io);
+    std::thread th([&] { loop.run(); });
+
+    bool ok = false;
+    const int c = client_connect(port);
+    if (c >= 0) {
+        const std::string v = pattern(13, 64);
+        const bool stored = set_value(c, "k", v) == "STORED\r\n";
+        const auto cas1 = gets_cas(c, "k");                  // current CAS
+        const auto miss = gets_cas(c, "nope");               // miss -> no CAS
+        const bool match = cas1 && cas_cmd(c, "k", v, *cas1) == "STORED\r\n";   // matching CAS stores
+        const auto cas2 = gets_cas(c, "k");                  // CAS changed after the store
+        const bool stale = cas1 && cas_cmd(c, "k", v, *cas1) == "EXISTS\r\n";   // old CAS -> EXISTS
+        const bool nf = cas_cmd(c, "ghost", v, 1) == "NOT_FOUND\r\n";           // cas on a missing key
+        ok = stored && cas1 && !miss && match && cas2 && *cas2 != *cas1 && stale && nf;
+        ::close(c);
+    }
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(ok);
+}

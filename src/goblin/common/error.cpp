@@ -7,6 +7,7 @@ std::string_view to_string(Errc c) noexcept {
         case Errc::ok:                   return "ok";
         case Errc::not_found:            return "not_found";
         case Errc::already_exists:       return "already_exists";
+        case Errc::cas_mismatch:         return "cas_mismatch";
         case Errc::out_of_space:         return "out_of_space";
         case Errc::out_of_memory:        return "out_of_memory";
         case Errc::too_large:            return "too_large";

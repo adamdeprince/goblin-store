@@ -30,6 +30,21 @@ TEST("memcache: parse set, with and without noreply") {
     CHECK_EQ(c2->exptime, std::uint32_t(600));
 }
 
+TEST("memcache: parse cas command") {
+    const auto c = parse_command("cas foo 1 0 5 42");
+    CHECK(c.has_value());
+    CHECK(c->verb == Verb::cas);
+    CHECK(c->is_storage());
+    CHECK(c->key == "foo");
+    CHECK_EQ(c->flags, std::uint32_t(1));
+    CHECK_EQ(c->bytes, std::uint64_t(5));
+    CHECK_EQ(c->cas, std::uint64_t(42));
+    CHECK(!c->noreply);
+    const auto c2 = parse_command("cas foo 0 0 5 7 noreply");
+    CHECK(c2.has_value() && c2->noreply && c2->cas == std::uint64_t(7));
+    CHECK(!parse_command("cas foo 0 0 5").has_value()); // missing the cas field
+}
+
 TEST("memcache: parse delete / version / quit") {
     CHECK(parse_command("delete foo")->verb == Verb::del);
     CHECK(parse_command("delete foo noreply")->noreply);

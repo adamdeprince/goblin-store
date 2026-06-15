@@ -95,7 +95,9 @@ public:
 
         Status write(ByteView chunk);       // append the next bytes (sequential, from offset 0)
         // publish to the index + cache the head. expiry is an absolute Unix time (0 = never, ADR-0007).
-        Status commit(std::uint32_t flags, std::uint32_t expiry = 0);
+        // cas_expected != 0 -> compare-and-swap: publish only if the live object's etag matches, else
+        // return Errc::cas_mismatch (checked under the publish lock; the scratch files just abort).
+        Status commit(std::uint32_t flags, std::uint32_t expiry = 0, std::uint64_t cas_expected = 0);
 
     private:
         friend class TierManager;

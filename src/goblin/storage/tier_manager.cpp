@@ -335,7 +335,8 @@ Status TierManager::StoreHandle::flush_block(Size n) {
     return {};
 }
 
-Status TierManager::StoreHandle::commit(std::uint32_t flags, std::uint32_t expiry) {
+Status TierManager::StoreHandle::commit(std::uint32_t flags, std::uint32_t expiry,
+                                        std::uint64_t cas_expected) {
     if (off_ != layout_.size)
         return err(Errc::invalid_argument, "commit before the full value was written");
 
@@ -348,13 +349,15 @@ Status TierManager::StoreHandle::commit(std::uint32_t flags, std::uint32_t expir
     }
 
     std::unique_lock<std::shared_mutex> lk(*tm_->mu_); // publish + swap atomically (exclusive, ADR-0018)
+    const auto old = tm_->index_->lookup(digest_);
+    if (cas_expected != 0 && (!old || is_expired(*old, now_unix()) || old->etag != cas_expected))
+        return err(Errc::cas_mismatch); // object changed/absent under us -> don't publish (scratch aborts)
     // Publish: rename the scratch files over the live names. Readers that already opened the old
     // files keep them (unlinked-but-open inodes) and finish a consistent old version.
     if (auto st = tm_->ssd_.publish(digest_, layout_.ssd_bytes, suffix_); !st) return st;
     if (tm_->hdd_) {
         if (auto st = tm_->hdd_->publish(digest_, layout_.hdd_bytes, suffix_); !st) return st;
     }
-    const auto old = tm_->index_->lookup(digest_);
     if (old && old->head.resident()) { // retire the replaced version's head now that the new is live
         tm_->free_head_region(old->head.block, old->head.offset, old->head.len);
         tm_->policy_->remove(digest_);

@@ -59,6 +59,7 @@ protected:
         std::string get_key;        // final (post-derivation) key, kept to re-open_snapshot when parked
         std::optional<ByteRange> req_range; // requested sub-range (HTTP Range), resolved in frame_get_hit
         std::string inm;            // HTTP If-None-Match (conditional GET), used in frame_get_hit; empty=absent
+        bool get_with_cas = false;  // memcache `gets`: emit the CAS in the VALUE header
         std::optional<storage::TierManager::ReadStream> rs; // open object files for this GET
         Size get_size = 0;          // last byte to stream (exclusive)
         Size get_pos = 0;           // head/header-phase cursor; tail start handed to send_pos/plan_pos
@@ -94,6 +95,8 @@ protected:
         Size set_remaining = 0;     // body bytes still to receive (== full nbytes while parked)
         std::uint32_t set_flags = 0;
         std::uint32_t set_exptime = 0; // raw memcache exptime; -> absolute expiry at commit time
+        std::uint64_t set_cas = 0;     // cas store: required current CAS (0 = not a cas store)
+        std::string_view set_reply;    // reply to send on set_reject: NOT_STORED / NOT_FOUND / EXISTS
         bool set_noreply = false;
         bool set_reject = false; // admission failed -> drain the body, then reject
         bool set_failed = false; // a disk write failed -> don't commit

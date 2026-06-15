@@ -95,15 +95,25 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
             const std::uint32_t flags = cmd->flags;
             const std::uint32_t exptime = cmd->exptime;
             const std::uint64_t nbytes = cmd->bytes;
+            const std::uint64_t cmd_cas = cmd->cas;
             const bool noreply = cmd->noreply;
             const auto digest = crypto::hash_key(cmd->key); // key still valid (buf intact here)
             buf.erase(0, eol + 2);                          // drop command line; data block follows
 
-            // ADD/REPLACE admission, before opening files or writing anything. An expired item counts
-            // as absent (lazy TTL, ADR-0007).
+            // Admission, before opening files or writing anything. An expired item counts as absent
+            // (lazy TTL, ADR-0007); cas must exist + match the current CAS.
             const auto exist = index.lookup(digest);
             const bool present = exist && !storage::is_expired(*exist, storage::now_unix());
-            const bool admit = !((verb == Verb::add && present) || (verb == Verb::replace && !present));
+            bool admit = true;
+            std::string_view reject_reply = kNotStored;
+            std::uint64_t cas_check = 0;
+            if (verb == Verb::add && present) admit = false;
+            else if (verb == Verb::replace && !present) admit = false;
+            else if (verb == Verb::cas) {
+                if (!present) { admit = false; reject_reply = kNotFound; }
+                else if (exist->etag != cmd_cas) { admit = false; reject_reply = kExists; }
+                else cas_check = cmd_cas;
+            }
             std::optional<storage::TierManager::StoreHandle> handle;
             if (admit) {
                 // Blocking-mode backpressure (ADR-0011/0016): if the write-staging pool is exhausted,
@@ -141,12 +151,13 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
             buf.erase(0, 2);
 
             std::string_view reply;
-            if (!admit) reply = kNotStored;
+            if (!admit) reply = reject_reply; // NOT_STORED / NOT_FOUND / EXISTS
             else if (!crlf_ok) reply = kBadDataChunk;
             else if (!handle || !write_ok) reply = kNotStored;
-            else if (auto st = handle->commit(flags, exptime_to_expiry(exptime, storage::now_unix()));
+            else if (auto st = handle->commit(flags, exptime_to_expiry(exptime, storage::now_unix()),
+                                              cas_check);
                      !st)
-                reply = kNotStored;
+                reply = (st.error().code == Errc::cas_mismatch) ? kExists : kNotStored;
             else reply = kStored;
             // (An uncommitted handle aborts on scope exit — the object stays unindexed/invisible.)
             if (!noreply && !send_all(fd, reply)) return;
@@ -163,7 +174,10 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
                     break;
                 }
                 tm.touch(digest); // record the hit for eviction (no-op if head not cached)
-                if (!send_all(fd, value_header(cmd->key, meta->flags, meta->size))) return;
+                if (!send_all(fd, cmd->verb == Verb::gets
+                                      ? value_header_cas(cmd->key, meta->flags, meta->size, meta->etag)
+                                      : value_header(cmd->key, meta->flags, meta->size)))
+                    return;
                 if (!stream_value(fd, tm, reactor, iobufs, digest, *meta)) return;
                 if (!send_all(fd, std::string_view{"\r\n"})) return;
                 if (!send_all(fd, kEnd)) return;
