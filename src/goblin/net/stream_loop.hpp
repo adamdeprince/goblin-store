@@ -60,6 +60,12 @@ protected:
         std::optional<ByteRange> req_range; // requested sub-range (HTTP Range), resolved in frame_get_hit
         std::string inm;            // HTTP If-None-Match (conditional GET), used in frame_get_hit; empty=absent
         bool get_with_cas = false;  // memcache `gets`: emit the CAS in the VALUE header
+        bool meta = false;            // meta `mg` with value: VA framing (frame_get_hit/miss/on_value_sent)
+        std::uint8_t meta_rflags = 0; // meta return-flags bitmask (f=1 s=2 t=4 c=8 k=16)
+        bool meta_quiet = false;      // meta q: suppress EN miss (mg) / HD success (ms)
+        std::string meta_opaque;      // meta O<token> to echo (copied; `in` is erased before the stream)
+        std::string meta_key;         // meta `ms` key, for k-echo on the HD reply (copied)
+        std::uint32_t meta_expiry = 0; // meta `ms` absolute expiry (T converted at parse; 0 = never)
         std::optional<storage::TierManager::ReadStream> rs; // open object files for this GET
         Size get_size = 0;          // last byte to stream (exclusive)
         Size get_pos = 0;           // head/header-phase cursor; tail start handed to send_pos/plan_pos

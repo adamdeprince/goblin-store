@@ -45,6 +45,29 @@ TEST("memcache: parse cas command") {
     CHECK(!parse_command("cas foo 0 0 5").has_value()); // missing the cas field
 }
 
+TEST("memcache: parse meta commands (mn/mg/ms/md + flags)") {
+    CHECK(parse_meta("mn")->verb == MetaVerb::mn);
+    const auto g = parse_meta("mg foo v f s t c k T90 Oabc");
+    CHECK(g.has_value());
+    CHECK(g->verb == MetaVerb::mg && g->key == "foo");
+    CHECK(g->rf_value && g->rf_flags && g->rf_size && g->rf_ttl && g->rf_cas && g->rf_key);
+    CHECK(g->has_ttl && g->ttl == 90);
+    CHECK(g->opaque == "abc");
+    const auto s = parse_meta("ms foo 5 F7 T300 C42 ME q");
+    CHECK(s.has_value());
+    CHECK(s->verb == MetaVerb::ms && s->key == "foo" && s->datalen == std::uint64_t(5));
+    CHECK(s->has_set_flags && s->set_flags == std::uint32_t(7));
+    CHECK(s->has_ttl && s->ttl == 300);
+    CHECK(s->has_cas && s->cas == std::uint64_t(42));
+    CHECK(s->mode == 'E' && s->quiet);
+    const auto d = parse_meta("md foo C42 q");
+    CHECK(d.has_value() && d->verb == MetaVerb::md && d->has_cas && d->cas == std::uint64_t(42) && d->quiet);
+    CHECK(!parse_meta("mg").has_value());       // no key
+    CHECK(!parse_meta("ms foo").has_value());   // no datalen
+    CHECK(!parse_meta("mg foo Z").has_value()); // unsupported flag
+    CHECK(!parse_meta("mx foo").has_value());   // unknown verb
+}
+
 TEST("memcache: parse delete / version / quit") {
     CHECK(parse_command("delete foo")->verb == Verb::del);
     CHECK(parse_command("delete foo noreply")->noreply);

@@ -85,6 +85,49 @@ Result<Command> parse_command(std::string_view line) {
     return err(Errc::invalid_protocol, "unhandled command");
 }
 
+Result<MetaCommand> parse_meta(std::string_view line) {
+    std::size_t i = 0;
+    auto next = [&]() -> std::string_view {
+        while (i < line.size() && line[i] == ' ') ++i;
+        const std::size_t s = i;
+        while (i < line.size() && line[i] != ' ') ++i;
+        return line.substr(s, i - s);
+    };
+    MetaCommand m;
+    const std::string_view v = next();
+    if (v == "mn") { m.verb = MetaVerb::mn; return m; } // no key/flags
+    else if (v == "mg") m.verb = MetaVerb::mg;
+    else if (v == "ms") m.verb = MetaVerb::ms;
+    else if (v == "md") m.verb = MetaVerb::md;
+    else return err(Errc::invalid_protocol, "unknown meta command");
+
+    m.key = next();
+    if (m.key.empty()) return err(Errc::invalid_protocol, "meta needs a key");
+    if (m.verb == MetaVerb::ms && !to_int(next(), m.datalen))
+        return err(Errc::invalid_protocol, "ms needs <datalen>");
+
+    for (std::string_view t = next(); !t.empty(); t = next()) {
+        const char c = t[0];
+        const std::string_view arg = t.substr(1);
+        switch (c) {
+            case 'v': m.rf_value = true; break;
+            case 'f': m.rf_flags = true; break;
+            case 's': m.rf_size = true; break;
+            case 't': m.rf_ttl = true; break;
+            case 'c': m.rf_cas = true; break;
+            case 'k': m.rf_key = true; break;
+            case 'q': m.quiet = true; break;
+            case 'F': if (!to_int(arg, m.set_flags)) return err(Errc::invalid_protocol, "bad F"); m.has_set_flags = true; break;
+            case 'T': if (!to_int(arg, m.ttl)) return err(Errc::invalid_protocol, "bad T"); m.has_ttl = true; break;
+            case 'C': if (!to_int(arg, m.cas)) return err(Errc::invalid_protocol, "bad C"); m.has_cas = true; break;
+            case 'M': if (arg.empty()) return err(Errc::invalid_protocol, "bad M"); m.mode = arg[0]; break;
+            case 'O': m.opaque = arg; break;
+            default: return err(Errc::invalid_protocol, "unsupported meta flag");
+        }
+    }
+    return m;
+}
+
 std::uint32_t exptime_to_expiry(std::uint32_t exptime, std::uint32_t now) {
     constexpr std::uint32_t kRelativeMax = 60u * 60u * 24u * 30u; // 30 days (memcache convention)
     if (exptime == 0) return 0;                 // never expires

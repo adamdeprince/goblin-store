@@ -123,6 +123,7 @@ public:
     Result<StoreHandle> begin_store(const Digest&, Size size);
     Status store(const Digest&, ByteView data, std::uint32_t flags, std::uint32_t expiry = 0); // begin+write+commit
     std::size_t reap_expired(); // drop objects past their TTL; returns count (O(1) when no TTLs are set)
+    bool touch_ttl(const Digest&, std::uint32_t expiry); // meta T: overwrite the TTL; false if absent
     Result<std::size_t> read(core::Reactor&, const Digest&, Offset offset, MutBytes out);
     bool remove(const Digest&); // erase from index + free the cached head
     // Resident RAM head bytes for a zero-copy send, or nullopt if not cached (ADR-0017).

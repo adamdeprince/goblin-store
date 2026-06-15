@@ -895,6 +895,108 @@ static std::string cas_cmd(int fd, const std::string& key, const std::string& va
     return read_until(fd, "\r\n");
 }
 
+// ----------------------------------------------------------------------------- Step 8: meta protocol
+
+// Send a meta command line, read one response line (no value); returns it without the CRLF.
+static std::string meta_cmd(int fd, const std::string& cmd) {
+    const std::string req = cmd + "\r\n";
+    if (!write_all(fd, req.data(), req.size())) return {};
+    const std::string r = read_until(fd, "\r\n");
+    return r.substr(0, r.find("\r\n"));
+}
+
+// "ms <key> <len> [flags]\r\n<val>\r\n" -> the response line.
+static std::string meta_set(int fd, const std::string& key, const std::string& val,
+                            const std::string& flags) {
+    std::string req = "ms " + key + " " + std::to_string(val.size());
+    if (!flags.empty()) req += " " + flags;
+    req += "\r\n" + val + "\r\n";
+    if (!write_all(fd, req.data(), req.size())) return {};
+    const std::string r = read_until(fd, "\r\n");
+    return r.substr(0, r.find("\r\n"));
+}
+
+// "mg <key> v" -> the value (nullopt on EN miss). Reads "VA <size> ...\r\n<size bytes>\r\n".
+static std::optional<std::string> meta_mg_value(int fd, const std::string& key) {
+    const std::string req = "mg " + key + " v\r\n";
+    if (!write_all(fd, req.data(), req.size())) return std::nullopt;
+    std::string buf;
+    char tmp[4096];
+    while (buf.find("\r\n") == std::string::npos) {
+        const ssize_t k = ::recv(fd, tmp, sizeof tmp, 0);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) return std::nullopt;
+        buf.append(tmp, static_cast<std::size_t>(k));
+    }
+    const auto eol = buf.find("\r\n");
+    if (buf.rfind("VA ", 0) != 0) return std::nullopt; // miss (EN)
+    const std::size_t size = std::stoul(buf.substr(3)); // "VA <size> ..."
+    const std::size_t need = eol + 2 + size + 2;        // VA line + data + CRLF
+    while (buf.size() < need) {
+        const ssize_t k = ::recv(fd, tmp, sizeof tmp, 0);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) return std::nullopt;
+        buf.append(tmp, static_cast<std::size_t>(k));
+    }
+    return buf.substr(eol + 2, size);
+}
+
+// Extract the numeric value of a " <f><digits>" meta flag (e.g. ' c' -> the CAS).
+static std::optional<std::uint64_t> meta_flag_u64(const std::string& line, char f) {
+    const std::string tok = std::string(" ") + f;
+    const auto p = line.find(tok);
+    if (p == std::string::npos) return std::nullopt;
+    return std::stoull(line.substr(p + 2));
+}
+
+TEST("event loop: meta protocol — mn / ms / mg / md, flags, modes, CAS") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("meta");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    auto io = make_iopool();
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    EventLoop loop(*rc, lfd, *tm, index, *io);
+    std::thread th([&] { loop.run(); });
+
+    bool ok = false;
+    const int c = client_connect(port);
+    if (c >= 0) {
+        const std::string v = "HELLOWORLD"; // 10 bytes
+        const bool mn = meta_cmd(c, "mn") == "MN";
+        const bool store = meta_set(c, "k", v, "F7") == "HD";              // ms store
+        const std::string hd = meta_cmd(c, "mg k f s t");                  // HD f7 s10 t-1 (never)
+        const bool meta_hd = hd.rfind("HD", 0) == 0 && hd.find(" f7") != std::string::npos &&
+                             hd.find(" s10") != std::string::npos && hd.find(" t-1") != std::string::npos;
+        const bool opaque = meta_cmd(c, "mg k Oabc") == "HD Oabc";         // O echoed on the reply
+        const auto val = meta_mg_value(c, "k");                            // mg v -> value
+        const bool got_val = val && *val == v;
+        const bool add = meta_set(c, "k", v, "ME") == "NS";                // add over existing -> NS
+        const bool repl = meta_set(c, "ghost", v, "MR") == "NS";          // replace missing -> NS
+        const auto cas = meta_flag_u64(meta_cmd(c, "mg k c"), 'c');        // current CAS
+        const bool cas_match = cas && meta_set(c, "k", v, "C" + std::to_string(*cas)) == "HD"; // stores
+        const bool cas_stale = cas && meta_set(c, "k", v, "C" + std::to_string(*cas)) == "EX"; // CAS bumped
+        const bool del = meta_cmd(c, "md k") == "HD";                      // delete
+        const bool miss = meta_cmd(c, "mg k") == "EN";                     // now a miss
+        const bool del_nf = meta_cmd(c, "md k") == "NF";                   // already gone
+        ok = mn && store && meta_hd && opaque && got_val && add && repl && cas && cas_match &&
+             cas_stale && del && miss && del_nf;
+        ::close(c);
+    }
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(ok);
+}
+
 TEST("event loop: cas — gets returns a CAS; match stores, stale -> EXISTS, missing -> NOT_FOUND") {
     if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
     auto rc = Reactor::create();

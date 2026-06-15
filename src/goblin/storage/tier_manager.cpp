@@ -160,6 +160,13 @@ Status TierManager::store(const Digest& digest, ByteView data, std::uint32_t fla
     return h->commit(flags, expiry);
 }
 
+// meta `T` touch: overwrite an object's absolute expiry in place (0 = never). false if absent.
+bool TierManager::touch_ttl(const Digest& digest, std::uint32_t expiry) {
+    const bool found = index_->update_expiry(digest, expiry);
+    if (found && expiry != 0) any_ttl_->store(true, std::memory_order_relaxed); // arm the reaper
+    return found;
+}
+
 // Drop every object whose TTL has passed. Lazy-skip already hides expired objects from reads; this
 // reclaims their RAM head + disk files. O(1) when no TTL has ever been set (the common cache case).
 std::size_t TierManager::reap_expired() {

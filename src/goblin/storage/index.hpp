@@ -67,6 +67,7 @@ public:
     bool erase(const Digest& d);                        // memcache DELETE
 
     bool set_head(const Digest& d, HeadLoc loc);        // update head residency; false if absent
+    bool update_expiry(const Digest& d, std::uint32_t expiry); // overwrite the TTL (meta T); false if absent
 
     std::size_t size() const; // live object count across shards
     void clear();             // blank slate (startup, ADR-0013)

@@ -64,6 +64,15 @@ bool Index::set_head(const Digest& d, HeadLoc loc) {
     return true;
 }
 
+bool Index::update_expiry(const Digest& d, std::uint32_t expiry) {
+    Shard& s = shard_for(d);
+    std::unique_lock lk(s.mu);
+    const auto it = s.map.find(d);
+    if (it == s.map.end()) return false;
+    it->second.expiry = expiry;
+    return true;
+}
+
 std::size_t Index::size() const {
     std::size_t n = 0;
     for (std::size_t i = 0; i < nshards_; ++i) {
