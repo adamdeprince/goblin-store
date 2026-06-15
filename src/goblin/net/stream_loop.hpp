@@ -39,7 +39,7 @@ public:
     std::size_t live_conns() const noexcept { return conns_.size(); }
 
 protected:
-    enum class St { idle, set_body, set_wait, get_wait, get_header, get_send_head, get_reading, get_send_piece, get_trailer };
+    enum class St { idle, set_body, set_wait, get_wait, get_header, get_send_head, get_stream, get_trailer };
 
     struct Conn {
         int fd = -1;
@@ -59,16 +59,33 @@ protected:
         std::optional<ByteRange> req_range; // requested sub-range (HTTP Range), resolved in frame_get_hit
         std::string inm;            // HTTP If-None-Match (conditional GET), used in frame_get_hit; empty=absent
         std::optional<storage::TierManager::ReadStream> rs; // open object files for this GET
-        MutBytes iobuf;             // borrowed I/O-pool buffer (value pieces land here)
-        bool have_iobuf = false;
         Size get_size = 0;          // last byte to stream (exclusive)
-        Size get_pos = 0;           // next byte to stream
-        Size piece_len = 0;         // bytes in the current piece
-        std::size_t piece_sent = 0; // partial-send progress into the current piece
-        unsigned pending_reads = 0; // disk segment reads outstanding for the current piece
-        bool read_error = false;
+        Size get_pos = 0;           // head/header-phase cursor; tail start handed to send_pos/plan_pos
         storage::TierManager::HeadPin head_pin; // pinned RAM head for the zero-copy send (ADR-0018)
         std::size_t head_sent = 0;              // partial-send progress into the head
+
+        // Disk-tail streaming with double-buffered read-ahead (ADR-0011): up to 2 lanes. Lane 0's
+        // buffer is mandatory; lane 1 is acquired opportunistically to pipeline -- read piece N+1 while
+        // piece N sends. One lane => the serial single-buffer path. Sends stay strictly ordered; only
+        // the disk reads run ahead. At most one read batch and one send are in flight at a time, so
+        // completions route by the read_lane / send_lane indices (no extra tag bits needed).
+        struct Lane {
+            MutBytes buf;
+            bool have = false;       // holds a read I/O-pool buffer
+            Size len = 0;            // bytes in this lane's piece
+            std::size_t sent = 0;    // partial-send progress within the piece
+            unsigned reads = 0;      // disk reads still outstanding for this piece
+            bool err = false;        // a read failed
+            bool ready = false;      // piece fully read (or all-head): awaiting its turn to send
+        };
+        std::array<Lane, 2> lane;
+        int n_lanes = 0;            // read buffers held (1 = serial, 2 = pipelined)
+        int read_lane = -1;         // lane with disk reads in flight, or -1
+        int send_lane = -1;         // lane with a send in flight, or -1
+        int fill_i = 0;             // next lane to plan+read into (round-robin over n_lanes)
+        int send_i = 0;             // next lane to send from (round-robin; pieces sent in plan order)
+        Size plan_pos = 0;          // next object byte to plan+read
+        Size send_pos = 0;          // next object byte to send (advances as pieces fully send)
 
         // Write-ingest state (memcache SET; HTTP PUT later):
         std::optional<storage::TierManager::StoreHandle> sh; // open writer for this body
@@ -118,16 +135,18 @@ private:
     void on_recv(Conn*, int res);
     void on_send(Conn*, int res);
     void on_read(Conn*, int res);
-    void start_send_head(Conn*); // send the pinned head region zero-copy (partial-aware)
-    void start_send_piece(Conn*); // (re)send the current piece from iobuf (partial-aware)
-    void pump_get(Conn*);         // produce + send the next value piece, or finish the value
+    void start_send_head(Conn*);  // send the pinned head region zero-copy (partial-aware)
+    void start_lane_send(Conn*);  // (re)send the current lane's piece (partial-aware)
+    void enter_stream(Conn*);     // head done -> begin streaming the disk tail through the lanes
+    void pump_stream(Conn*);      // start the next ordered send + read-ahead, or finish the value
+    bool plan_lane_read(Conn*, int lane); // plan + issue a piece's reads into a lane; false -> abort
     void abort_get(Conn*);        // error mid-GET -> release buffers, close
     void drain_set_waiters();     // retry parked writes once a staging buffer may be free
     void drain_get_waiters();     // retry parked GETs once a read I/O buffer may be free
     void sweep_stalled(std::chrono::steady_clock::time_point now); // drop buffer-holding conns gone idle
     void abort_conn(Conn*);       // abortive close (RST) so a stalled conn's pending op completes
     void unpin_if_held(Conn*);
-    void release_iobuf(Conn*);
+    void release_lanes(Conn*); // release all held read buffers + reset lane state
     void retire(Conn*);
 
     int lfd_;

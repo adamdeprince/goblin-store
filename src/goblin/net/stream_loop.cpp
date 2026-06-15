@@ -141,8 +141,17 @@ bool StreamLoop::begin_get(Conn* c, const std::string& key) {
             return false;
         }
         c->rs.emplace(std::move(*snap->rs));
-        c->iobuf = *buf;
-        c->have_iobuf = true;
+        c->lane[0].buf = *buf;
+        c->lane[0].have = true;
+        c->n_lanes = 1;
+        if (auto buf2 = iobufs_.acquire()) { // opportunistic 2nd buffer -> read-ahead (best-effort)
+            c->lane[1].buf = *buf2;
+            c->lane[1].have = true;
+            c->n_lanes = 2;
+        }
+        c->read_lane = c->send_lane = -1;
+        c->fill_i = c->send_i = 0;
+        for (auto& L : c->lane) { L.len = L.sent = L.reads = 0; L.ready = L.err = false; }
     }
     c->head_pin = snap->pin;
     c->head_sent = 0;
@@ -192,58 +201,96 @@ void StreamLoop::drain_get_waiters() {
     }
 }
 
-void StreamLoop::pump_get(Conn* c) {
-    if (c->get_pos >= c->get_size) { // value done
-        on_value_sent(c);
-        return;
+// Head/header fully sent: begin streaming the disk tail [get_pos, get_size) through the read lanes.
+void StreamLoop::enter_stream(Conn* c) {
+    c->send_pos = c->plan_pos = c->get_pos;
+    c->state = St::get_stream;
+    pump_stream(c);
+}
+
+// Plan the next tail piece into lane `i` and issue its disk reads (or mark it ready immediately if it
+// maps to already-resident head bytes the plan copied in). Advances plan_pos + fill_i. false -> abort.
+bool StreamLoop::plan_lane_read(Conn* c, int i) {
+    Conn::Lane& L = c->lane[i];
+    const Size want = std::min<Size>(L.buf.size(), c->get_size - c->plan_pos);
+    const auto plan = c->rs->plan(c->plan_pos, L.buf.subspan(0, want));
+    if (plan.total != want) return false; // couldn't map the whole piece
+    L.len = plan.total;
+    L.sent = 0;
+    L.reads = 0;
+    L.err = false;
+    L.ready = false;
+    c->plan_pos += L.len;
+    c->fill_i = (c->fill_i + 1) % c->n_lanes;
+    if (plan.segs.empty()) { // all-head piece already copied into the buffer -> no disk reads
+        L.ready = true;
+        return true;
     }
-    const Size want = std::min<Size>(c->iobuf.size(), c->get_size - c->get_pos);
-    const auto plan = c->rs->plan(c->get_pos, c->iobuf.subspan(0, want));
-    c->piece_len = plan.total;
-    if (c->piece_len != want) { // couldn't map the whole piece
-        abort_get(c);
-        return;
-    }
-    if (plan.segs.empty()) { // all-head piece, already in iobuf
-        c->piece_sent = 0;
-        c->state = St::get_send_piece;
-        start_send_piece(c);
-        return;
-    }
-    c->pending_reads = 0;
-    c->read_error = false;
-    c->state = St::get_reading;
     for (const auto& s : plan.segs) {
-        // O_DIRECT (ADR-0011): the read length must be a device-block multiple. Round up into the
-        // (page-aligned, io_chunk-sized) I/O buffer and serve only piece_len bytes; offsets are
-        // already 4 KiB-aligned (pieces start on 4 KiB boundaries, segments at stripe boundaries).
-        const Size rlen = std::min<Size>(align_up(s.len, kDeviceBlock), c->iobuf.size() - s.out_off);
-        if (!r_.submit_read(s.fd, s.file_off, c->iobuf.subspan(s.out_off, rlen), tag(c, kRead))) {
-            abort_get(c);
+        // O_DIRECT (ADR-0011): read length must be a device-block multiple. Round up into the
+        // (page-aligned, io_chunk-sized) buffer and serve only L.len bytes; offsets are already
+        // 4 KiB-aligned (pieces start on 4 KiB boundaries, segments at stripe boundaries).
+        const Size rlen = std::min<Size>(align_up(s.len, kDeviceBlock), L.buf.size() - s.out_off);
+        if (!r_.submit_read(s.fd, s.file_off, L.buf.subspan(s.out_off, rlen), tag(c, kRead)))
+            return false;
+        ++c->inflight;
+        ++L.reads;
+    }
+    c->read_lane = i;
+    return true;
+}
+
+// Drive the tail pipeline: start the next in-order piece send if its lane is ready, and start the
+// next read-ahead into a free lane. At most one send and one read are in flight, so the read of piece
+// N+1 overlaps the send of piece N (ADR-0006 shock absorber). Finishes the value once all bytes send.
+void StreamLoop::pump_stream(Conn* c) {
+    for (;;) {
+        bool progress = false;
+        // Send the next piece in order, once its lane has finished reading and nothing else is sending.
+        if (c->send_lane < 0 && c->send_pos < c->get_size && c->lane[c->send_i].ready) {
+            c->send_lane = c->send_i;
+            c->lane[c->send_i].sent = 0;
+            start_lane_send(c);
+            if (c->closing) return;
+            progress = true;
+        }
+        // Read-ahead: fill the next free lane (never the one currently sending) while tail remains.
+        if (c->read_lane < 0 && c->plan_pos < c->get_size) {
+            const int f = c->fill_i;
+            if (c->lane[f].have && !c->lane[f].ready && f != c->send_lane) {
+                if (!plan_lane_read(c, f)) { abort_get(c); return; }
+                progress = true;
+            }
+        }
+        if (c->send_lane < 0 && c->read_lane < 0 && c->send_pos >= c->get_size) {
+            on_value_sent(c); // tail fully sent
             return;
         }
-        ++c->inflight;
-        ++c->pending_reads;
+        if (!progress) return; // nothing more to start this tick; wait for an in-flight completion
     }
 }
 
 void StreamLoop::on_read(Conn* c, int res) {
-    if (res <= 0) c->read_error = true;
-    if (c->pending_reads) --c->pending_reads;
-    if (c->pending_reads != 0) return;
-    if (c->closing) return; // already aborting; just drain the remaining reads
-    if (c->read_error) {
+    if (c->read_lane < 0) return; // no read batch tracked (defensive)
+    Conn::Lane& L = c->lane[c->read_lane];
+    if (res <= 0) L.err = true;
+    if (L.reads) --L.reads;
+    if (L.reads != 0) return; // more segments of this piece still outstanding
+    const int done = c->read_lane;
+    c->read_lane = -1;
+    if (c->closing) return; // already aborting; just drain
+    if (c->lane[done].err) {
         abort_get(c);
         return;
     }
-    c->piece_sent = 0;
-    c->state = St::get_send_piece;
-    start_send_piece(c);
+    c->lane[done].ready = true;
+    pump_stream(c); // piece ready -> may start its send and the next read-ahead
 }
 
-void StreamLoop::start_send_piece(Conn* c) {
+void StreamLoop::start_lane_send(Conn* c) {
     if (c->closing) return;
-    const ByteView piece(c->iobuf.data() + c->piece_sent, c->piece_len - c->piece_sent);
+    Conn::Lane& L = c->lane[c->send_lane];
+    const ByteView piece(L.buf.data() + L.sent, L.len - L.sent);
     if (r_.submit_send(c->fd, piece, tag(c, kSend)))
         ++c->inflight;
     else
@@ -264,7 +311,7 @@ void StreamLoop::start_send_head(Conn* c) {
 void StreamLoop::on_send(Conn* c, int res) {
     if (res < 0) {
         if (res == -EAGAIN || res == -EWOULDBLOCK) { // non-blocking fd (kTLS/HTTPS): buffer full -> retry
-            if (c->state == St::get_send_piece) start_send_piece(c);
+            if (c->state == St::get_stream) start_lane_send(c);
             else if (c->state == St::get_send_head) start_send_head(c);
             else start_send(c);
             return;
@@ -277,14 +324,20 @@ void StreamLoop::on_send(Conn* c, int res) {
         return;
     }
     stats_.bytes_served.fetch_add(static_cast<std::uint64_t>(res), rlx); // header/head/piece/trailer
-    if (c->state == St::get_send_piece) {
-        c->piece_sent += static_cast<std::size_t>(res);
-        if (c->piece_sent < c->piece_len) {
-            start_send_piece(c); // short send -> remainder of the piece
+    if (c->state == St::get_stream) {
+        Conn::Lane& L = c->lane[c->send_lane];
+        L.sent += static_cast<std::size_t>(res);
+        if (L.sent < L.len) {
+            start_lane_send(c); // short send -> remainder of this piece
             return;
         }
-        c->get_pos += c->piece_len;
-        pump_get(c); // next piece, or value done
+        c->send_pos += L.len; // piece fully sent -> this lane is free again
+        L.ready = false;
+        L.len = L.sent = L.reads = 0;
+        L.err = false;
+        c->send_lane = -1;
+        c->send_i = (c->send_i + 1) % c->n_lanes;
+        pump_stream(c); // start the next ordered send + read-ahead, or finish the value
         return;
     }
     if (c->state == St::get_send_head) {
@@ -295,8 +348,8 @@ void StreamLoop::on_send(Conn* c, int res) {
             return;
         }
         unpin_if_held(c);     // head slice fully sent -> release the pin
-        c->get_pos = head_hi; // continue (disk tail, if any) from the end of the head slice
-        pump_get(c);
+        c->get_pos = head_hi; // tail (if any) continues from the end of the head slice
+        enter_stream(c);
         return;
     }
     // out-based send: idle response, GET header, or GET trailer
@@ -316,7 +369,7 @@ void StreamLoop::on_send(Conn* c, int res) {
             start_send_head(c);
         } else {
             unpin_if_held(c); // range is disk-only (or empty) -> drop the unused head pin
-            pump_get(c);
+            enter_stream(c);
         }
     } else if (c->state == St::get_trailer)
         finish_get(c);
@@ -326,11 +379,18 @@ void StreamLoop::on_send(Conn* c, int res) {
         start_recv(c);
 }
 
-void StreamLoop::release_iobuf(Conn* c) {
-    if (c->have_iobuf) {
-        iobufs_.release(c->iobuf);
-        c->have_iobuf = false;
+void StreamLoop::release_lanes(Conn* c) {
+    for (auto& L : c->lane) {
+        if (L.have) {
+            iobufs_.release(L.buf);
+            L.have = false;
+        }
+        L.len = L.sent = L.reads = 0;
+        L.ready = L.err = false;
     }
+    c->n_lanes = 0;
+    c->read_lane = c->send_lane = -1;
+    c->fill_i = c->send_i = 0;
 }
 
 void StreamLoop::unpin_if_held(Conn* c) {
@@ -341,7 +401,7 @@ void StreamLoop::unpin_if_held(Conn* c) {
 }
 
 void StreamLoop::finish_get(Conn* c) {
-    release_iobuf(c);
+    release_lanes(c);
     unpin_if_held(c);
     c->rs.reset();
     c->state = St::idle;
@@ -349,7 +409,7 @@ void StreamLoop::finish_get(Conn* c) {
 }
 
 void StreamLoop::abort_get(Conn* c) {
-    release_iobuf(c);
+    release_lanes(c);
     unpin_if_held(c);
     c->rs.reset();
     close_conn(c);
@@ -363,7 +423,7 @@ void StreamLoop::close_conn(Conn* c) {
 
 void StreamLoop::retire(Conn* c) {
     if (c->closing && c->inflight == 0) {
-        release_iobuf(c);  // in case we closed mid-GET
+        release_lanes(c);  // in case we closed mid-GET (frees any held read buffers)
         unpin_if_held(c);  // release the head pin if a send was interrupted
         on_destroy(c);     // free any per-conn TLS state before the Conn goes away
         stats_.curr_conns.fetch_sub(1, rlx);
@@ -391,7 +451,7 @@ void StreamLoop::sweep_stalled(std::chrono::steady_clock::time_point now) {
     const auto deadline = std::chrono::milliseconds(io_timeout_ms_);
     for (auto& [c, up] : conns_) {
         if (c->closing) continue;
-        const bool holds_buffer = c->have_iobuf || c->head_pin.valid || c->sh.has_value();
+        const bool holds_buffer = c->n_lanes > 0 || c->head_pin.valid || c->sh.has_value();
         if (holds_buffer && now - c->last_progress >= deadline) abort_conn(c);
     }
 }
