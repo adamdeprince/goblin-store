@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -101,6 +103,9 @@ void StreamLoop::on_accept(int res) {
     if (!draining_) arm_accept();            // once draining, stop accepting new connections
     if (res < 0) return;
     if (draining_) { ::close(res); return; } // reject a connection that slipped in during the drain
+    const int one = 1;
+    ::setsockopt(res, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); // no Nagle: small replies must not
+                                                                  // wait on the peer's delayed ACK (~40ms)
     auto up = std::make_unique<Conn>();
     up->fd = res;
     up->last_progress = std::chrono::steady_clock::now();

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <poll.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <optional>
 #include <print>
 #include <string>
@@ -246,6 +247,8 @@ void worker_loop(int lfd, const ServerConfig& cfg, storage::TierManager& tm, sto
             if (errno == EINTR) continue;
             break;
         }
+        const int one = 1;
+        ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); // no Nagle (small-reply latency)
         if (cfg.io_timeout_ms) { // a slow client errors out instead of blocking this worker forever
             timeval tv{};
             tv.tv_sec = cfg.io_timeout_ms / 1000;
