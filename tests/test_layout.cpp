@@ -26,10 +26,10 @@ TEST("layout: 3-layer large object splits into SSD prefix + HDD tail") {
     CHECK_EQ(L.ram_head_bytes, Size(256 * KiB));
 }
 
-TEST("layout: tiny object fits in the head, no HDD tail") {
-    const auto L = compute_layout(100 * KiB, ts(), /*three_layer=*/true);
-    CHECK_EQ(L.ram_head_bytes, Size(100 * KiB)); // min(size, ram_head)
-    CHECK_EQ(L.ssd_bytes, Size(100 * KiB));
+TEST("layout: object that fits in the head is RAM-only (no SSD/HDD copy)") {
+    const auto L = compute_layout(100 * KiB, ts(), /*three_layer=*/true); // 100 KiB <= ram_head (256 KiB)
+    CHECK_EQ(L.ram_head_bytes, Size(100 * KiB)); // min(size, ram_head) -- the head is the whole object
+    CHECK_EQ(L.ssd_bytes, Size(0));              // RAM-only: no redundant disk copy (ADR-0003-rev)
     CHECK_EQ(L.hdd_bytes, Size(0));
 }
 

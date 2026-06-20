@@ -138,9 +138,9 @@ TEST("tier_manager: head cache stays bounded under many stores; all objects stil
     CHECK(tm.has_value());
 
     const int kN = 60;
-    const Size sz = 16 * KiB;
-    auto pattern = [](int i) {
-        std::vector<std::byte> v(16 * KiB);
+    const Size sz = 32 * KiB; // > ram_head (16 KiB): disk-backed, so an evicted head re-reads from SSD
+    auto pattern = [sz](int i) {
+        std::vector<std::byte> v(sz);
         for (Size j = 0; j < v.size(); ++j) v[j] = static_cast<std::byte>((j + std::size_t(i) * 7) & 0xFF);
         return v;
     };
@@ -166,6 +166,76 @@ TEST("tier_manager: head cache stays bounded under many stores; all objects stil
             CHECK(got == want);
         }
     }
+    fs::remove_all(base);
+}
+
+TEST("tier_manager: small objects (<= ram_head) are RAM-only -- no SSD copy; head-evict drops them") {
+    if (!core::Reactor::available()) {
+        std::println("    (skipped: built without liburing)");
+        return;
+    }
+    auto reactor = core::Reactor::create();
+    if (!reactor) {
+        std::println("    (skipped: io_uring unavailable: {})", reactor.error().detail);
+        return;
+    }
+
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-ramonly-" + std::to_string(::getpid()))).string();
+    PoolConfig ssd, hdd; // 2-layer (no HDD)
+    ssd.stripe_unit = 64 * KiB;
+    for (const char* d : {"/s0"}) ssd.dirs.push_back(base + d);
+    for (const auto& d : ssd.dirs) fs::create_directories(d);
+
+    TierSizes tiers;
+    tiers.ram_head = 16 * KiB;
+    tiers.ssd_prefix = 1 * MiB;
+    MemoryConfig mem;
+    mem.total_bytes = 256 * KiB; // holds ~16 heads of 16 KiB
+    mem.block_bytes = 64 * KiB;
+    mem.lock_memory = false;
+    EvictionConfig ev; // s3fifo
+
+    Index index;
+    auto tm = TierManager::open(tiers, mem, ev, ssd, hdd, index);
+    CHECK(tm.has_value());
+
+    const int kN = 60;
+    const Size sz = 16 * KiB; // == ram_head -> RAM-only (no disk copy)
+    auto pattern = [sz](int i) {
+        std::vector<std::byte> v(sz);
+        for (Size j = 0; j < v.size(); ++j) v[j] = static_cast<std::byte>((j + std::size_t(i) * 5) & 0xFF);
+        return v;
+    };
+    for (int i = 0; i < kN; ++i) {
+        const auto d = pattern(i);
+        CHECK(tm->store(hash_key("/s/" + std::to_string(i)), ByteView(d.data(), d.size()), 0).has_value());
+    }
+
+    // RAM-only: the head is the only copy, so head-evict == object-evict. The live count is bounded by
+    // the head cache (NOT kN), and every live object has a resident head.
+    CHECK(index.size() < std::size_t(kN)); // eviction happened
+    CHECK(index.size() <= std::size_t(16));
+    CHECK_EQ(tm->head_resident(), index.size());
+
+    // The whole point: small objects wrote NO per-object SSD files (vs the old redundant disk copy).
+    std::size_t files = 0;
+    for (const auto& e : fs::recursive_directory_iterator(base))
+        if (e.is_regular_file()) ++files;
+    CHECK_EQ(files, std::size_t(0));
+
+    // A survivor still reads back correctly from RAM.
+    bool any = false;
+    for (int i = kN - 1; i >= 0 && !any; --i) {
+        std::vector<std::byte> got(sz);
+        const auto n = tm->read(*reactor, hash_key("/s/" + std::to_string(i)), 0,
+                                MutBytes(got.data(), got.size()));
+        if (n && *n == sz) {
+            any = true;
+            CHECK(got == pattern(i));
+        }
+    }
+    CHECK(any);
     fs::remove_all(base);
 }
 

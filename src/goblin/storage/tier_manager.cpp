@@ -185,8 +185,15 @@ Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, 
     // (files + head) for concurrent readers until commit publishes the new one. Opening the scratch
     // files touches no shared state, so it needs no lock.
     const std::string suffix = ".tmp." + std::to_string(store_seq_->fetch_add(1));
-    auto ssd_files = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/true, suffix);
-    if (!ssd_files) return std::unexpected(ssd_files.error());
+    // RAM-only objects (size <= ram_head, so ssd_bytes==0) carry no disk extents -> open no files at
+    // all (ADR-0003-rev): the head IS the whole object. Saves the redundant SSD copy + the per-object
+    // file that throttled small-object ingest.
+    std::optional<ObjectFiles> ssd_files;
+    if (layout.ssd_bytes > 0) {
+        auto f = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/true, suffix);
+        if (!f) return std::unexpected(f.error());
+        ssd_files.emplace(std::move(*f));
+    }
     std::optional<ObjectFiles> hdd_files;
     if (layout.hdd_bytes > 0) {
         auto h = hdd_->open_object(digest, layout.hdd_bytes, /*create=*/true, suffix);
@@ -206,8 +213,8 @@ Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, 
     auto stage = write_pool_->acquire();
     if (!stage) {
         lk.unlock();
-        ssd_.unlink_object(digest, layout.ssd_bytes, suffix); // discard the scratch files we opened
-        if (hdd_) hdd_->unlink_object(digest, layout.hdd_bytes, suffix);
+        if (layout.ssd_bytes > 0) ssd_.unlink_object(digest, layout.ssd_bytes, suffix);
+        if (hdd_ && layout.hdd_bytes > 0) hdd_->unlink_object(digest, layout.hdd_bytes, suffix);
         return err(Errc::would_block, "write staging buffers exhausted");
     }
 
@@ -220,14 +227,30 @@ Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, 
             if (!victim) break;
             if (const auto vm = index_->lookup(*victim); vm && vm->head.resident()) {
                 free_head_region(vm->head.block, vm->head.offset, vm->head.len);
-                index_->set_head(*victim, HeadLoc{});
+                if (vm->size <= tiers_.ram_head) {
+                    // RAM-only victim: its head is the only copy, so evicting the head evicts the
+                    // object (no disk files to unlink; evict() already popped it from the head policy).
+                    object_policy_->remove(*victim);
+                    index_->erase(*victim);
+                } else {
+                    index_->set_head(*victim, HeadLoc{}); // disk-backed: object stays, served from SSD
+                }
             }
             region = ram_.allocate(static_cast<std::uint32_t>(head_len));
         }
         if (region) head = *region;
     }
 
-    return StoreHandle(this, digest, layout, std::move(*ssd_files), std::move(hdd_files), head,
+    // A RAM-only object that couldn't get a head (everything live is pinned) has nowhere to live ->
+    // backpressure rather than index a head-less, body-less object. (head_len>0 excludes 0-byte values.)
+    if (head_len > 0 && layout.ssd_bytes == 0 && !head) {
+        write_pool_->release(*stage);
+        lk.unlock();
+        return err(Errc::would_block, "no RAM for RAM-only head");
+    }
+
+    return StoreHandle(this, digest, layout,
+                       ssd_files ? std::move(*ssd_files) : ObjectFiles{}, std::move(hdd_files), head,
                        suffix, *stage);
 }
 
@@ -283,8 +306,9 @@ void TierManager::StoreHandle::abort_uncommitted() {
             stage_ = {};
         }
     }
-    tm_->ssd_.unlink_object(digest_, layout_.ssd_bytes, suffix_); // scratch files; filesystem only
-    if (tm_->hdd_) tm_->hdd_->unlink_object(digest_, layout_.hdd_bytes, suffix_);
+    if (layout_.ssd_bytes > 0)
+        tm_->ssd_.unlink_object(digest_, layout_.ssd_bytes, suffix_); // scratch files; filesystem only
+    if (tm_->hdd_ && layout_.hdd_bytes > 0) tm_->hdd_->unlink_object(digest_, layout_.hdd_bytes, suffix_);
 }
 
 Status TierManager::StoreHandle::write(ByteView chunk) {
@@ -294,6 +318,10 @@ Status TierManager::StoreHandle::write(ByteView chunk) {
     if (head_) { // fill the resident head directly from the chunk (RAM; no alignment needed)
         const Size hend = std::min<Size>(off_ + len, head_->len);
         if (off_ < hend) std::memcpy(head_->data + off_, chunk.data(), hend - off_);
+    }
+    if (layout_.ssd_bytes == 0 && layout_.hdd_bytes == 0) { // RAM-only: the head holds the whole object
+        off_ += len;
+        return {};
     }
     // Stage the body into the aligned buffer, flushing full device-block-aligned blocks to disk;
     // the trailing partial block is flushed (zero-padded) at commit. SET is write-once, so the copy
@@ -361,8 +389,9 @@ Status TierManager::StoreHandle::commit(std::uint32_t flags, std::uint32_t expir
         return err(Errc::cas_mismatch); // object changed/absent under us -> don't publish (scratch aborts)
     // Publish: rename the scratch files over the live names. Readers that already opened the old
     // files keep them (unlinked-but-open inodes) and finish a consistent old version.
-    if (auto st = tm_->ssd_.publish(digest_, layout_.ssd_bytes, suffix_); !st) return st;
-    if (tm_->hdd_) {
+    if (layout_.ssd_bytes > 0)
+        if (auto st = tm_->ssd_.publish(digest_, layout_.ssd_bytes, suffix_); !st) return st;
+    if (tm_->hdd_ && layout_.hdd_bytes > 0) {
         if (auto st = tm_->hdd_->publish(digest_, layout_.hdd_bytes, suffix_); !st) return st;
     }
     if (old && old->head.resident()) { // retire the replaced version's head now that the new is live
@@ -416,7 +445,7 @@ Result<std::size_t> TierManager::read(core::Reactor& reactor, const Digest& dige
             if (!f) return std::unexpected(f.error());
             ssd_files = std::move(*f);
         }
-        if (three_layer() && offset + want > layout.ssd_bytes) {
+        if (three_layer() && layout.hdd_bytes > 0 && offset + want > layout.ssd_bytes) {
             auto f = hdd_->open_object(digest, layout.hdd_bytes, /*create=*/false);
             if (!f) return std::unexpected(f.error());
             hdd_files = std::move(*f);
@@ -437,7 +466,7 @@ Result<std::size_t> TierManager::read(core::Reactor& reactor, const Digest& dige
                               out.subspan(ssd_begin - offset, room));
         if (!n) return std::unexpected(n.error());
     }
-    if (three_layer() && offset + want > layout.ssd_bytes) {
+    if (three_layer() && layout.hdd_bytes > 0 && offset + want > layout.ssd_bytes) {
         const Size begin = std::max<Size>(offset, layout.ssd_bytes);
         const Size len = (offset + want) - begin;
         const Size room = std::min<Size>(align_up(len, kDeviceBlock), out.size() - (begin - offset));
@@ -463,15 +492,19 @@ Result<TierManager::ReadStream> TierManager::open_read(const Digest& digest) {
     const auto meta = index_->lookup(digest);
     if (!meta) return err(Errc::not_found, "object not in index");
     const ObjectLayout layout = compute_layout(meta->size, tiers_, three_layer());
-    auto ssd = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/false);
-    if (!ssd) return std::unexpected(ssd.error());
+    ObjectFiles ssd; // RAM-only objects have no SSD extent -> empty files; plan() then yields head-only
+    if (layout.ssd_bytes > 0) {
+        auto f = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/false);
+        if (!f) return std::unexpected(f.error());
+        ssd = std::move(*f);
+    }
     std::optional<ObjectFiles> hdd;
     if (layout.hdd_bytes > 0 && hdd_) {
         auto h = hdd_->open_object(digest, layout.hdd_bytes, /*create=*/false);
         if (!h) return std::unexpected(h.error());
         hdd.emplace(std::move(*h));
     }
-    return ReadStream(this, digest, meta->size, layout, std::move(*ssd), std::move(hdd));
+    return ReadStream(this, digest, meta->size, layout, std::move(ssd), std::move(hdd));
 }
 
 TierManager::ReadStream::Plan TierManager::ReadStream::plan(Offset off, MutBytes out) {
@@ -522,7 +555,7 @@ void TierManager::drop_object(const Digest& digest) {
     }
     object_policy_->remove(digest);
     const ObjectLayout layout = compute_layout(meta->size, tiers_, three_layer());
-    ssd_.unlink_object(digest, layout.ssd_bytes);
+    if (layout.ssd_bytes > 0) ssd_.unlink_object(digest, layout.ssd_bytes);
     if (layout.hdd_bytes > 0 && hdd_) hdd_->unlink_object(digest, layout.hdd_bytes);
     index_->erase(digest);
 }
