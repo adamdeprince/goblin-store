@@ -25,10 +25,11 @@ if [ ! -x "$VENV/bin/python" ]; then
 fi
 
 "$VENV/bin/python" - <<'PYEOF'
-import html as H, os, re
+import html as H, os, re, shutil
 import markdown
 
 OUT = "html"
+shutil.rmtree(OUT, ignore_errors=True)  # clean rebuild — no orphan HTML from renamed/removed docs
 def skip(d): return d in {".git", "third_party", OUT, ".cache"} or d.startswith("build")
 
 CSS = """
@@ -50,7 +51,15 @@ table{border-collapse:collapse;width:100%;font-size:.95em;display:block;overflow
 th,td{border:1px solid var(--border);padding:.45rem .7rem;text-align:left} th{background:var(--code-bg)}
 hr{border:0;border-top:1px solid var(--border);margin:2rem 0}
 img{max-width:100%}
+footer{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--border);color:var(--muted);font-size:.85em}
+footer a{color:var(--muted)}
 """
+
+FOOTER = ('<footer>'
+          '<a href="https://github.com/adamdeprince/goblin-store">Source &amp; issues on GitHub</a>'
+          ' &middot; &copy; 2026 Adam DePrince &middot; '
+          'Licensed under <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache-2.0</a>'
+          '</footer>')
 
 def render(path):
     with open(path, encoding="utf-8") as f:
@@ -61,10 +70,12 @@ def render(path):
     body = md.convert(text)
     # Rewrite local .md links (not http(s)/mailto) to .html so the generated tree is browsable.
     body = re.sub(r'(href="(?!https?:|//|mailto:)[^"]*?)\.md(["#])', r'\1.html\2', body)
+    # Drop the ".md" from link *text* so a "BENCHMARKS.md" label shows as "BENCHMARKS".
+    body = body.replace(".md</code></a>", "</code></a>").replace(".md</a>", "</a>")
     return ('<!doctype html>\n<html lang="en"><head><meta charset="utf-8">\n'
             '<meta name="viewport" content="width=device-width,initial-scale=1">\n'
             f'<title>{H.escape(title)}</title>\n<style>{CSS}</style>\n'
-            f'</head><body><main>\n{body}\n</main></body></html>\n')
+            f'</head><body><main>\n{body}\n{FOOTER}\n</main></body></html>\n')
 
 mds = []
 for dp, dn, fns in os.walk("."):
@@ -73,17 +84,26 @@ for dp, dn, fns in os.walk("."):
 mds.sort()
 
 for md in mds:
-    out = os.path.join(OUT, md[:-3] + ".html")
+    # The root README becomes the site index; everything else mirrors its path (incl. docs/adr/README.md).
+    out = os.path.join(OUT, "index.html" if md == "README.md" else md[:-3] + ".html")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         f.write(render(md))
     print("  ", out)
 
-if os.path.exists(os.path.join(OUT, "README.html")):
-    with open(os.path.join(OUT, "index.html"), "w", encoding="utf-8") as f:
+# README.html redirects to index.html so links / back-references to README.html still resolve.
+if "README.md" in mds:
+    with open(os.path.join(OUT, "README.html"), "w", encoding="utf-8") as f:
         f.write('<!doctype html><meta charset="utf-8">'
-                '<meta http-equiv="refresh" content="0; url=README.html">'
-                '<a href="README.html">README</a>\n')
+                '<meta http-equiv="refresh" content="0; url=index.html">'
+                '<link rel="canonical" href="index.html">'
+                '<a href="index.html">index.html</a>\n')
+    print("   html/README.html (redirect -> index.html)")
 
-print(f"==> generated {len(mds)} HTML file(s) in {OUT}/  (+ index.html -> README.html)")
+# Copy LICENSE into the site so in-page [LICENSE](LICENSE) links resolve.
+if os.path.exists("LICENSE"):
+    shutil.copy("LICENSE", os.path.join(OUT, "LICENSE"))
+    print("   html/LICENSE")
+
+print(f"==> generated {len(mds)} page(s) in {OUT}/  (root README -> index.html; README.html redirects there)")
 PYEOF
