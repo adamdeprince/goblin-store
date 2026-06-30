@@ -135,3 +135,9 @@ src/goblin/tools/     goblin-store-path-prep, goblin-bench
 tests/                dependency-free unit tests (Release + ASan + TSan)
 docs/adr/             18 architecture decision records
 ```
+
+## License
+
+Copyright 2026 Adam DePrince. Licensed under the **Apache License, Version 2.0** — see
+[LICENSE](LICENSE) (or <https://www.apache.org/licenses/LICENSE-2.0>). Source and issues:
+<https://github.com/adamdeprince/goblin-store>.
