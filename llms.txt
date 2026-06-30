@@ -1,0 +1,47 @@
+# Goblin Store (goblin-store)
+
+> A C++23, Linux-only **large-object** tiered key/value cache and HTTP object server. It keeps each
+> object's hot head in RAM, streams the middle from SSD, and hoards the cold tail on cheap HDD —
+> handing clients the first bytes instantly while a read-ahead pipeline drags the rest out behind them.
+> Mission: **beat memcached on large objects** — match it at a fraction of the RAM, beat extstore on the
+> cold-read tail, and cost less per stored GB. Speaks the **memcache** text + meta protocols (drop-in for
+> memcache clients) and a read-only **HTTP/1.1** object path for edge/CDN use.
+
+goblin-store is explicitly a large-object engine. On a 256 KiB–8 MiB workload it matches memcached's
+latency at ~7× less RAM (working set fits RAM), and beats memcached+extstore on both throughput and cost
+on the same spindle when the set spills to disk. For sub-2 KB values memcached's slab allocator wins, and
+the project says so — small objects are not its game.
+
+Built on **io_uring + O_DIRECT**, thread-per-core shared-nothing loops, **atomic copy-on-write publish**
+(readers never see a torn value), a buddy RAM-head allocator, and a bounded, mlock-able RAM budget.
+Working memcache + HTTP/HTTPS server; **115 unit tests pass under Release, ASan, and TSan**. Linux-only by
+design (no macOS io_uring/O_DIRECT analog; FreeBSD is a planned port). Trunk branch is `initial`.
+
+## Documentation
+- [README](README.md): overview — mission, how the positional tiering works (incl. RAM-only small objects), protocols, dependencies, build & run.
+- [Benchmarks](BENCHMARKS.md): full rig + methodology + results — memory-sized (7.4× less RAM, same latency), disk-sized (+68% throughput, ~25% cheaper than extstore), and the honest small-object verdict, with a cost model.
+
+## Architecture (ADRs)
+- [ADR index](docs/adr/README.md): the 18 architecture decision records.
+- [ADR-0001: Thread-per-core, network-sharded concurrency](docs/adr/0001-thread-per-core-concurrency.md)
+- [ADR-0002: Per-core io_uring rings, shared drive fds, striped parallel reads](docs/adr/0002-iouring-rings-shared-drives.md)
+- [ADR-0003: Cache semantics — RAM head as a write-through cache of an SSD-resident prefix](docs/adr/0003-cache-semantics-head-as-cache.md) — revised: objects ≤ `ram_head` are now RAM-only (no SSD copy); see README/BENCHMARKS.
+- [ADR-0004: C++23 toolchain & build](docs/adr/0004-cpp23-toolchain.md)
+- [ADR-0005: Protocol surface — memcache over TCP only, HTTP object path, no UDP, no auth](docs/adr/0005-protocol-surface.md)
+- [ADR-0006: Positional tiering & the request-triggered read-ahead pipeline](docs/adr/0006-positional-tiering-pipeline.md)
+- [ADR-0007: Eviction — size-aware, FIFO-based (not LRU/LFU)](docs/adr/0007-eviction-policy.md)
+- [ADR-0008: RAM allocator — power-of-two block array + intra-block buddy](docs/adr/0008-ram-allocator.md)
+- [ADR-0009: Drive pools — per-object files, round-robin striping, short-read EOF](docs/adr/0009-striping-and-eof.md)
+- [ADR-0010: Write/upload admission — EVICT vs BLOCK on disk exhaustion](docs/adr/0010-write-admission-modes.md)
+- [ADR-0011: O_DIRECT — own the backing store, bypass the kernel page cache](docs/adr/0011-odirect-bypass-page-cache.md)
+- [ADR-0012: Multi-resource eviction — per-resource relief valves & the demotion ladder](docs/adr/0012-multi-resource-eviction.md)
+- [ADR-0013: Ephemeral by design — wipe-on-start, no persistence (v1)](docs/adr/0013-ephemeral-wipe-on-start.md)
+- [ADR-0014: Keyless internal identity — client keys hashed to a digest](docs/adr/0014-keyless-digest-identity.md)
+- [ADR-0015: HTTP key derivation — path vs virtual-host mode, and the `--source` preloader](docs/adr/0015-http-key-derivation.md)
+- [ADR-0016: Bounded, locked total memory (RSS ≈ `--memory`)](docs/adr/0016-bounded-locked-memory.md)
+- [ADR-0017: Buffer taxonomy — fixed head pool vs small streaming I/O pool; zero-copy head](docs/adr/0017-buffer-taxonomy.md)
+- [ADR-0018: Concurrency — thread-per-core network, shared locked storage](docs/adr/0018-concurrency-model.md)
+
+## Optional
+- [Source repository](https://github.com/adamdeprince/goblin-store): the C++23 tree under `src/goblin/{common,core,crypto,storage,net,protocol,http,tls,tools}`.
+- [llms-full.txt](llms-full.txt): the README, benchmarks, and all 18 ADRs inlined into a single file.

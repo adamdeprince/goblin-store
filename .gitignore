@@ -6,3 +6,6 @@ compile_commands.json
 *.o
 *.tmp
 .DS_Store
+
+# generated docs (scripts/build-docs.sh) — HTML is text, not committed
+/html/

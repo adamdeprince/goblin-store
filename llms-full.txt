@@ -1,0 +1,1148 @@
+# Goblin Store (goblin-store) — full documentation
+
+> A C++23, Linux-only large-object tiered key/value cache and HTTP object server. It keeps each object's
+> hot head in RAM, streams the middle from SSD, and hoards the cold tail on cheap HDD. Mission: beat
+> memcached on large objects — match it at a fraction of the RAM, beat extstore on the cold-read tail,
+> cost less per stored GB. Speaks the memcache text + meta protocols and a read-only HTTP/1.1 object path.
+
+This file inlines the project documentation for LLM consumption: the README, the benchmark report, and
+all 18 architecture decision records. README and BENCHMARKS are the current authoritative overview; the
+ADRs capture design rationale. The binary/command is `goblin-store`.
+
+
+===============================================================================
+# README.md
+===============================================================================
+
+# Goblin Store (`goblin-store`)
+
+Goblin Sture is a high performance large-object key/value cache and
+HTTP object server. It keeps the latency-sensitive *head* of each
+object in RAM, streams the middle from SSD, and (optionally) hoards
+the cold tail on cheap HDD — handing clients the first bytes
+immediately while the rest is dragged out of the cave behind them.
+
+The goal of golbin-store is to beat memcached on large objects, match
+memcached's hit latency at a fraction of the RAM, beat extstore on the
+cold-read table and cost less per stored GB by storing the bulk of
+each object on cheap SSD or HDD storage, spreading each object down a
+RAM → SSD → HDD price pyramid.
+
+goblin-store speaks the memcache text and meta protocols making it a
+drop-in replacement for memcached and read-only HTTP/1.1 for edge/CDN
+use.
+
+
+## Benchmarks — the short version
+
+
+We setup a 2-core server running goblin-store and pitted ig against a
+16-vCPU load box running mutilate across a real NIC transfering mixed
+256KiB-8MiB objects.  Full methodology, rig, and tables in
+**[`BENCHMARKS.md`](BENCHMARKS.md)**.
+
+| workload | vs | result |
+|---|---|---|
+| **memory-sized** (set fits RAM) | memcached | **same latency, 7.4× less RAM** (267 MiB vs 1.97 GiB) → ~6–7× cheaper |
+| **disk-sized** (set ≫ RAM) | memcached + extstore | **+68% throughput, ~25% cheaper** on the *same* HDD — and goblin-store holds 100% of the set while extstore **sheds 41%** under write load |
+| **small objects** (sub-2 KB) | memcached | **memcached wins** — ~12× less RAM, ~2× faster. Small values are the slab allocator's turf; goblin-store is a large-object engine and says so. |
+
+The win is large objects: a hot **RAM head** + **SSD prefix** hide the ~5 ms HDD seek that extstore
+pays in full on every cold GET, while a read-ahead pipeline keeps the cheap-tier bulk flowing near
+spindle throughput.
+
+## How it works
+
+Each object is split **positionally** ([ADR-0006](docs/adr/0006-positional-tiering-pipeline.md)) into a RAM head `[0, ram_head)`, an SSD prefix, and
+an HDD tail — bytes flow down the tiers as they get colder and cheaper:
+
+- **RAM head** — first `ram_head` bytes (default 256 KiB), served zero-copy for instant time-to-first-byte.
+- **SSD prefix** — the warm middle (default up to 32 MiB/object) on fast storage.
+- **HDD tail** — the cold remainder on cheap, throughput-optimized disk (3-layer mode).
+
+Small objects that fit in the head (`size ≤ ram_head`) are stored in RAM-only — no redundant disk copy, no
+per-object file ([ADR-0003](docs/adr/0003-cache-semantics-head-as-cache.md), revised): the head is authoritative (a cache that blanks on restart, like
+memcached), so head-evict = object-evict. (Trimming the head off *large* objects' disk copy too is a
+planned follow-up.)
+
+Underneath: **thread-per-core** shared-nothing loops on **io_uring** ([ADR-0001](docs/adr/0001-thread-per-core-concurrency.md)/[ADR-0002](docs/adr/0002-iouring-rings-shared-drives.md)), **O_DIRECT**
+backing store so the cache owns its RAM budget instead of fighting the page cache ([ADR-0011](docs/adr/0011-odirect-bypass-page-cache.md)), **atomic
+copy-on-write publish** (readers never see a torn value, [ADR-0018](docs/adr/0018-concurrency-model.md)), a **buddy** RAM-head allocator
+([ADR-0008](docs/adr/0008-ram-allocator.md)), **s3fifo** + whole-object multi-resource eviction ([ADR-0007](docs/adr/0007-eviction-policy.md)/[ADR-0012](docs/adr/0012-multi-resource-eviction.md)), keyless **SHA-256
+digest identity** ([ADR-0014](docs/adr/0014-keyless-digest-identity.md)), and a **bounded, mlock-able** memory model ([ADR-0016](docs/adr/0016-bounded-locked-memory.md)).
+
+Start at **[`docs/adr/README.md`](docs/adr/README.md)** — 18 ADRs covering the full design.
+
+## Protocols
+
+- **memcache (TCP):** classic text (`get`/`gets`/`set`/`add`/`replace`/`append`/`prepend`/`cas`/
+  `delete`/`incr`/`decr`/`touch`/`stats`) + the **meta** protocol (`mn`/`mg`/`ms`/`md`), TTL, and
+  **CAS** (= a per-store ETag, essentially free). No binary protocol, no UDP, no built-in auth.
+- **HTTP/1.1 (read-only):** `GET`/`HEAD`, byte ranges, conditional GET (ETag / `If-None-Match` → 304),
+  `Content-Type`, `Accept-Ranges`. **No write surface by design** (edge-cache role; put a writer in
+  front). **HTTPS** via OpenSSL + **kTLS** with SNI cert selection.
+
+> **Status:** working memcache + HTTP/HTTPS server on io_uring + O_DIRECT — 3-tier store, atomic
+> publish, zero-copy head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **115 unit tests pass
+> under Release, ASan, and TSan.** macOS is a non-goal (no io_uring / O_DIRECT analog); FreeBSD
+> (kqueue/aio) is a planned port.
+
+## Dependencies
+
+**Build:** **C++23** compiler (GCC ≥ 14, developed on GCC 16; or Clang ≥ 18), **CMake ≥ 3.28** +
+**Ninja**, **OpenSSL** (`libssl-dev`, for the HTTPS listener — always linked; the key-digest SHA-256 is
+vendored so the storage path never links TLS, [ADR-0014](docs/adr/0014-keyless-digest-identity.md)), **liburing** (`liburing-dev`, the io_uring
+backend — without it the logic layers still compile but the reactor is stubbed and the server can't serve).
+
+**Runtime:** Linux kernel ≥ 5.19 (io_uring multishot).
+
+```sh
+sudo apt-get install -y build-essential cmake ninja-build libssl-dev liburing-dev
+```
+
+## Build & run
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build --output-on-failure
+./build/goblin-store --help
+
+# A pool directory must be "blessed" before use — goblin-store refuses to wipe an unblessed dir,
+# so a typo'd --ssd-dir can never erase /var ([ADR-0013](docs/adr/0013-ephemeral-wipe-on-start.md)). One-time, and it must be empty:
+./build/goblin-store-path-prep /mnt/ssd/pool
+./build/goblin-store-path-prep /mnt/hdd/pool          # optional cold tier (enables 3-layer)
+
+# 3-tier: 4 GiB RAM heads, SSD prefix, HDD tail; memcache on 11211 + HTTP on 8080
+./build/goblin-store --memory 4G \
+    --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool \
+    --memcache-port 11211 --http-port 8080
+```
+
+Key knobs (see `--help`): `--ram-head`, `--ssd-prefix` (positional tier sizes), `--io-buffers` /
+`--io-chunk` (bounded streaming RAM), `--eviction`, `--max-objects`, `--no-mlock` (dev), `--tls-cert`/
+`--tls-key` (HTTPS), `--source` (preload a directory tree).
+
+## Layout
+```
+src/goblin/common/    types, error (std::expected), config + validation
+src/goblin/core/      RAM block/buddy allocator, io_uring reactor, thread-per-core runtime
+src/goblin/crypto/    vendored SHA-256 (keyless digest identity)
+src/goblin/storage/   positional layout, drive-pool striping, index, tiering, eviction
+src/goblin/net/       shared stream loop (memcache / HTTP / HTTPS subclasses)
+src/goblin/protocol/  memcache text + meta front-end
+src/goblin/http/      HTTP request/response, key derivation
+src/goblin/tls/       OpenSSL + kTLS, SNI
+src/goblin/tools/     goblin-store-path-prep, goblin-bench
+tests/                dependency-free unit tests (Release + ASan + TSan)
+docs/adr/             18 architecture decision records
+```
+
+
+===============================================================================
+# BENCHMARKS.md
+===============================================================================
+
+# goblin-store benchmarks
+
+Goblin Store's mission is **"beat memcached on large objects"** — match it at less RAM, beat extstore on
+the cold tail, cost less per stored GB. These are the measurements behind that claim.
+
+## TL;DR
+
+| workload | vs | result |
+|---|---|---|
+| **memory-sized** (set fits RAM) | memcached | same latency, **7.4× less RAM** → ~6–7× cheaper |
+| **disk-sized** (set ≫ RAM) | memcached + extstore | **+68% throughput, ~25% cheaper** on the same HDD; goblin-store holds 100% of the set, extstore **sheds 41%** |
+| **small objects** (sub-2 KB) | memcached | **memcached wins** (~12× less RAM, ~2× faster) — small values are not goblin-store's game |
+
+The win is large objects, and the mechanism is the tiering: a hot **RAM head** + **SSD prefix** answer
+instantly while a **read-ahead pipeline** hides the ~5 ms HDD seek that extstore eats whole on every cold GET.
+
+## The rig
+
+Two AWS instances, same VPC / same AZ (us-east-2c), driven over a real NIC on private IPs:
+
+- **Server** — 2 vCPU, **3.7 GiB RAM**. Two disks: a fast root volume (**SSD**, ~0.58 ms random read,
+  1713 IOPS) and `/mnt/slow` (**HDD/st1**, ~5.04 ms random read, 198 IOPS — **8.6× slower**). The ~5 ms
+  HDD seek is the thing the RAM head exists to hide.
+- **Load box** — c7g.4xlarge, **16 vCPU** (sized so the *server*, not the client, is the bottleneck).
+
+**Load generator:** [mutilate](https://github.com/leverich/mutilate), patched to handle multi-MB and
+variable value sizes (stock mutilate's 2 MiB value buffer segfaults on a distribution; enlarged to 34 MiB).
+
+**Object sizes:** a realistic, bounded, right-skewed **mixed distribution** spanning **256 KiB – 8 MiB**
+(generalized Pareto, mean ≈ 1 MiB) — i.e. "binary artifacts," not uniform blobs. Small-object runs use
+mutilate's `fb_value` (the Facebook/Atikoglu memcache size distribution).
+
+**Cost model (illustrative; adjust to your prices):** RAM **$4**, gp3-SSD **$0.08**, st1-HDD **$0.045**
+per GiB-month. RAM dominates, so the RAM ratio drives the cost story at any realistic price ratio.
+
+---
+
+## 1. Memory-sized — same speed, far less RAM
+
+Working set ~2 GiB (fits RAM). At a fixed 16 connections everyone is server-throughput-bound, so latency
+is ~equal across the board — this is a **RAM-cost** contest, and goblin-store wins it. (0 misses everywhere.)
+
+| run | QPS | lat p99 | **RAM** | SSD | HDD | ~$/mo |
+|---|---|---|---|---|---|---|
+| memcached standard | 640 | 78 ms | **1974 MiB** | — | — | **$7.7** |
+| goblin-store 2-tier (RAM + SSD) | 615 | 79 ms | **267 MiB** | 1951 MiB | — | **$1.2** |
+| goblin-store 3-tier (RAM + SSD + HDD) | 618 | 84 ms | **267 MiB** | 486 MiB | 1627 MiB | **$1.1** |
+
+**Same latency, 7.4× less RAM** (267 MiB vs 1.97 GiB): memcached holds the whole set in RAM; goblin-store
+holds only the hot heads and pushes the bulk to cheap disk. ~6–7× cheaper for identical performance.
+
+## 2. Disk-sized — faster *and* cheaper than extstore on the same spindle
+
+Working set ~12 GiB (≫ RAM → cold reads hit disk). extstore given a 48 GiB backing file so it holds the
+set (≤0.4% miss). Latency = 16 ÷ QPS at fixed concurrency, so **throughput is the metric**.
+
+| run | QPS | lat avg | RAM | SSD | HDD (bulk) | ~$/mo |
+|---|---|---|---|---|---|---|
+| memcached + extstore | 70 | 226 ms | 2188 MiB | — | 9.5 GiB | **$9.0** |
+| goblin-store 2-tier (bulk on SSD) | 93 | 170 ms | 1520 MiB | 10.7 GiB | — | $6.9 |
+| **goblin-store 3-tier (bulk on HDD)** | **118** | **135 ms** | **1520 MiB** | 2.84 GiB | 8.9 GiB | **$6.6** |
+
+**goblin-store 3-tier sustains +68% throughput (118 vs 70 QPS) on the *same* HDD bulk, using less RAM, at
+~25% lower cost.** extstore does synchronous ~5 ms seeks (≈110 MB/s, seek-bound); goblin-store answers
+head/SSD-prefix instantly and **read-ahead pipelines the HDD tail** (≈210 MB/s, near spindle throughput).
+
+**Durability bonus:** at a full-speed 20 GiB load, extstore **shed 41.5% of the data** — it ingests at
+RAM speed but flushes to HDD at ~200 MB/s, so under pressure memcached *evicts* rather than backpressuring.
+goblin-store queues-on-admission and **dropped nothing**.
+
+## 3. Small objects — memcached's turf, and goblin-store says so
+
+Working set 400 K `fb_value` objects (sub-2 KB, ~typical memcache). 0 misses.
+
+| run | QPS | lat p99 | RAM | SSD / files |
+|---|---|---|---|---|
+| memcached | **152 K** | 1.9 ms | **152 MiB** | — |
+| goblin-store 2-tier | 72 K | 2.3 ms | 1785 MiB | ~0 / 1 file |
+
+**memcached wins decisively** — ~12× less RAM (152 MiB vs 1.78 GiB; confirmed real — at a 1 GiB budget
+goblin-store sheds 34%) and ~2× faster. With objects too small to tier, the data lives entirely in RAM,
+where goblin-store's **buddy allocator** (power-of-2 rounding) + rich per-object index cost ~3× the raw
+bytes vs memcached's lean **slab allocator**. This is positioning, not a bug: **goblin-store is a
+large-object engine.** A finer small-object allocator is the lever if that ever needs to change.
+
+---
+
+## The trimmed head ([ADR-0003](docs/adr/0003-cache-semantics-head-as-cache.md), revised)
+
+Originally every object's head lived in *both* RAM and the SSD copy (so an evicted head could re-read
+from disk). For objects that fit entirely in the head (`size ≤ ram_head`) that disk copy is pure waste —
+the object already fits in RAM and the tiering buys nothing. So those objects are now **RAM-only**: no
+SSD copy, no per-object file; the head is authoritative (a cache that blanks on restart), so head-evict =
+object-evict.
+
+Effect on the small-object run: **SSD 546 MiB → 8 KiB, per-object files 137 K → 1, and ingest stopped
+being file-creation-bound.** It did not close the RAM gap (that's the allocator). Validated **115/115**
+unit tests under Release, ASan, and TSan. Trimming the head off *large* objects' disk copy too (storing
+only `[ram_head, size)`) is a planned follow-up.
+
+## Notes & caveats
+
+- Small absolute QPS reflects the **2-core server** — these are relative results; the architecture
+  conclusions scale.
+- goblin-store uses ~20% more *total* disk than extstore on large objects (1 MiB `--block` rounding) —
+  tunable; the RAM + throughput wins dominate cost regardless.
+- Numbers are point-in-time on modest hardware; reproduce with the drivers and your own object mix.
+
+
+===============================================================================
+# Architecture Decision Records (docs/adr/)
+===============================================================================
+
+# Architecture Decision Records
+
+Lightweight ADRs (MADR-ish). Status values: **Proposed** / **Accepted** / **Superseded**.
+Everything marked *Accepted* below is the working default chosen **2026-06-09** and is revisable —
+these are decisions of record, not laws.
+
+| # | Decision | Status |
+|---|----------|--------|
+| [0001](0001-thread-per-core-concurrency.md) | Thread-per-core, network-sharded concurrency | Accepted |
+| [0002](0002-iouring-rings-shared-drives.md) | Per-core io_uring rings, shared drive fds, striped parallel reads | Accepted |
+| [0003](0003-cache-semantics-head-as-cache.md) | Best-effort cache semantics; RAM head = write-through cache of an SSD-resident prefix | Accepted |
+| [0004](0004-cpp23-toolchain.md) | C++23 toolchain & build | Accepted |
+| [0005](0005-protocol-surface.md) | Protocol surface: memcache/TCP only, HTTP object path, **no UDP**, no auth | Accepted |
+| [0006](0006-positional-tiering-pipeline.md) | Positional tiering & the request-triggered read-ahead pipeline | Accepted |
+| [0007](0007-eviction-policy.md) | Eviction: size-aware, FIFO-based (S3-FIFO/SIEVE + GDSF), **not LRU/LFU** | Accepted |
+| [0008](0008-ram-allocator.md) | RAM allocator: power-of-two block array + intra-block buddy | Accepted |
+| [0009](0009-striping-and-eof.md) | Drive pools: per-object files, round-robin striping, short-read EOF | Accepted |
+| [0010](0010-write-admission-modes.md) | Write/upload admission: EVICT (cache) vs BLOCK (origin) on disk exhaustion | Accepted |
+| [0011](0011-odirect-bypass-page-cache.md) | O_DIRECT: own the backing store, bypass the kernel page cache | **Proposed** |
+| [0012](0012-multi-resource-eviction.md) | Multi-resource eviction: per-resource valves + demotion ladder; SSD count-bound (v1) | Accepted |
+| [0013](0013-ephemeral-wipe-on-start.md) | Ephemeral v1: no persistence, wipe-on-start (dedicated subdir + marker guard) | Accepted |
+| [0014](0014-keyless-digest-identity.md) | Keyless identity: client keys → 256-bit SHA-256 digest as the internal ID | Accepted |
+| [0015](0015-http-key-derivation.md) | HTTP key derivation: path vs virtual-host mode; `--source` directory preloader | Accepted |
+| [0016](0016-bounded-locked-memory.md) | Bounded, locked total memory: RSS ≈ `--memory` (streaming I/O from the pool) | Accepted (partial) |
+| [0017](0017-buffer-taxonomy.md) | Buffer taxonomy: fixed head pool vs small streaming I/O pool; zero-copy head send | Accepted |
+
+See [`../ARCHITECTURE.md`](../ARCHITECTURE.md) for the readable overview that ties these together.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0001-thread-per-core-concurrency.md
+-------------------------------------------------------------------------------
+
+# ADR-0001: Thread-per-core, network-sharded concurrency
+
+**Status:** Accepted (2026-06-09) — revisable.
+
+## Context
+Goblin Store streams large objects through an io_uring pipeline. We want lock-free hot
+paths and **zero cross-core data movement** while bytes flow socket ↔ buffer ↔ disk.
+
+Two shared-nothing shapes were considered:
+- **Network-sharded** — cores own connections; storage state is shared (read-mostly).
+- **Key-sharded** — cores own a slice of the keyspace *and* its storage; misrouted requests
+  are forwarded to the owning core (Seastar style).
+
+## Decision
+**Thread-per-core reactor, network-sharded.** Each core runs an independent io_uring event
+loop and owns a disjoint set of client connections (distributed via `SO_REUSEPORT`). A
+request is served **end-to-end on the core that owns its connection**: that core issues all
+RAM/SSD/HDD reads on its own ring and writes its own socket. No request hand-off, no
+cross-core byte shuffling on the streaming path.
+
+We deliberately reject key-sharded storage: for a streaming workload it would force
+gigabytes to cross cores from the storage-owning core back to the connection's core. Storage
+state (object index, drive fds) is therefore **shared and read-mostly** — see [ADR-0002](0002-iouring-rings-shared-drives.md).
+
+## Consequences
+- ➕ Lock-free serving path; per-core buffer pools; near-linear scaling for independent connections; NUMA/affinity friendly.
+- ➖ The shared index needs concurrency control — but objects are *few and large*, so contention is low (sharded `shared_mutex` now; RCU/epoch later if needed).
+- ➖ A few enormous connections can imbalance cores. v1 mitigates with per-connection backpressure, **not** migration.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0002-iouring-rings-shared-drives.md
+-------------------------------------------------------------------------------
+
+# ADR-0002: Per-core io_uring rings, shared drive fds, striped parallel reads
+
+**Status:** Accepted (2026-06-09) — revisable.
+
+## Context
+Early framing spoke of "per-drive queues." That conflates two things. An io_uring ring is a
+**per-thread** submission/completion structure; a read is `(ring, fd, offset, len, buffer)`.
+A drive is just an `fd`. There is no hardware reason a ring must belong to a drive.
+
+## Decision
+- Each core owns its own io_uring ring(s). Drive `fd`s (SSD/HDD) are opened **once and shared
+  globally**; they are read-mostly and safe to share across cores.
+- The connection-owning core (see [ADR-0001](0001-thread-per-core-concurrency.md)) submits all
+  reads for its objects against any drive `fd` **on its own ring**. `blk-mq` maps per-core
+  submissions onto per-core NVMe hardware queues automatically.
+- **Striping:** an object's bytes are striped across the SSD pool (and HDD pool) in
+  fixed-size chunks; the owning core **fans out parallel reads** to every relevant drive at
+  once — multi-drive parallelism falls out of fan-out on a single ring.
+- Use io_uring **registered (fixed) buffers** and **registered files** where they measurably
+  help; **multishot accept/recv** on the network side.
+
+## liburing availability
+liburing is **optional at the skeleton stage** (not installed on the dev box). Code compiles
+with a **stub reactor** when `GOBLIN_HAVE_URING` is unset. The real io_uring backend is the
+first implementation milestone — needs `liburing-dev` and a kernel ≥ 5.19 for multishot (we
+have 6.17).
+
+## Consequences
+- ➕ No per-drive lock and no cross-core I/O routing; parallel pool reads are free.
+- ➖ Shared device queues/page cache mean fairness must be managed by **bounded per-tier queues** ([ADR-0006](0006-positional-tiering-pipeline.md)), not by ring ownership.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0003-cache-semantics-head-as-cache.md
+-------------------------------------------------------------------------------
+
+# ADR-0003: Best-effort cache semantics; RAM head = write-through cache of an SSD-resident prefix
+
+**Status:** Accepted (2026-06-09); **revised 2026-06-29** — for objects that fit in the head
+(`size ≤ ram_head`) the RAM head is now the *sole* copy (no SSD duplicate); see the **Revision** section below.
+
+## Context
+The name says both "store" and "cache." Two questions decide the write path, durability, and
+eviction: (1) cache or store? (2) is the RAM head the *sole* copy of bytes `[0, head)`, or a
+*cache* of bytes also persisted below?
+
+## Decision
+**Best-effort CACHE semantics in v1.** Objects are evictable; **no fsync, no durability
+guarantee**. (A durable "store" mode can be added later as an explicit option.)
+
+**Persistent layout (the source of truth):**
+- *2-layer:* the entire object `[0, size)` lives on the SSD pool.
+- *3-layer:* `[0, ssd_prefix)` lives on the SSD pool; `[ssd_prefix, size)` lives on the HDD
+  pool. `ssd_prefix = ram_head + ssd_middle` (operator-configured).
+
+**The RAM head is a WRITE-THROUGH CACHE** of the first `ram_head` bytes, which also physically
+reside at the front of the SSD prefix. Therefore:
+- Evicting a RAM head is **free** — the bytes already exist on SSD.
+- A RAM-head miss costs **one SSD read** of the head — still far better TTFB than reading a whole value.
+- **Whole-object eviction** reclaims RAM + SSD + HDD together.
+- Duplicate cost (head in RAM *and* on SSD) is `ram_head` per object (e.g. 256 KB) — negligible **for large
+  objects**. *(Revised 2026-06-29: for objects ≤ `ram_head` the head IS the whole object, so the duplicate is
+  100% — those are now stored RAM-only; see the Revision section.)*
+
+## Consequences
+- ➕ No fsync on the write path; eviction is cheap; matches the "cache" positioning; deterministic placement, no temperature migration.
+- ➖ Not durable — a crash loses unflushed objects. Acceptable for a cache; revisit for a store mode. **v1 goes further: no persistence at all — blank slate every boot (see [ADR-0013](0013-ephemeral-wipe-on-start.md)).**
+
+## Revision (2026-06-29): objects that fit in the head are RAM-only
+
+The "negligible duplicate" reasoning in the Decision holds for *large* objects — a 256 KiB head on an 8 MiB
+value is ~3% overhead. It breaks down when `size ≤ ram_head`: then the head **is** the whole object, so the
+"duplicate" is 100% of it. Every byte sits in both RAM and SSD, and the SSD copy buys nothing — the object
+already fits in RAM and the disk tiers add no capacity for it. Worse, each such object still cost a
+per-object file, which made small-object ingest filesystem-bound.
+
+**So for `size ≤ ram_head` the object is now stored RAM-only** — no SSD/HDD extent, no per-object file. The
+RAM head is the **sole, authoritative** copy. Consequences specific to these objects:
+- **head-evict = object-evict** — there is no disk copy to fall back to, so evicting the head removes the
+  object (vs. the "free, re-read from SSD" eviction the Decision describes for larger objects).
+- a head-only object that cannot obtain RAM **backpressures** (`would_block`) rather than indexing a
+  body-less entry.
+
+The write-through-cache model in the Decision is **unchanged for objects larger than `ram_head`**: their head
+stays a cache of the SSD-resident prefix and evicts for free. (Trimming the head off *large* objects' disk
+copy too — persisting only `[ram_head, size)` — was considered but **not** adopted: it would couple the
+cacheable object count to RAM-head capacity. A possible future ADR.)
+
+**Impact.** On the small-object benchmark this cut the SSD footprint from 546 MiB to 8 KiB and the per-object
+file count from ~137 K to 1, with no latency change. It does **not** change goblin-store's standing vs
+memcached on small objects (memcached's slab allocator still wins on RAM and throughput — see
+[BENCHMARKS.md](../../BENCHMARKS.md)); it just stops wasting disk on objects that don't need it. Implemented
+in `storage/layout.cpp` (`compute_layout`) and `storage/tier_manager.cpp`
+(begin_store / write / commit / read / eviction); validated by 115/115 unit tests under Release, ASan, and TSan.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0004-cpp23-toolchain.md
+-------------------------------------------------------------------------------
+
+# ADR-0004: C++23 toolchain & build
+
+**Status:** Accepted (2026-06-09).
+
+## Context
+Observed dev box (2026-06-09): **GCC 16.1** (system `g++`), `g++-15` present, **CMake 3.31**,
+**Ninja 1.13**, **kernel 6.17**; clang absent. `std::expected`, `std::print`, and
+`std::format` all confirmed working under `-std=c++23`. **liburing not installed.**
+
+## Decision
+- **Language:** C++23. **Compiler floor:** GCC 14+ (or Clang 18+); we develop on GCC 16.
+- **Build:** CMake ≥ 3.28, Ninja generator. Dev builds use `-Wall -Wextra -Wpedantic -Werror`
+  and ASan/UBSan in `Debug`.
+- **Headers only for now — C++ modules OFF.** Module/toolchain maturity isn't worth the build
+  risk yet.
+- **Dependencies:** **OpenSSL — required** (`libssl-dev`; TLS for the runtime-optional HTTPS
+  listener, [ADR-0005](0005-protocol-surface.md)); the key-digest SHA-256 is **vendored, not from
+  OpenSSL** ([ADR-0014](0014-keyless-digest-identity.md)). **liburing — required for the io_uring
+  backend** (`liburing-dev`; detected via `pkg-config`, gated by `GOBLIN_HAVE_URING`; the
+  pure-logic layers build without it, but the server can't serve). HTTP/2,3 later: nghttp2 /
+  ngtcp2 + nghttp3.
+- **C++23 features we use now:** `std::expected` (hot-path error returns, no exceptions),
+  `std::span`, `std::print`/`std::format`, `if consteval` + `constexpr` (compile-time
+  command table). **Defer** `std::generator`, `std::flat_map`, `std::mdspan` until measured.
+
+## Consequences
+- ➕ Modern, exception-light error handling; fast iteration with Ninja.
+- ➖ The GCC-14 floor excludes some older LTS distros — acceptable; document the install.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0005-protocol-surface.md
+-------------------------------------------------------------------------------
+
+# ADR-0005: Protocol surface — memcache over TCP only, HTTP object path, no UDP, no auth
+
+**Status:** Accepted (2026-06-09). Supersedes the earlier memcache-UDP / kernel-bypass exploration.
+
+## Context
+The memcache **UDP** path is semantically wrong for large objects: its framing targets small
+responses (request-id + datagram seq/count), there is no flow control and no retransmit, and a
+1 GB value becomes ~700k datagrams the client must reassemble across packet loss. Decision on
+**2026-06-09: drop UDP.**
+
+## Decision
+- **memcache protocol over TCP ONLY.** Implemented subset (compatible for what we implement):
+  `get`, `gets`, `set`, `add`, `replace`, `delete`, `stats`, `version`, `quit`.
+  **Not:** `incr`/`decr`, CAS-as-coordination, counter mutation, touch/gat, slab/LRU admin.
+  The value block is length-prefixed, so we **stream it out** for fast time-to-first-byte.
+- **No ranged GET on the memcache port** — the protocol has no partial-get/resume. Range &
+  partial reads belong to HTTP.
+- **HTTP object-serving path:** HTTP/1.1 first (TLS via OpenSSL, keep-alive, **Range
+  requests**, streaming, cache-control, low-copy send, backpressure-aware). HTTP/2 later.
+  **HTTP/3 deferred** — it rides QUIC/UDP, but that is a separate, congestion-controlled,
+  integrated-library decision (ngtcp2 + nghttp3), **distinct from the raw memcache-UDP path we
+  just dropped**. Revisit post-v1.
+- **No built-in authentication anywhere.** TLS is transport only. Auth/policy = trusted
+  network, public-edge use, or a reverse proxy (nginx/Envoy/HAProxy/Caddy) in front.
+
+## Consequences
+- ➕ Big scope reduction: a single network substrate (TCP) for v1; DPDK/AF_XDP/recvmmsg no longer relevant.
+- ➕ Clear contract: streaming + range on HTTP; simple key ops on memcache/TCP.
+- ➖ Clients that require memcache-UDP are unsupported — intended.
+
+## Amendment (2026-06-09): SSL is required at build, optional at runtime
+**OpenSSL is a required build dependency** (not compile-time optional). What's optional is
+**enabling HTTPS when launching the server.** The HTTP front-end can run:
+- **HTTP only** (plaintext) — default;
+- **HTTPS only** — `--no-http` plus `--tls-cert`/`--tls-key`;
+- **both at once** — a plaintext listener and a TLS listener on separate ports, simultaneously.
+
+Config: independent `enable_http` (`--http-port`, default 8080) and `enable_https`
+(`--https-port`, default 8443; turned on by supplying `--tls-cert` + `--tls-key`). **Both HTTP and
+HTTPS may be off** — a **memcache-only** server is valid (the classic cache case; memcache/TCP
+serves reads too). The only rule: at least one listener overall (memcache, HTTP, or HTTPS). TLS
+stays transport-only (no auth). The keyless-identity hash
+([ADR-0014](0014-keyless-digest-identity.md)) is kept **independent of OpenSSL by choice** (a
+vendored SHA-256), so the storage engine doesn't link the TLS library.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0006-positional-tiering-pipeline.md
+-------------------------------------------------------------------------------
+
+# ADR-0006: Positional tiering & the request-triggered read-ahead pipeline
+
+**Status:** Accepted (2026-06-09).
+
+## Context
+The core serving idea, and the sizing constraint it hides.
+
+## Decision
+- **Tiering is POSITIONAL (by byte offset), not temperature-based.** Every object is split
+  `RAM head | SSD middle | (optional) HDD tail`. Placement is deterministic at write time —
+  **no promotion/demotion**, no hotness tracking.
+- **Request arrival triggers the whole pipeline at once.** Return the RAM head immediately
+  while async reads for the SSD/HDD ranges are *already in flight*, staged **ahead of** the
+  wire position via bounded per-tier queues + explicit backpressure. The wire path should
+  almost always find the next chunk already resident.
+- **The win is the head-first *sequential* path** (the common case — a memcache `GET` returns the
+  whole value from byte 0): the RAM head gives the instant first byte and the pipeline prefetches
+  forward. Arbitrary mid-object byte-range reads (e.g. an HTTP `Range` into the middle) hit
+  SSD/HDD *cold* with no head/prefetch benefit — that's inherent; Goblin's latency magic is
+  byte-0-first streaming, not random access. `tier_manager.read(offset,len)` is the primitive;
+  the GET path always streams from offset 0.
+- **Read-ahead sizing law — the SSD middle is a shock absorber for HDD seeks.** An HDD only
+  delivers sequential throughput when read in large gulps; under *N* concurrent streams it
+  degrades toward IOPS-bound. Therefore:
+
+  > `ssd_middle ≥ hdd_readahead_chunk × concurrent_streams_per_spindle`
+
+  HDD reads are issued in **coarse chunks**, and config validation **must reject** an SSD
+  middle smaller than the HDD chunk size. The 32 MB example is *derived*, not magic.
+- **Index is small** (few, large objects) → cheap sharded-lock map; **whole-object eviction**.
+
+## Consequences
+- ➕ Deterministic, explainable placement; trivial index; cheap eviction; the SSD-middle size is a *derived* quantity.
+- ➖ HDD seek contention under concurrency is the dominant risk — mitigated by big chunks, striping across spindles, and a **cap on concurrent HDD streams** (a bounded queue).
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0007-eviction-policy.md
+-------------------------------------------------------------------------------
+
+# ADR-0007: Eviction — size-aware, FIFO-based (not LRU/LFU)
+
+**Status:** Accepted (2026-06-09) — revisable; the policy is pluggable.
+
+## Context
+LRU and LFU are the wrong frame here for two reasons:
+1. They optimize object **count**, but we evict to reclaim **bytes**, and objects span
+   1 MB–1 GB (1000×) — so **value-per-byte** is what matters, not recency alone.
+2. LRU's per-hit list surgery is a lock convoy under thread-per-core ([ADR-0001](0001-thread-per-core-concurrency.md)).
+
+We also have **few** objects (thousands of big ones, not memcached's tens of millions of
+tiny ones), which lets us afford a richer per-object policy than memcached can.
+
+## Decision
+- **Base signal — FIFO-based, not LRU/LFU.** Default **S3-FIFO** (SOSP'23: small/main/ghost
+  queues); **SIEVE** (NSDI'24: one queue + a hand) as the simpler fallback. A "hit" sets a
+  *visited bit* (one atomic) — no list reorder, no global lock — and both are scan-resistant.
+- **Size-aware retention — GreedyDual-Size-Frequency (GDSF).** Rank whole-object retention by
+  value ≈ `(frequency × recency) / bytes` with an aging *inflation clock*. The usual GDSF
+  objection (an O(log n) priority queue) is a non-issue: few objects → a heap is cheap.
+- **Two eviction tiers** (because tiering is positional — [ADR-0003](0003-cache-semantics-head-as-cache.md)/[ADR-0006](0006-positional-tiering-pipeline.md)):
+  - *RAM-head cache:* cheap SIEVE/CLOCK over heads; eviction is **free** (bytes are on SSD); optimize for TTFB hit-rate.
+  - *Whole-object capacity* (SSD+HDD full): size-aware GDSF; `unlink` reclaims SSD+HDD together.
+- **Admission control**, not just eviction: a size-aware gate so a 1 GB one-hit-wonder can't
+  flush the hot set (the GDSF comparison + S3-FIFO's ghost queue / SIEVE's lazy promotion).
+- **TTL/expiry is separate:** memcache `exptime` is authoritative — expired objects are dropped
+  on access and swept by a timer wheel, independent of the capacity policy.
+- **Pluggable `EvictionPolicy`, selectable at runtime** via `--eviction {sieve|s3fifo|tinylfu}`
+  (default **s3fifo**) — so policies are A/B-benchmarkable on real workloads (a stated project
+  value). All three are FIFO/clock-based and lock-light (a hit sets a visited/frequency bit, no
+  list surgery); **W-TinyLFU** adds a Count-Min frequency sketch as an admission filter. Size-aware
+  GDSF (ADR-0012) layers on top for the whole-object tiers.
+  **(Status 2026-06-10: S3-FIFO is implemented and wired into both the RAM-head cache and the
+  object-count bound; SIEVE / W-TinyLFU are postponed — `--eviction` accepts only `s3fifo` for now.)**
+
+## Consequences
+- ➕ Lock-light hits; scan resistance; byte-correct value; benchmarkable; exploits "few large items."
+- ➖ More moving parts than LRU — mitigated by shipping SIEVE as a simple baseline.
+
+## References
+S3-FIFO (Yang et al., SOSP 2023) · SIEVE (Zhang et al., NSDI 2024) · GreedyDual-Size / GDSF
+(Cao & Irani 1997; Cherkasova 1998) · W-TinyLFU (Caffeine) as an alternative admission filter.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0008-ram-allocator.md
+-------------------------------------------------------------------------------
+
+# ADR-0008: RAM allocator — power-of-two block array + intra-block buddy
+
+**Status:** Accepted (2026-06-09).
+
+## Context
+RAM is a sized latency tool, not a savings tool. We want fixed, bounded,
+fragmentation-resistant RAM that also doubles as the io_uring **registered-buffer** region.
+
+## Decision
+- RAM is **one preallocated array of equal-size blocks**; block size is a **power of two**
+  (operator-configured). Whole-block allocation/free is O(1) via a free-list.
+- Allocations **smaller than a block** take one block and run **buddy allocation inside it**
+  (power-of-two sub-blocks down to a minimum order); split/merge is O(log).
+- The block array is a single large region whose total size is a **fixed,
+  command-line-specified amount** — RAM is a sized latency tool, it never grows. The region is
+  **`mlock`ed / `MAP_LOCKED` — never swapped** (never page the fast head out to the very disk
+  we're trying to avoid), prefers hugepages (THP / `MAP_HUGETLB`), and is **registered once
+  with io_uring as a fixed buffer** so reads DMA straight into it. The arena is **aligned to the
+  device block size (≥ 4 KiB)** and blocks are power-of-two ≥ that — which hands us **O_DIRECT
+  alignment for free** (see [ADR-0011](0011-odirect-bypass-page-cache.md)). *Ops:* raise
+  `RLIMIT_MEMLOCK` (or grant `CAP_IPC_LOCK`) for multi-GB locked regions; fail fast at startup if
+  the limit is too low.
+- **Per-core arenas:** each core owns a batch of blocks drawn from the global array and refills
+  in bulk → no per-allocation cross-core lock (matches thread-per-core, [ADR-0001](0001-thread-per-core-concurrency.md)).
+- Size the block / buddy min-order so the RAM head size and the read chunk / stripe unit land
+  on clean orders (minimize internal fragmentation).
+
+## Consequences
+- ➕ Bounded, predictable RAM (no unbounded growth); zero-copy into registered buffers; lock-light per core.
+- ➖ Internal fragmentation up to the buddy min-order — mitigated by sizing blocks/orders to the workload.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0009-striping-and-eof.md
+-------------------------------------------------------------------------------
+
+# ADR-0009: Drive pools — per-object files, round-robin striping, short-read EOF
+
+**Status:** Accepted (2026-06-09) — revisable. (The one open fork: **per-object files** vs a
+**packed-extent** allocator. Defaulting to per-object files — it's what the short-read-EOF
+mechanic implies and it's the simplest thing that works.)
+
+## Context
+How object bytes map onto a multi-drive tier pool, how reads parallelize, and how we detect
+end-of-object.
+
+## Decision
+- A tier pool (the SSD pool, the HDD pool) is a **list of drive directories** — one per drive.
+- Each object occupies **one file per directory** in the pool (named by key hash). Bytes are
+  **round-robin striped** across those `N` files by a **stripe unit `S`**:
+
+  > logical chunk `i = offset / S`  →  file `i mod N`,  at in-file position `(i / N) * S`.
+
+  (RAID-0 layout: chunk 0 → file 0, chunk 1 → file 1, …, chunk N → file 0 row 2, …)
+- **Stripe unit `S` is configurable, `≥ 1 page`.** Recommend **larger units on the HDD pool**
+  (e.g. 1–8 MB) to amortize seeks — ties directly to the shock-absorber law in [ADR-0006](0006-positional-tiering-pipeline.md);
+  the SSD pool can use small units (page–128 KB) since SSDs don't seek.
+- **Parallel reads:** the connection-owning core ([ADR-0001](0001-thread-per-core-concurrency.md)/[ADR-0002](0002-iouring-rings-shared-drives.md))
+  issues one read per file for a full **stripe row** at once on its own ring → N-way parallelism.
+- **EOF detection:** the **first constituent file that returns a short read** (in round-robin
+  scan order) marks end-of-object; later files in that row read empty. Cross-checked against the
+  size recorded in the index.
+- **Delete = `unlink` the files.** In 3-layer, an object has SSD-pool files for `[0, ssd_prefix)`
+  and HDD-pool files for the tail; each pool is striped independently.
+
+## Consequences
+- ➕ Dead-simple placement, parallel reads, trivial delete, self-describing EOF; resurrects junk drives with no NAS/SAN.
+- ➖ Many small files at scale + per-object `open()` cost → revisit packed-extent allocation if file count or open latency bites.
+
+## Refinements (2026-06-09 — many objects only partly fill the pool)
+- **Rotate the start drive per object:** `chunk i → file (hash(key) + i) mod N`. Without
+  rotation every object's chunk 0 lands on drive 0 — and when most objects are sub-stripe (see
+  [ADR-0012](0012-multi-resource-eviction.md)), drive 0 becomes a hotspot. Rotation spreads
+  small objects across the pool.
+- **Sub-stripe-unit objects are stored as a single, unstriped file** — no value in striping data
+  smaller than one stripe unit, and it avoids creating empty constituent files.
+- **Create only `min(N, ceil(size / S))` files**, never empty ones. The index records exact
+  per-file lengths, so reads go only to files that hold data; short-read EOF remains the cross-check.
+
+## Goal: one read saturates the whole pool (2026-06-09)
+**Priority (operator):** a single object read must use the full *aggregate* bandwidth of all
+drives in its tier. So every object is striped RAID-0 across **all** N drives in its pool, and
+the read-ahead pipeline ([ADR-0006](0006-positional-tiering-pipeline.md)) prefetches in **full
+stripe rows**.
+
+Grid layout for an object's tier-local bytes (pool of N drives, stripe unit S):
+- `chunk c = offset / S`,  `row = c / N`
+- **drive = `(hash(key) + c) % N`**  — consecutive chunks land on consecutive drives
+- **in-file offset = `row * S + (offset % S)`**
+
+A read of one row (`N × S` bytes) therefore issues N parallel per-drive reads and lights up
+every drive at once. `drive_pool` exposes `plan_reads(key, tier_offset, len) → [{drive,
+file_offset, length}]`; the pipeline calls it in `N × S` rows.
+
+**Stripe unit is per-pool and does NOT fight [ADR-0006](0006-positional-tiering-pipeline.md):**
+SSD pool uses a small S (e.g. 64 KB) so even modest reads span all drives; HDD pool uses a large
+S (MBs) for seek amortization — a full-row read is still `N × S`, so each HDD gets a coarse
+sequential chunk. Across a whole object stream both pools run concurrently (SSD serves the prefix
+while HDD prefetches the tail). Tiny objects (≤ `ram_head`) are served from RAM, so
+striping-for-bandwidth applies to the medium/large objects that actually hit disk.
+
+**Trade-off:** striping every object across every spindle maximizes single-stream bandwidth at
+the cost of concurrent-stream isolation (every read touches every drive). The large HDD stripe
+unit + SSD buffering bound the resulting seek pressure; stripe unit is the knob if concurrent
+throughput must ever be traded against single-stream latency.
+
+## File names & the open path (2026-06-09)
+- Per-object files are named by the **hex** of the digest
+  ([ADR-0014](0014-keyless-digest-identity.md)): the same `<64-hex>` name in each drive directory
+  (the directory identifies the drive). Because we have **few, large** objects, a **flat
+  directory** is fine — no git-style `ab/cd/` fan-out — so resolution is a single component.
+- **Open via a long-lived per-drive `dirfd` + `openat`:** open each drive directory once at
+  startup (`O_DIRECTORY`), then `openat(drive_dirfd, hex, O_RDONLY|O_DIRECT)` per object. The
+  kernel starts at the pinned directory and looks up only the final hex component — no re-walking
+  the `/data/ssdN/goblin-store/…` parent chain on every open. (Modern path-walk is RCU-lockless,
+  so the win is *less work per open*, not lock relief; biggest for frequent opens / small objects,
+  negligible for a 1 GB stream — but free.)
+- **With io_uring:** `IORING_OP_OPENAT` (async open via the dirfd) + **registered fixed-files**
+  (`IOSQE_FIXED_FILE`, [ADR-0002](0002-iouring-rings-shared-drives.md)) so reads skip the per-op fd
+  refcount lookup; a bounded **hot-object fd cache** (feasible because objects are few) avoids
+  re-opening on repeat reads. `openat2(RESOLVE_NO_SYMLINKS)` is cheap defense-in-depth (our names
+  are never symlinks).
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0010-write-admission-modes.md
+-------------------------------------------------------------------------------
+
+# ADR-0010: Write/upload admission — EVICT vs BLOCK on disk exhaustion
+
+**Status:** Accepted (2026-06-09).
+
+## Context
+[ADR-0003](0003-cache-semantics-head-as-cache.md) makes the default a best-effort cache that
+evicts to admit. But when Goblin is an **HTTP object origin**, eviction-driven disappearance of
+stored objects is wrong — clients expect what they uploaded to stay put. We need a write-time
+policy for what happens when a tier pool is full.
+
+## Decision
+Two operator-selectable **write-admission modes** (per server, with a sensible per-protocol
+default, overridable per request):
+
+- **EVICT — cache mode (default on the memcache path).** On exhaustion, evict low-value objects
+  (GDSF, [ADR-0007](0007-eviction-policy.md)) to make room. Best-effort; existing objects may
+  disappear.
+- **BLOCK — store/origin mode (default on the HTTP path).** Never evict to admit. Existing
+  objects are **pinned**. On exhaustion the write is refused with a clear status —
+  HTTP **`507 Insufficient Storage`**; memcache **`SERVER_ERROR out of memory storing object`**.
+  Streaming uploads get **bounded backpressure** (pause, wait for space freed by deletes/TTL)
+  and then fail on a timeout — they never block a connection forever.
+
+### Cross-cutting rules (both modes)
+- **Atomic publish.** Stream uploads into **temp shards**; **register in the index only on full
+  receipt**. A partial or failed upload (including mid-stream exhaustion in BLOCK mode) is
+  aborted and its temp shards `unlink`ed — an object is **never half-visible and never corrupt**.
+  (Pairs with per-object-file striping, [ADR-0009](0009-striping-and-eof.md).)
+- **Reserve when length is known.** memcache `<bytes>` and HTTP `Content-Length` let us reserve
+  SSD-prefix + HDD-tail space up front and reject immediately; chunked / unknown-length uploads
+  stream-and-check and may fail late.
+- **Check both pools (3-layer):** an object needs SSD-prefix space **and** HDD-tail space.
+- BLOCK prevents **eviction-driven** loss only. **Crash durability (fsync) is a separate axis** —
+  still the future "durable store mode" of [ADR-0003](0003-cache-semantics-head-as-cache.md), not
+  implied here.
+
+## Consequences
+- ➕ One binary serves both roles: ephemeral cache (EVICT) and pinned origin (BLOCK); no half-written objects; standard, honest out-of-space signaling.
+- ➖ BLOCK needs per-pool space accounting/reservation and a backpressure-timeout knob.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0011-odirect-bypass-page-cache.md
+-------------------------------------------------------------------------------
+
+# ADR-0011: O_DIRECT — own the backing store, bypass the kernel page cache
+
+**Status:** **Proposed** (2026-06-09) — inferred from the "override the backing store" thesis;
+flip to Accepted on operator confirmation.
+
+## Context
+Project thesis (operator, 2026-06-09): Goblin **overrides the OS backing store** and caches in
+RAM the latency-sensitive part of each file *itself*, because it knows what the kernel page
+cache can't — the head of each object is the latency-critical part. RAM is a **fixed,
+command-line-specified, `mlock`ed budget** ([ADR-0008](0008-ram-allocator.md)) that Goblin
+manages. If the kernel page cache *also* manages the backing-store files, the two caches fight.
+
+## Decision (proposed)
+Open all SSD/HDD backing files with **`O_DIRECT`** — bypass the kernel page cache entirely. The
+kernel collapses to a block transport: `io_uring` submit → DMA into our registered, locked
+buffers. Goblin owns **caching** (mlock'd head cache), **read-ahead** (the pipeline, [ADR-0006](0006-positional-tiering-pipeline.md)),
+and **eviction** (multi-resource).
+
+## Rationale
+- **Deterministic footprint:** total RAM == exactly the operator's `--memory`. The page cache
+  would add *unbudgeted* RAM on top and evict unpredictably — breaking the "fixed amount" promise.
+- **No double-caching, no competition** with the mlock'd region; the kernel won't cache cold HDD
+  tail bytes we stream once.
+- **Alignment is already paid for:** O_DIRECT needs buffer/offset/length aligned to the device
+  block (512/4 KiB); ADR-0008's power-of-two, block-aligned arena gives this for free, and stripe
+  units ([ADR-0009](0009-striping-and-eof.md)) are multiples of the block size.
+- **We didn't want kernel read-ahead:** O_DIRECT disables it; our pipeline does object-aware read-ahead.
+- **Lowest-copy path:** O_DIRECT + io_uring fixed buffers = DMA device → our buffer, no page-cache bounce.
+
+## Consequences
+- ➕ Deterministic memory; no cache contention; the literal expression of "own the backing store."
+- ➖ The RAM head cache is the **only** cache — a head miss is a real device read (~50–100 µs NVMe; deterministic). Raises the stakes on head residency (eviction valve 1 is a real read).
+- ➖ Sub-block reads must be aligned-and-trimmed (read the enclosing aligned range, return the slice).
+- 🔬 **Benchmark vs `RWF_DONTCACHE`** (uncached buffered I/O, kernel ≥ ~6.14; dev box is 6.17): no
+  cache pollution without strict alignment — a pragmatic alternative. Default to O_DIRECT.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0012-multi-resource-eviction.md
+-------------------------------------------------------------------------------
+
+# ADR-0012: Multi-resource eviction — per-resource relief valves & the demotion ladder
+
+**Status:** Accepted (2026-06-09) — revisable. Complements [ADR-0007](0007-eviction-policy.md)
+(the *value/recency* model); this ADR is the *structure* — which resource, which valve.
+
+## Context
+Eviction is a **multi-resource (vector)** problem. Positional tiering ([ADR-0006](0006-positional-tiering-pipeline.md))
+gives each object a structured footprint, and the per-object cost differs by **size regime**
+(example `ram_head`=256 KB, `ssd_prefix`=32 MB):
+
+| Regime | RAM | SSD | HDD |
+|---|---|---|---|
+| tiny (`size ≤ ram_head`) | whole object | `size` (backing copy) | 0 |
+| small/med (`ram_head < size ≤ ssd_prefix`) | head | `size` — **partly fills** | 0 |
+| large (`size > ssd_prefix`) | head | `ssd_prefix` (full) | `size − ssd_prefix` (the bulk) |
+
+So **SSD bytes = `min(size, ssd_prefix)`** — uniform only for large objects; the *many* small
+files use little SSD each. RAM ≈ a free-to-drop uniform knob; HDD ≈ the variable bulk.
+
+## Decision
+**Three independent, watermarked pressure controllers sharing one value model (ADR-0007).
+Reclaim in the background** (never on the serving path), from high-watermark down to low.
+
+**Relief valves** (cheapest → most destructive):
+1. **Drop RAM head** (RAM→∅) — free, reversible; the RAM controller's only valve.
+2. **Demote SSD prefix → HDD** (object goes fully cold) — frees SSD, spends HDD + migration I/O; reversible (a hit re-promotes); **3-layer only**.
+3. **Evict whole object** — frees RAM+SSD+HDD; irreversible; the HDD controller's main valve.
+
+**Demotion ladder:** `hot (RAM+SSD+HDD) → [RAM pressure] cool → [SSD pressure] cold (HDD only)
+→ [HDD pressure] evicted`; a hit promotes back up. Primary placement stays positional
+(ADR-0006) — this is only the pressure-relief overlay.
+
+**Per controller:**
+- **RAM** → valve 1; free; rank heads by recency/freq (SIEVE/CLOCK); optimize TTFB hit-rate.
+- **SSD → count-bound for v1** (operator decision 2026-06-09). Trigger on **object count**, not
+  byte-precise accounting. Default limit `= ssd_capacity / ssd_prefix` (safe — never overflows
+  even if every object is large). Reuse the per-pool **byte counter already kept for BLOCK-mode
+  reservation ([ADR-0010](0010-write-admission-modes.md)) as a free hard ceiling.** On trip:
+  **demote** (valve 2) if HDD has room, else **evict** (valve 3); victims = lowest value.
+- **HDD** → valve 3, **size-aware** (`value / hdd_bytes` → big cold tails first).
+
+**Coupling:** valve 2 spends HDD, so under simultaneous SSD+HDD pressure the SSD controller
+falls through to eviction. In **BLOCK mode** (ADR-0010) write-side refusal replaces eviction.
+**TTL-expired objects are swept first** (free relief).
+
+## Consequences
+- ➕ Each pressure source relieved by the right valve at minimum value-loss; count-bound SSD is simple and ships now.
+- ➖ **Count-bound under-utilizes SSD when many objects are small** (the partly-fill case): the count cap can trip with SSD bytes mostly free. Accepted for v1; the byte ceiling prevents the opposite (overflow). Revisit with byte accounting / small-object packing.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0013-ephemeral-wipe-on-start.md
+-------------------------------------------------------------------------------
+
+# ADR-0013: Ephemeral by design — wipe-on-start, no persistence (v1)
+
+**Status:** Accepted (2026-06-09).
+
+## Context
+[ADR-0003](0003-cache-semantics-head-as-cache.md) already makes Goblin a best-effort cache (no
+fsync). Operator decision (2026-06-09): **v1 is fully ephemeral** — no persistence across
+restarts or crashes. Every start is a blank slate; old object files and partials are erased.
+Durable/recoverable operation is deferred to a future "professional" version.
+
+## Decision
+- **No persistence.** The object index lives only in RAM; it is never written to disk nor
+  rebuilt from disk. After a restart the cache is empty.
+- **Marker-gated wipe.** A pool directory is wiped to a blank slate at startup **only if it
+  contains a `.goblin-store-marker` file**. If the marker is absent, Goblin **aborts and refuses
+  to start** — so a fat-fingered `--ssd-dir /var` can never erase anything. The wipe removes all
+  object / partial files but **preserves the marker** (otherwise the next restart would abort).
+- **A separate one-time prep tool blesses directories:** `goblin-store-path-prep /a/b/c ...`
+  - `mkdir -p` the path (or confirm it already exists), then
+  - **refuse if the directory contains anything** (it will only mark an empty / freshly-created
+    dir), and finally write the `.goblin-store-marker`.
+  - Because you can only bless an *empty* directory, the marker can never legitimately appear in
+    `/var`, `$HOME`, etc.; the destructive power (wipe-on-start) is gated on a marker the prep
+    tool refuses to place anywhere non-empty.
+  - *(Re-running prep on an already-blessed dir fails — it now contains the marker, so it's
+    non-empty. An idempotent "already prepared → ok" can be added later if wanted.)*
+- **Fast blank slate despite many small files** ([ADR-0012](0012-multi-resource-eviction.md)
+  partial-fill reality): move everything except the marker into a `goblin-trash.<pid>/` sidecar
+  inside the pool dir and unlink it in the background, so startup isn't blocked unlinking
+  potentially millions of files.
+
+## Consequences
+- ➕ No crash-recovery, no index persistence/rebuild, no durability bookkeeping — a large v1 simplification. Atomic-publish partials ([ADR-0010](0010-write-admission-modes.md)) are cleaned by the wipe.
+- ➖ Cold start is always empty (no warm cache after a restart) — acceptable for a cache; the "professional" version adds persistence/recovery.
+- ➖ Operators must run `goblin-store-path-prep` on scratch dirs first; the marker gate plus the prep tool's empty-only rule prevent collateral deletion.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0014-keyless-digest-identity.md
+-------------------------------------------------------------------------------
+
+# ADR-0014: Keyless internal identity — client keys hashed to a digest
+
+**Status:** Accepted (2026-06-09). The hash algorithm (SHA-256 vs blake3) is revisable — both are
+trivially swappable behind one function.
+
+## Context
+Clients present arbitrary, variable-length keys (memcache keys ≤ 250 B; HTTP paths). We want
+fast key → metadata lookups and we do **not** need key enumeration ("list your keys").
+
+## Decision
+- **Keyless identity.** The internal object ID is a **256-bit cryptographic digest** of the
+  client key. We do **not** store the original key — the digest *is* the identity. (Dropping
+  key-enumeration is what makes this safe to do.)
+- **Algorithm: SHA-256, hardware-accelerated, from a vendored implementation** (Bitcoin Core's is
+  the quality bar — MIT, lean, with runtime **SHA-NI → AVX2 → SSE4 → scalar** dispatch chosen once
+  via CPUID). **Speed matters:** 100 ns ≈ 125 bytes of wire time at 10 GbE and we hash once per
+  request, so a SHA-NI path (~4–6× a scalar impl; ~125 ns vs ~500–800 ns for a 250 B key) is a
+  *requirement*, not a nicety. Bitcoin's lean path also avoids OpenSSL's **EVP per-call overhead**
+  (context alloc + provider fetch), which on tiny inputs can cost more than the hash itself.
+  Everything sits behind a one-function `hash_key()` seam, so OpenSSL's SHA-256 (a required dep,
+  also SHA-NI) is a 1-line A/B — pick by benchmark on ≤ 250 B inputs. **Vendor the real upstream
+  files** (don't retype crypto), gated on NIST test vectors. We hash **once** at protocol parse and
+  carry the 32-byte digest through the pipeline (per-core state, no contention). **blake3** stays a
+  swappable alternative (its edge is large inputs we don't hash).
+- **Why a crypto hash:** because we're keyless, a collision would serve the **wrong object**.
+  256-bit ⇒ ~2^128 collision resistance ⇒ impossible in practice. (If we stored + compared keys,
+  a fast non-crypto hash like xxh3 would suffice — but keyless is the better fit here.)
+- **Index shape ([ADR-0001](0001-thread-per-core-concurrency.md)):** open map
+  `digest → ObjectMeta`; bucket = low 64 bits of the digest (already uniform — no secondary hash);
+  collisions compared on the full 32 bytes (4× `uint64`). The drive-striping seed
+  (`drive_of` key_hash, [ADR-0009](0009-striping-and-eof.md)) and per-object file names derive
+  from a slice of the digest.
+- **We hash keys, never values.** A ≤ 250 B key hashes in ~100 ns — invisible next to network RTT
+  and disk I/O for the large-object workload. Index overhead is 32 B/object — negligible vs
+  MB/GB objects.
+
+## Representation (confirmed 2026-06-09)
+- **Internal identity is the 32-byte BINARY digest, never hex.** 32 B is half a 64-byte cache
+  line, so an index slot (digest + compact metadata) fits in **one cache line** → one miss per
+  lookup, compare is 4× `uint64`. Hex (64 B) would fill the line with just the key.
+- **Index entry:** `digest → ObjectMeta { size; RAM-head residency = (block index, buddy offset,
+  head_len) or "not resident"; eviction bookkeeping }`. The RAM-head locator is the
+  `hash → block (+ maybe buddy offset)` mapping into the [ADR-0008](0008-ram-allocator.md) pool.
+  Disk location is **not** stored — it's recomputed (hex filename + stripe layout,
+  [ADR-0009](0009-striping-and-eof.md)).
+- **The filesystem is the on-disk index.** Per-object files are named by the **hex** of the
+  digest, so a disk lookup is just `openat(drive_dirfd, hex, …)` — no separate on-disk metadata
+  index to maintain or rebuild. Consistent with ephemeral wipe-on-start
+  ([ADR-0013](0013-ephemeral-wipe-on-start.md)): the RAM index is authoritative, rebuilt empty +
+  repopulated. See [ADR-0009](0009-striping-and-eof.md) for the open path.
+
+## Consequences
+- ➕ Fixed-size IDs everywhere; fast fixed-width lookups; on-disk names don't leak keys; no variable-length key storage; no new dependency.
+- ➖ Cannot enumerate or recover the original keys (intended).
+- ➖ An unkeyed digest lets an attacker who knows the scheme target a single bucket (algorithmic-complexity / bucket-flooding *slowdown* — not a wrong answer). Fine for trusted-network / behind-proxy ([ADR-0005](0005-protocol-surface.md)); seed the bucket function if hardening is ever required.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0015-http-key-derivation.md
+-------------------------------------------------------------------------------
+
+# ADR-0015: HTTP key derivation — path vs virtual-host mode, and the `--source` preloader
+
+**Status:** Accepted (2026-06-09). Canonicalization defaults revisable; the query-string default
+(strip) is the one open judgment call.
+
+## Context
+HTTP retrieval must turn a request into a Goblin key, and a startup `--source <dir>` preloader
+must derive **the same** keys so preloaded content is actually found. The two are duals of one
+rule.
+
+## Decision
+**Two server-wide modes (flag; default = path):**
+
+| | HTTP request | → key | `--source` file | → key |
+|---|---|---|---|---|
+| **Path** (default) | `GET /foo/bar.tar.gz` | `/foo/bar.tar.gz` | `src/bar/baz.txt` | `/bar/baz.txt` |
+| **Virtual-host** (`--http-vhost`) | `Host: www.example.com` + `GET /foo/bar.tar.gz` | `www.example.com/foo/bar.tar.gz` | `src/www.example.com/bar/baz.txt` | `www.example.com/bar/baz.txt` |
+
+Path mode keeps the URI's leading `/`; **vhost mode has no leading `/`** — the first path
+component *is* the host.
+
+- **One shared `derive_key(mode, host, uri)` / `derive_key_from_relpath(mode, relpath)`** used by
+  both the HTTP front-end and the loader — same normalization, no drift.
+- **`--source <dir>` (repeatable):** read-only input directories, **not** pool dirs (never wiped).
+  Startup order: wipe pools ([ADR-0013](0013-ephemeral-wipe-on-start.md)) → ingest each file under
+  its derived key through the normal write path (tiering/striping/atomic-publish,
+  [ADR-0006](0006-positional-tiering-pipeline.md)/[ADR-0010](0010-write-admission-modes.md)).
+  Honors the write mode — run BLOCK if "content didn't fit" should error rather than evict.
+- **Canonicalization (recommended defaults):**
+  - URI path: percent-decode, collapse duplicate `/`, resolve `.`/`..` segments.
+  - **Query string stripped by default** (the directory model has no queries, so this is what
+    makes `/app.js?v=2` find the preloaded `/app.js`); flag to key-on-query for cache-busting.
+  - Host (vhost): lowercase, strip port and trailing dot (do **not** strip `www.`). Require a
+    `Host` header in vhost mode — `400` if missing, since the key depends on it.
+- **memcache keys are literal** — the client supplies the exact string (then hashed,
+  [ADR-0014](0014-keyless-digest-identity.md)); modes/derivation apply only to HTTP + `--source`.
+  The operator picks a mode and uploaders must produce matching keys ("the user has to know").
+- **Security:** keys are hashed to opaque digests and files are digest-named
+  ([ADR-0014](0014-keyless-digest-identity.md)/[ADR-0009](0009-striping-and-eof.md)), so an
+  attacker-controlled `Host`/URI — `..` and all — **cannot escape to the filesystem**; a hostile
+  path just hashes to a different digest → miss. Traversal/symlink care applies only to the
+  `--source` loader (trusted operator input).
+
+## Consequences
+- ➕ Preload-from-directory and HTTP serving line up exactly; one rule; traversal-safe by construction.
+- ➖ Mode is server-wide and must match how items were uploaded (intended; documented).
+- ➖ Query-string default (strip) is a judgment call — revisit if per-query entries are wanted.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0016-bounded-locked-memory.md
+-------------------------------------------------------------------------------
+
+# ADR-0016: Bounded, locked total memory (RSS ≈ `--memory`)
+
+**Status:** Accepted (2026-06-09) — invariant; **partially implemented** (see status below).
+
+## Context
+Operator requirement: specify a memory budget (`--memory`), have it **locked** (no swap of the
+hot head), and **never OOM**. RAM is a sized latency tool ([ADR-0008](0008-ram-allocator.md)) — its
+footprint must be a hard, predictable cap, not best-effort.
+
+## Decision
+- **The one `mlock`'d `BufferPool` (`--memory`) is the only home for large/streaming RAM:** RAM
+  heads **and** all I/O chunk buffers (SET ingest, GET egress, read-ahead staging). Allocation from
+  it is bounded; when full → **backpressure** ([ADR-0006](0006-positional-tiering-pipeline.md)),
+  never heap growth.
+- **No operation buffers a whole object.** SET streams socket→disk in fixed chunks; GET streams
+  disk→socket head-first in fixed chunks. RAM per transfer = a few pool chunks, *independent of
+  object size* (so a 1 GB GET/SET uses a handful of chunks, not 1 GB).
+- **The index is bounded by the SSD object-count cap** ([ADR-0012](0012-multi-resource-eviction.md)),
+  so its size is `O(count_limit)`. Locking the pool already covers the latency-critical data (heads
+  + buffers never swap); the index is bounded-by-count and may be locked later if needed.
+- **Connection state uses bounded fixed buffers** (cap the command line; stream the body).
+- Size `--memory` below physical RAM ⇒ the locked pool can't swap, everything else is bounded ⇒
+  **no OOM**. Result: `RSS ≈ --memory + bounded index + small fixed overhead`.
+
+## Consequences
+- ➕ Hard, predictable footprint; the `mlock`'d pool never swaps (no major-fault latency on the head); no OOM when `--memory` is sized with headroom.
+- ➖ Requires **streaming I/O everywhere** (no whole-value buffers) and enforcing the index count-bound.
+
+## Implementation status (2026-06-10)
+- ✅ Fixed, `mlock`'d pool backs the RAM-head cache, **bounded by S3-FIFO eviction** (ADR-0007/0012).
+- ✅ **Streaming GET** (head zero-copy + chunked egress) and **streaming SET** (chunked ingest) —
+  no whole-value buffers; RAM per transfer = O(chunk).
+- ✅ **Object-count bound** (`--max-objects`) caps the index/store via whole-object eviction + unlink.
+- Remaining polish: auto-derive the default `--max-objects` from SSD `statvfs` (today it's opt-in,
+  `0` = unbounded); `mlock`-by-default needs `RLIMIT_MEMLOCK` raised (or `--no-mlock` for dev).
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0017-buffer-taxonomy.md
+-------------------------------------------------------------------------------
+
+# ADR-0017: Buffer taxonomy — fixed head pool vs. small streaming I/O pool; zero-copy head
+
+**Status:** Accepted (2026-06-09).
+
+## Context
+Two distinct kinds of RAM buffer were being conflated. They have different lifetimes and sizing,
+and treating them the same is what makes the current GET allocate (and copy) a whole object.
+
+## Decision
+- **Payload head buffers — FIXED.** Object heads live in the fixed, `mlock`'d head-cache pool
+  ([ADR-0008](0008-ram-allocator.md)), sized by config, bounded by S3-FIFO eviction
+  ([ADR-0012](0012-multi-resource-eviction.md)). Long-lived (cached across requests).
+- **I/O buffers — small, separate, fixed-size, reused.** A small slab of fixed chunk buffers for
+  streaming the SSD/HDD portions (GET egress) and SET ingest. Transient: acquired per pipeline
+  step, released immediately. **Not** proportional to object size. Size ≈
+  `chunk × pipeline_depth × concurrent_streams`. Kept separate from the head pool so transient
+  churn never fragments the head cache.
+- **Zero-copy head send.** Head bytes go straight from the head-cache region to the socket — no
+  intermediate userspace copy into a response buffer. Implemented as a scatter send (`writev` /
+  io_uring send of `[header, head region, chunk…, trailer]`; `IORING_OP_SEND_ZC` later for NIC
+  zero-copy). The head path therefore needs **zero** I/O buffers.
+- **Streaming, not whole-file.** GET = header → head (zero-copy) → SSD/HDD in fixed chunks from the
+  I/O pool, each sent as read, head-first ([ADR-0006](0006-positional-tiering-pipeline.md)), never
+  buffering the whole value. SET = stream socket→disk in chunks. RAM per transfer ≈ a few chunks,
+  independent of object size.
+- `--memory` = head pool (bulk) + small I/O pool, both `mlock`'d ⇒ total locked `= --memory`
+  ([ADR-0016](0016-bounded-locked-memory.md)).
+
+## Consequences
+- ➕ RAM per request is O(chunks), not O(object size); head served with no userspace payload copy; the two pools have clean, independent lifetimes.
+- ➖ Requires a streaming GET/SET path + scatter-send; replaces the current whole-file-in-one-block GET.
+
+## Implementation status (2026-06-10)
+Done: the fixed head pool, the small `IoBufferPool`, **streaming GET** (head sent zero-copy from the
+pool + the remainder in fixed I/O chunks), and **streaming SET** (chunked ingest). `IORING_OP_SEND_ZC`
+/ `writev` scatter-send is a later micro-opt; today each segment is a separate `send`.
+
+
+-------------------------------------------------------------------------------
+source: docs/adr/0018-concurrency-model.md
+-------------------------------------------------------------------------------
+
+# ADR-0018: Concurrency — thread-per-core network, shared locked storage
+
+**Status:** Accepted (2026-06-10). Details ADR-0001/0002 and records the v1 trade-offs.
+
+## Context
+The v1 server is a blocking, single-connection loop — correct, but it caps throughput at one
+in-flight request. Throughput is the headline benchmark vs memcached extstore.
+
+## Decision
+- **Thread-per-core.** N worker threads (`--cores`, default = hardware concurrency), each with its
+  own io_uring `Reactor` + I/O-buffer pool. A connection is served end-to-end on its accepting core
+  — no cross-core byte movement (ADR-0001).
+  - **Blocking interim: one shared listen socket.** All workers `accept()` from a single listener so
+    the kernel hands each new connection to a *free* worker. Per-core `SO_REUSEPORT` listeners are
+    wrong here: SO_REUSEPORT pins a connection to a fixed listener by 4-tuple hash, so when two
+    connections collide on the hash one worker serves both serially while another idles — and under
+    one-connection-per-worker the collided connection *starves* in the backlog. (Measured: cores=2
+    showed zero speedup until switched to a shared listener; then 1.7×/4.0×/5.0× at 2/4/8 cores.)
+  - Per-core `SO_REUSEPORT` listeners + multishot accept return with the async loop, where a worker
+    multiplexes many connections and an uneven hash just means "a few more connections," not starvation.
+- **Shared, locked storage.** The index is sharded `shared_mutex` (already). The tier manager's
+  head-cache + eviction policies are guarded by a single `TierManager` mutex (coarse, v1), held
+  **only** for the control-plane (head memcpy + policy ops) — never during disk I/O or network.
+  Drive fds are shared read-only; striped reads/writes go through the per-core reactor and run
+  concurrently. **Lock order:** `TierManager` mutex → index shard lock.
+- **Staging (v1 → target).** First cut runs the existing blocking `handle_conn` per connection on
+  each core thread (concurrency = thread count). The io_uring **multishot-recv async loop**
+  (many connections multiplexed per core) is the throughput target and layers on top.
+
+## Trade-offs
+- **Zero-copy head — RESOLVED (head pinning).** A GET pins the resident head (refcount, under the
+  lock), sends it zero-copy straight from the pool with no lock held, then unpins. An eviction or
+  overwrite of a pinned head **orphans** its RAM region (deferred free) until the last reader unpins,
+  so a late send can never touch freed memory. Head-resident GETs serve entirely from RAM and never
+  borrow an I/O buffer. (Pin/unpin are O(1) under the exclusive lock; a shared/atomic-refcount pin is
+  the scaling follow-up.)
+- **Atomic publish (deferred).** Stores overwrite the per-object files in place (`O_TRUNC`); a concurrent GET
+  of the *same* key could read torn bytes. Index-gated visibility keeps distinct-key concurrency
+  (the common case) correct; same-key store+read needs temp-file + atomic rename (ADR-0010) — deferred.
+- **Lock granularity.** One TierManager mutex is a contention point at high core counts; sharding
+  the head cache + policies (or RCU on the index) is the scaling follow-up.
+
+## Consequences
+- ➕ N-way concurrency; disk I/O overlaps across cores; clean path to the async loop.
+- ➖ Coarse lock + copy-head + non-atomic same-key writes are v1 simplifications with clear upgrades (pinning, atomic-publish, sharded locks).
