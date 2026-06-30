@@ -52,8 +52,8 @@ std::optional<T> parse_int(std::string_view s) {
 
 void print_help() {
     std::println(
-        "goblincache — large-object tiered cache / HTTP object server (scaffold)\n"
-        "usage: goblincache [options]\n"
+        "goblin-store — large-object tiered cache / HTTP object server (scaffold)\n"
+        "usage: goblin-store [options]\n"
         "  --memory SIZE       RAM budget, mlock'd (e.g. 4G, 512M)   [default 1G]\n"
         "  --block SIZE        RAM block size, power of two          [default 1M]\n"
         "  --ssd-dir DIR       SSD pool directory (repeatable, >=1 required)\n"
@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::println("┌─ goblincache 0.0.1 ─────────────────────────");
+    std::println("┌─ goblin-store 0.0.1 ─────────────────────────");
     std::println("│ mode        : {}", cfg.three_layer() ? "3-layer (RAM+SSD+HDD)" : "2-layer (RAM+SSD)");
     std::println("│ RAM budget  : {} MiB (block {} KiB, mlock={})",
                  cfg.memory.total_bytes / MiB, cfg.memory.block_bytes / KiB, cfg.memory.lock_memory);

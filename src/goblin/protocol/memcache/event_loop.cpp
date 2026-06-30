@@ -47,7 +47,7 @@ std::string EventLoop::format_stats() const {
     };
     o += std::format("STAT pid {}\r\n", ::getpid());
     line("uptime", uptime);
-    o += "STAT version goblincache 0.0.1\r\n"; // keep in sync with kVersion
+    o += "STAT version goblin-store 0.0.1\r\n"; // keep in sync with kVersion
     line("curr_connections", s.curr_conns);
     line("total_connections", s.conns);
     line("cmd_get", s.get_hits + s.get_misses);

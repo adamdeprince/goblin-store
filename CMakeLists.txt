@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(goblincache LANGUAGES CXX C VERSION 0.0.1)
+project(goblin-store LANGUAGES CXX C VERSION 0.0.1)
 
 # ---- Standard (ADR-0004): C++23, no extensions, modules off for now ----
 set(CMAKE_CXX_STANDARD 23)
@@ -74,8 +74,8 @@ if(GOBLIN_SANITIZE)
 endif()
 
 # ---- main executable ----
-add_executable(goblincache "${CMAKE_SOURCE_DIR}/src/goblin/main.cpp")
-target_link_libraries(goblincache PRIVATE goblin_core)
+add_executable(goblin-store "${CMAKE_SOURCE_DIR}/src/goblin/main.cpp")
+target_link_libraries(goblin-store PRIVATE goblin_core)
 
 # CLI helper that blesses a directory as a Goblin pool store (ADR-0013).
 add_executable(goblin-store-path-prep "${CMAKE_SOURCE_DIR}/src/goblin/tools/path_prep.cpp")
@@ -99,4 +99,4 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-message(STATUS "goblincache ${PROJECT_VERSION}  io_uring=${GOBLIN_HAVE_URING}  build=${CMAKE_BUILD_TYPE}  werror=${GOBLIN_WERROR}")
+message(STATUS "goblin-store ${PROJECT_VERSION}  io_uring=${GOBLIN_HAVE_URING}  build=${CMAKE_BUILD_TYPE}  werror=${GOBLIN_WERROR}")

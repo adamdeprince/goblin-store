@@ -67,7 +67,7 @@ inline constexpr std::string_view kNotFound = "NOT_FOUND\r\n";
 inline constexpr std::string_view kEnd = "END\r\n";
 inline constexpr std::string_view kError = "ERROR\r\n";
 inline constexpr std::string_view kBadDataChunk = "CLIENT_ERROR bad data chunk\r\n";
-inline constexpr std::string_view kVersion = "VERSION goblincache 0.0.1\r\n";
+inline constexpr std::string_view kVersion = "VERSION goblin-store 0.0.1\r\n";
 
 // Fixed meta-protocol replies (the flagged forms — VA/HD with return flags — are built dynamically).
 inline constexpr std::string_view kMetaNoop = "MN\r\n";      // mn
