@@ -44,33 +44,71 @@ for name in os.listdir(OUT):
 def skip(d): return d in {".git", "third_party", OUT, ".cache"} or d.startswith("build")
 
 CSS = """
-:root{--fg:#1b1b1f;--bg:#fff;--muted:#5a5a66;--accent:#6b46c1;--border:#e3e3ea;--code-bg:#f6f6f9}
+:root{color-scheme:light;--ink:#12140f;--paper:#f7f6f1;--white:#fffefa;--muted:#62645c;--line:#d8d8cf;--acid:#a6e22e;--acid-dark:#548a08;--cyan:#0b8897;--orange:#ed6b2f;--dark:#11130f;--dark-soft:#1b1e17;--mono:"IBM Plex Mono","SFMono-Regular",Consolas,monospace;--sans:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--serif:"IBM Plex Serif",Georgia,"Times New Roman",serif;--max:1180px}
 *{box-sizing:border-box}
-body{margin:0;color:var(--fg);background:var(--bg);font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-main{max-width:54rem;margin:0 auto;padding:2.5rem 1.25rem 6rem}
-h1,h2,h3,h4{line-height:1.25;margin:2rem 0 .6rem;font-weight:650}
-h1{font-size:1.9rem;margin-top:0}
-h2{font-size:1.4rem;border-bottom:1px solid var(--border);padding-bottom:.3rem}
-h3{font-size:1.15rem}
-a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
-p,ul,ol,blockquote,table,pre{margin:0 0 1rem}
-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em;background:var(--code-bg);padding:.12em .35em;border-radius:4px}
-pre{background:var(--code-bg);padding:1rem;border-radius:8px;overflow:auto;border:1px solid var(--border)}
-pre code{background:none;padding:0}
-blockquote{border-left:4px solid var(--accent);margin:0 0 1rem;padding:.2rem 0 .2rem 1rem;color:var(--muted)}
-table{border-collapse:collapse;width:100%;font-size:.95em;display:block;overflow:auto}
-th,td{border:1px solid var(--border);padding:.45rem .7rem;text-align:left} th{background:var(--code-bg)}
-hr{border:0;border-top:1px solid var(--border);margin:2rem 0}
-img{max-width:100%}
-footer{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--border);color:var(--muted);font-size:.85em}
-footer a{color:var(--muted)}
+html{scroll-behavior:smooth;background:var(--dark)}
+body{margin:0;color:var(--ink);background:var(--paper);font:16px/1.64 var(--sans)}
+::selection{color:var(--ink);background:var(--acid)}
+a{color:var(--cyan);text-decoration-thickness:1px;text-underline-offset:.2em}
+a:hover{color:var(--acid-dark)}
+img{display:block;max-width:100%}
+.skip-link{position:fixed;top:8px;left:8px;z-index:100;padding:8px 12px;color:var(--ink);background:var(--white);border:1px solid var(--ink);transform:translateY(-160%)}
+.skip-link:focus{transform:none}
+.site-header{background:#faf9f5;border-top:5px solid var(--dark);border-bottom:1px solid var(--line)}
+.header-inner{display:flex;align-items:center;justify-content:space-between;gap:28px;width:min(calc(100% - 40px),var(--max));min-height:76px;margin:0 auto}
+.brand{display:inline-flex;align-items:center;gap:10px;color:var(--ink);font-weight:850;text-decoration:none}
+.brand:hover{color:var(--ink)}
+.brand-mark{width:38px;height:38px;overflow:hidden;flex:0 0 38px;border:1px solid var(--ink);border-radius:50%;background:var(--white)}
+.brand-mark img{width:100%;height:100%;object-fit:cover;transform:scale(1.45) translateY(4%)}
+.brand strong,.brand small{display:block}
+.brand strong{font:800 .98rem/1.15 var(--mono)}
+.brand small{margin-top:3px;color:var(--muted);font:.68rem/1.2 var(--mono)}
+.nav{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:8px 24px}
+.nav a{color:var(--ink);font-size:.8rem;font-weight:750;text-decoration:none}
+.nav a:hover{color:var(--acid-dark)}
+.nav .source-link{padding:8px 12px;color:var(--white);background:var(--ink);border:1px solid var(--ink)}
+.nav .source-link:hover{color:var(--white);background:var(--orange);border-color:var(--orange)}
+main{width:min(calc(100% - 40px),920px);margin:0 auto;padding:88px 0 110px}
+.doc-kicker{margin:0 0 20px;color:var(--acid-dark);font:750 .75rem/1.2 var(--mono);text-transform:uppercase;letter-spacing:.02em}
+.doc-kicker::before{content:"// ";color:var(--orange)}
+.doc-body{min-width:0}
+.doc-body h1,.doc-body h2,.doc-body h3,.doc-body h4{font-family:var(--sans);letter-spacing:-.025em}
+.doc-body h1{max-width:850px;margin:0 0 38px;font-size:clamp(3rem,7vw,5.5rem);font-weight:900;line-height:.92;letter-spacing:-.055em}
+.doc-body h1 code{font:inherit;color:inherit;background:none;padding:0}
+.doc-body h1+p{max-width:800px;margin-bottom:38px;color:#34372f;font:500 clamp(1.12rem,2.2vw,1.35rem)/1.55 var(--serif)}
+.doc-body h2{margin:64px 0 22px;padding-top:23px;border-top:1px solid var(--ink);font-size:clamp(1.8rem,4vw,2.55rem);font-weight:830;line-height:1.04}
+.doc-body h2::before{content:"/ ";color:var(--orange);font-family:var(--mono);font-size:.55em;vertical-align:.2em}
+.doc-body h3{margin:38px 0 14px;font-size:1.3rem;font-weight:800;line-height:1.2}
+.doc-body h4{margin:30px 0 10px;font-size:1rem;font-weight:800;text-transform:uppercase}
+.doc-body p,.doc-body li{font-family:var(--serif)}
+.doc-body p,.doc-body ul,.doc-body ol,.doc-body blockquote,.doc-body table,.doc-body pre{margin:0 0 1.25rem}
+.doc-body ul,.doc-body ol{padding-left:1.55rem}
+.doc-body li{padding-left:.2rem}
+.doc-body li+li{margin-top:.3rem}
+.doc-body li::marker{color:var(--acid-dark);font-family:var(--mono);font-weight:800}
+.doc-body strong{font-family:var(--sans);font-size:.94em}
+code{padding:.13em .36em;color:#26301d;background:#e7ecd9;font:500 .86em var(--mono)}
+pre{padding:22px 24px;overflow:auto;color:#d5d8ce;background:var(--dark);border:1px solid #363a31;line-height:1.65}
+pre code{padding:0;color:inherit;background:none;font-size:.78rem}
+blockquote{padding:20px 24px;color:#44473f;background:var(--white);border-left:5px solid var(--orange)}
+blockquote p{font-family:var(--serif)}
+table{display:block;width:100%;overflow:auto;border-collapse:collapse;border-block:1px solid var(--ink)}
+thead{color:var(--white);background:var(--dark)}
+th,td{min-width:100px;padding:13px 14px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font:600 .68rem/1.4 var(--mono);text-transform:uppercase}
+td{font:.82rem/1.5 var(--mono)}
+tbody tr:nth-child(even){background:rgba(255,255,255,.5)}
+tbody tr:last-child td{border-bottom:0}
+hr{margin:3rem 0;border:0;border-top:1px solid var(--line)}
+.site-footer{padding:38px max(20px,calc((100vw - var(--max))/2));color:#bfc2b8;background:#090a08}
+.footer-inner{display:flex;justify-content:space-between;gap:30px;width:min(100%,var(--max));margin:0 auto}
+.footer-brand{color:var(--white);font:750 .84rem var(--mono)}
+.footer-copy{max-width:720px;text-align:right;font-size:.76rem}
+.footer-copy a{color:#d8dbd1}
+@media(max-width:760px){.nav a:not(.source-link){display:none}.brand small{display:none}main{padding:62px 0 82px}.doc-body h1{font-size:clamp(2.65rem,13vw,4rem)}.doc-body h2{margin-top:52px}.footer-inner{display:block}.footer-copy{margin-top:18px;text-align:left}}
+@media(max-width:420px){.header-inner{min-height:68px}.nav .source-link{padding:7px 9px;font-size:.72rem}main{width:min(calc(100% - 32px),920px)}pre{padding:18px 16px}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
 """
-
-FOOTER = ('<footer>'
-          '<a href="https://github.com/adamdeprince/goblin-store">Source &amp; issues on GitHub</a>'
-          ' &middot; &copy; 2026 Adam DePrince &middot; '
-          'Licensed under <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache-2.0</a>'
-          '</footer>')
 
 def render(path):
     with open(path, encoding="utf-8") as f:
@@ -83,10 +121,39 @@ def render(path):
     body = re.sub(r'(href="(?!https?:|//|mailto:)[^"]*?)\.md(["#])', r'\1.html\2', body)
     # Drop the ".md" from link *text* so a "BENCHMARKS.md" label shows as "BENCHMARKS".
     body = body.replace(".md</code></a>", "</code></a>").replace(".md</a>", "</a>")
+    root = "../" * path.count(os.sep)
+    home = root + "index.html"
+    readme = root + "README.html"
+    benchmarks = root + "BENCHMARKS.html"
+    architecture = root + "docs/adr/README.html"
+    mascot = root + "goblin.png"
+    license_path = root + "LICENSE"
+    header = (f'<a class="skip-link" href="#content">Skip to content</a>'
+              f'<header class="site-header"><div class="header-inner">'
+              f'<a class="brand" href="{home}" aria-label="Goblin Store home">'
+              f'<span class="brand-mark"><img src="{mascot}" alt=""></span><span>'
+              f'<strong>Goblin Store</strong><small>Technical documentation</small></span></a>'
+              f'<nav class="nav" aria-label="Documentation navigation">'
+              f'<a href="{home}">Home</a><a href="{readme}">README</a>'
+              f'<a href="{benchmarks}">Benchmarks</a><a href="{architecture}">Architecture</a>'
+              f'<a class="source-link" href="https://github.com/adamdeprince/goblin-store">View source</a>'
+              f'</nav></div></header>')
+    footer = (f'<footer class="site-footer"><div class="footer-inner">'
+              f'<div class="footer-brand">Goblin Store</div><div class="footer-copy">'
+              f'First byte from RAM. The rest is already on its way. &middot; &copy; 2026 Adam DePrince &middot; '
+              f'<a href="{license_path}">Apache-2.0</a> &middot; '
+              f'<a href="https://goblinreactor.com">Built by Goblin Reactor</a>'
+              f'</div></div></footer>')
     return ('<!doctype html>\n<html lang="en"><head><meta charset="utf-8">\n'
             '<meta name="viewport" content="width=device-width,initial-scale=1">\n'
-            f'<title>{H.escape(title)}</title>\n<style>{CSS}</style>\n'
-            f'</head><body><main>\n{body}\n{FOOTER}\n</main></body></html>\n')
+            '<meta name="theme-color" content="#11130f">\n'
+            '<link rel="preconnect" href="https://fonts.googleapis.com">\n'
+            '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+            '<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Serif:wght@400;500;600;700&amp;display=swap" rel="stylesheet">\n'
+            f'<link rel="icon" href="{mascot}" type="image/png">\n'
+            f'<title>{H.escape(title)} — Goblin Store</title>\n<style>{CSS}</style>\n'
+            f'</head><body>{header}<main id="content"><p class="doc-kicker">Field notes from the cave</p>'
+            f'<article class="doc-body">\n{body}\n</article></main>{footer}</body></html>\n')
 
 mds = []
 for dp, dn, fns in os.walk("."):
