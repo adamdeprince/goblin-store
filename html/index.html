@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Goblin Store is a large-object memcache clone and HTTP object server that keeps object heads in RAM while streaming tails from SSD and HDD.">
+  <meta name="theme-color" content="#11130f">
+  <meta property="og:title" content="Goblin Store — first byte from RAM, the rest already on its way">
+  <meta property="og:description" content="Memcache latency for large objects with 7.4× less RAM. A RAM head hides SSD and HDD latency while a read-ahead pipeline keeps the wire fed.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://goblin-store.dev/">
+  <meta property="og:image" content="https://goblin-store.dev/goblin.png">
+  <link rel="icon" href="goblin.png" type="image/png">
+  <link rel="apple-touch-icon" href="goblin.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Serif:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <title>Goblin Store — large-object caching without the RAM bill</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #12140f;
+      --paper: #f7f6f1;
+      --white: #fffefa;
+      --muted: #62645c;
+      --line: #d8d8cf;
+      --acid: #a6e22e;
+      --acid-dark: #548a08;
+      --cyan: #0b8897;
+      --cyan-bright: #41c4d1;
+      --orange: #ed6b2f;
+      --orange-bright: #ff8a55;
+      --dark: #11130f;
+      --dark-soft: #1b1e17;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --serif: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+      --max: 1180px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; overflow-x: hidden; background: var(--dark); }
+    body { margin: 0; overflow-x: hidden; color: var(--ink); background: var(--paper); font: 16px/1.58 var(--sans); }
+    ::selection { color: var(--ink); background: var(--acid); }
+    a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: .2em; }
+    a:hover { color: var(--acid-dark); }
+    img { display: block; max-width: 100%; }
+    code, pre { font-family: var(--mono); }
+    code { font-size: .88em; }
+    p, h1, h2, h3, li, dd { overflow-wrap: anywhere; }
+
+    .skip-link {
+      position: fixed; top: 8px; left: 8px; z-index: 100; padding: 8px 12px;
+      color: var(--ink); background: var(--white); border: 1px solid var(--ink); transform: translateY(-160%);
+    }
+    .skip-link:focus { transform: none; }
+
+    .site-header {
+      position: absolute; inset: 0 0 auto; z-index: 20; display: flex; align-items: center;
+      justify-content: space-between; gap: 28px; width: min(calc(100% - 40px), var(--max));
+      min-height: 76px; margin: 0 auto; border-bottom: 1px solid rgba(18, 20, 15, .16);
+    }
+    .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 850; text-decoration: none; }
+    .brand:hover { color: var(--ink); }
+    .brand-mark {
+      width: 38px; height: 38px; overflow: hidden; flex: 0 0 38px; border: 1px solid var(--ink);
+      border-radius: 50%; background: var(--white);
+    }
+    .brand-mark img { width: 100%; height: 100%; object-fit: cover; transform: scale(1.45) translateY(4%); }
+    .brand strong, .brand small { display: block; }
+    .brand strong { font: 800 .98rem/1.15 var(--mono); }
+    .brand small { margin-top: 3px; color: var(--muted); font: .68rem/1.2 var(--mono); }
+    .nav { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 8px 26px; }
+    .nav a { font-size: .82rem; font-weight: 750; text-decoration: none; }
+    .nav a:hover { color: var(--acid-dark); }
+    .nav .nav-cta { padding: 8px 12px; color: var(--white); background: var(--ink); border: 1px solid var(--ink); }
+    .nav .nav-cta:hover { color: var(--white); background: var(--orange); border-color: var(--orange); }
+
+    .hero { position: relative; min-height: min(790px, 91vh); overflow: hidden; background: #faf9f5; border-bottom: 1px solid var(--line); }
+    .hero-goblin {
+      position: absolute; z-index: 0; top: 58px; right: max(-105px, calc((100vw - var(--max)) / 2 - 125px));
+      width: min(64vw, 790px); height: calc(100% - 58px); object-fit: cover; object-position: 50% 46%;
+      mix-blend-mode: multiply; filter: contrast(1.02);
+    }
+    .hero::after {
+      content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+      background: linear-gradient(90deg, #faf9f5 0%, #faf9f5 40%, rgba(250,249,245,.84) 52%, rgba(250,249,245,0) 74%);
+    }
+    .hero-inner {
+      position: relative; z-index: 2; display: flex; flex-direction: column; align-items: flex-start;
+      justify-content: center; width: min(calc(100% - 40px), var(--max)); min-height: min(790px, 91vh);
+      padding: 145px 0 64px; margin: 0 auto;
+    }
+    .eyebrow, .section-label { margin: 0 0 18px; color: var(--acid-dark); font: 750 .76rem/1.2 var(--mono); text-transform: uppercase; letter-spacing: .015em; }
+    .eyebrow::before { content: "// "; color: var(--orange); }
+    .section-label::before { content: "/ "; color: var(--orange); }
+    .hero h1 { width: 100%; max-width: 810px; margin: 0; font: 900 clamp(4rem, 8.7vw, 7.8rem)/.84 var(--sans); letter-spacing: -.065em; }
+    .hero-copy { width: 100%; max-width: 650px; margin: 30px 0 0; font: 400 clamp(1.12rem, 2vw, 1.5rem)/1.42 var(--serif); }
+    .hero-copy strong { font-family: var(--sans); font-size: .92em; }
+    .hero-actions { display: flex; flex-wrap: wrap; width: 100%; max-width: 650px; gap: 12px; margin-top: 32px; }
+    .button {
+      display: inline-flex; min-height: 46px; align-items: center; justify-content: center; gap: 9px;
+      padding: 10px 17px; border: 1px solid var(--ink); font-size: .86rem; font-weight: 780;
+      line-height: 1.25; text-align: center; text-decoration: none;
+    }
+    .button.primary { color: var(--white); background: var(--ink); }
+    .button.primary:hover { color: var(--white); background: var(--acid-dark); border-color: var(--acid-dark); }
+    .button.secondary { background: rgba(255,255,255,.72); }
+    .button.secondary:hover { color: var(--cyan); background: var(--white); }
+    .hero-note { max-width: 650px; margin: 25px 0 0; color: var(--muted); font: .73rem/1.5 var(--mono); }
+    .hero-note::before { content: "✓ "; color: var(--acid-dark); font-weight: 900; }
+
+    .proof-strip { color: var(--white); background: var(--dark); }
+    .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); width: min(100%, 1440px); margin: 0 auto; }
+    .metric { min-width: 0; min-height: 148px; padding: 28px clamp(20px, 3vw, 48px); border-right: 1px solid #373a32; }
+    .metric:last-child { border-right: 0; }
+    .metric strong { display: block; color: var(--acid); font: 850 clamp(1.75rem, 3vw, 2.7rem)/1 var(--mono); }
+    .metric:nth-child(3) strong { color: var(--cyan-bright); }
+    .metric:nth-child(4) strong { color: var(--orange-bright); }
+    .metric span { display: block; margin-top: 10px; color: #c5c8be; font-size: .82rem; }
+
+    .section { padding: 108px max(20px, calc((100vw - var(--max)) / 2)); }
+    .section-inner { width: min(100%, var(--max)); margin: 0 auto; }
+    .band { background: var(--white); border-block: 1px solid var(--line); }
+    .section-heading { max-width: 900px; margin-bottom: 54px; }
+    h2 { margin: 0; font: 830 clamp(2.35rem, 5vw, 4.8rem)/.98 var(--sans); letter-spacing: -.04em; }
+    h3 { margin: 0 0 12px; font: 800 1.25rem/1.2 var(--sans); letter-spacing: -.02em; }
+    p { margin: 0; }
+    .lede { max-width: 720px; margin-top: 24px; color: var(--muted); font: 1.14rem/1.65 var(--serif); }
+
+    .fit-grid { display: grid; grid-template-columns: .86fr 1.14fr; gap: 90px; align-items: start; }
+    .fit-copy { padding-top: 36px; border-top: 1px solid var(--ink); }
+    .fit-copy > p { font: 1.18rem/1.65 var(--serif); }
+    .fit-list { display: grid; grid-template-columns: 1fr 1fr; gap: 0 36px; padding: 0; margin: 32px 0 0; list-style: none; }
+    .fit-list li { position: relative; padding: 11px 0 11px 23px; border-top: 1px solid var(--line); font-size: .9rem; }
+    .fit-list li::before { content: "+"; position: absolute; left: 0; color: var(--acid-dark); font: 800 1rem var(--mono); }
+
+    .pipeline { color: var(--white); background: var(--dark); }
+    .pipeline .section-label { color: var(--acid); }
+    .pipeline .lede { color: #b8bbb1; }
+    .pipeline-diagram {
+      display: grid; grid-template-columns: .85fr 54px 1fr 54px 1fr 54px 1.15fr; align-items: stretch;
+      margin-top: 58px; border: 1px solid #45483f; background: var(--dark-soft);
+    }
+    .pipeline-step { min-height: 250px; padding: 28px; }
+    .pipeline-step small { color: var(--acid); font: .7rem var(--mono); text-transform: uppercase; }
+    .pipeline-step:nth-of-type(4) small { color: var(--cyan-bright); }
+    .pipeline-step:nth-of-type(6) small { color: var(--orange-bright); }
+    .pipeline-step h3 { margin: 58px 0 12px; font-size: 1.25rem; }
+    .pipeline-step p { color: #adb0a7; font-size: .87rem; }
+    .pipeline-arrow { display: grid; place-items: center; color: var(--orange-bright); border-inline: 1px solid #45483f; font: 1.7rem var(--mono); }
+    .pipeline-note { display: grid; grid-template-columns: 1fr 1fr; gap: 60px; margin-top: 50px; }
+    .pipeline-note article { padding-top: 21px; border-top: 1px solid #45483f; }
+    .pipeline-note h3 { font-size: 1rem; }
+    .pipeline-note p { color: #adb0a7; font-size: .9rem; }
+
+    .bench-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 70px; align-items: start; }
+    .benchmark-copy .lede { margin-bottom: 35px; }
+    .bench-link { display: inline-block; margin-top: 28px; color: var(--cyan); font-weight: 800; text-underline-offset: 4px; }
+    .bar-chart { margin: 0; padding-top: 8px; }
+    .bar-chart figcaption { margin-bottom: 25px; color: var(--muted); font: .72rem/1.5 var(--mono); }
+    .bar-group + .bar-group { margin-top: 42px; }
+    .bar-title { display: block; margin-bottom: 14px; font: 750 .76rem var(--mono); text-transform: uppercase; }
+    .bar-row + .bar-row { margin-top: 13px; }
+    .bar-label { display: flex; justify-content: space-between; gap: 15px; margin-bottom: 6px; font: .76rem var(--mono); }
+    .bar-track { height: 27px; background: #e3e2db; }
+    .bar-fill { height: 100%; background: var(--ink); transform-origin: left; animation: grow .9s ease-out both; }
+    .bar-row.goblin .bar-fill { background: var(--acid-dark); }
+    .bar-group.throughput .bar-row.goblin .bar-fill { background: var(--cyan); }
+    @keyframes grow { from { transform: scaleX(0); } }
+
+    .benchmark-table-wrap { margin-top: 72px; overflow-x: auto; border-block: 1px solid var(--ink); }
+    table { width: 100%; min-width: 800px; border-collapse: collapse; }
+    th, td { padding: 17px 14px; border-bottom: 1px solid var(--line); text-align: right; font: .82rem var(--mono); }
+    th:first-child, td:first-child { padding-left: 0; text-align: left; font-family: var(--sans); font-weight: 760; }
+    th { color: var(--muted); font-size: .67rem; text-transform: uppercase; }
+    td.winner { color: var(--acid-dark); font-weight: 900; }
+    tr:last-child td { border-bottom: 0; }
+    .method { margin-top: 18px; color: var(--muted); font: .72rem/1.6 var(--mono); }
+
+    .scope { background: #e9e8e1; border-block: 1px solid var(--line); }
+    .scope-grid { display: grid; grid-template-columns: .88fr 1.12fr; gap: 90px; }
+    .scope-card { padding: 36px; background: var(--white); border: 1px solid var(--ink); box-shadow: 9px 9px 0 var(--ink); }
+    .scope-card .card-label { color: var(--orange); font: 800 .73rem var(--mono); text-transform: uppercase; }
+    .scope-card h3 { margin: 18px 0; font-size: clamp(1.65rem, 3vw, 2.45rem); }
+    .scope-card p { color: var(--muted); font-family: var(--serif); font-size: 1.05rem; }
+    .scope-card .button { margin-top: 28px; font-family: var(--sans); }
+
+    .features-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); margin-top: 58px; border-block: 1px solid var(--ink); }
+    .feature { min-height: 260px; padding: 34px 32px 38px 0; }
+    .feature + .feature { padding-left: 32px; border-left: 1px solid var(--ink); }
+    .feature-num { display: block; margin-bottom: 56px; color: var(--muted); font: .74rem var(--mono); }
+    .feature p { color: var(--muted); font-family: var(--serif); }
+    .feature code { color: var(--cyan); font-family: var(--mono); }
+
+    .quickstart { color: var(--white); background: var(--dark); }
+    .quickstart .section-label { color: var(--acid); }
+    .quick-grid { display: grid; grid-template-columns: .8fr 1.2fr; gap: 80px; align-items: start; }
+    .quick-copy p { color: #b8bbb1; font-family: var(--serif); font-size: 1.05rem; }
+    .requirements { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 28px; }
+    .requirements span { padding: 7px 10px; color: #c8cbc1; border: 1px solid #45483f; font: .7rem var(--mono); }
+    .terminal { margin: 0; padding: 27px; overflow-x: auto; color: #d6d9ce; background: #080907; border: 1px solid #45483f; font: .78rem/1.75 var(--mono); }
+    .terminal .comment { color: #74786c; }
+    .terminal .command { color: var(--acid); }
+    .quick-links { display: flex; flex-wrap: wrap; gap: 12px 25px; margin-top: 26px; }
+    .quick-links a { color: var(--cyan-bright); font: .76rem var(--mono); }
+
+    .site-footer { padding: 38px max(20px, calc((100vw - var(--max)) / 2)); color: #bfc2b8; background: #090a08; }
+    .footer-inner { display: flex; justify-content: space-between; gap: 30px; width: min(100%, var(--max)); margin: 0 auto; }
+    .footer-brand { color: var(--white); font: 750 .84rem var(--mono); }
+    .footer-copy { max-width: 720px; text-align: right; font-size: .76rem; }
+    .footer-copy a { color: #d8dbd1; }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .bar-fill { animation: none; }
+    }
+
+    @media (max-width: 900px) {
+      .nav a:not(.nav-cta) { display: none; }
+      .hero { min-height: 780px; }
+      .hero-inner { min-height: 780px; padding-top: 130px; justify-content: flex-start; }
+      .hero-goblin { top: auto; right: -120px; bottom: -75px; width: min(82vw, 620px); height: 58%; }
+      .hero::after { background: linear-gradient(180deg, #faf9f5 0%, #faf9f5 55%, rgba(250,249,245,.84) 68%, rgba(250,249,245,0) 88%); }
+      .hero h1 { max-width: 700px; font-size: clamp(3.8rem, 13vw, 6.5rem); }
+      .metric-grid { grid-template-columns: 1fr 1fr; }
+      .metric:nth-child(2) { border-right: 0; }
+      .metric:nth-child(-n+2) { border-bottom: 1px solid #373a32; }
+      .fit-grid, .bench-grid, .scope-grid, .quick-grid { grid-template-columns: 1fr; gap: 52px; }
+      .pipeline-diagram { grid-template-columns: 1fr; }
+      .pipeline-step { min-height: auto; }
+      .pipeline-step h3 { margin-top: 32px; }
+      .pipeline-arrow { min-height: 48px; border: 0; border-block: 1px solid #45483f; transform: rotate(90deg); }
+      .features-grid { grid-template-columns: 1fr; }
+      .feature { min-height: auto; padding: 30px 0; }
+      .feature + .feature { padding-left: 0; border-left: 0; border-top: 1px solid var(--ink); }
+      .feature-num { margin-bottom: 30px; }
+    }
+
+    @media (max-width: 620px) {
+      .site-header { min-height: 68px; }
+      .brand small { display: none; }
+      .nav .nav-cta { padding: 7px 9px; font-size: .73rem; }
+      .hero { min-height: 760px; }
+      .hero-inner { min-height: 760px; padding-top: 112px; }
+      .hero h1 { font-size: clamp(3.35rem, 15vw, 4.7rem); }
+      .hero-copy { font-size: 1.05rem; }
+      .hero-actions { align-items: flex-start; }
+      .hero-goblin { right: -115px; bottom: -48px; width: 110vw; height: 50%; }
+      .section { padding-top: 78px; padding-bottom: 78px; }
+      h2 { font-size: clamp(2.2rem, 12vw, 3.7rem); }
+      .metric-grid { grid-template-columns: 1fr; }
+      .metric { min-height: 120px; border-right: 0; border-bottom: 1px solid #373a32; }
+      .metric:last-child { border-bottom: 0; }
+      .fit-list, .pipeline-note { grid-template-columns: 1fr; }
+      .scope-card { padding: 27px; box-shadow: 6px 6px 0 var(--ink); }
+      .footer-inner { display: block; }
+      .footer-copy { margin-top: 18px; text-align: left; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header" id="top">
+    <a class="brand" href="#top" aria-label="Goblin Store home">
+      <span class="brand-mark"><img src="goblin.png" alt=""></span>
+      <span>
+        <strong>Goblin Store</strong>
+        <small>Large-object cache</small>
+      </span>
+    </a>
+    <nav class="nav" aria-label="Primary navigation">
+      <a href="#how">How it works</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#fit">Right workload</a>
+      <a href="README.html">Docs</a>
+      <a class="nav-cta" href="https://github.com/adamdeprince/goblin-store">View source</a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <img class="hero-goblin" src="goblin.png" alt="The Goblin Store silkie mascot" width="1254" height="1254">
+      <div class="hero-inner">
+        <p class="eyebrow">Large-object cache + HTTP object server</p>
+        <h1 id="hero-title">First byte from RAM. The rest is already on its way.</h1>
+        <p class="hero-copy">
+          Goblin Store keeps each object’s latency-sensitive <strong>head in RAM</strong>, streams the middle from SSD,
+          and hoards the cold tail on cheap HDD. It speaks memcache, but large objects no longer require an all-RAM bill.
+        </p>
+        <div class="hero-actions">
+          <a class="button primary" href="#quickstart">Build Goblin Store</a>
+          <a class="button secondary" href="BENCHMARKS.html">Read the full benchmarks</a>
+        </div>
+        <p class="hero-note">Open source · Apache-2.0 · C++23 · Linux io_uring · memcache text + meta · HTTP/HTTPS</p>
+      </div>
+    </section>
+
+    <section class="proof-strip" aria-label="Headline benchmark results">
+      <div class="metric-grid">
+        <div class="metric">
+          <strong>7.4×</strong>
+          <span>less RAM than memcached at the same large-object latency</span>
+        </div>
+        <div class="metric">
+          <strong>+68%</strong>
+          <span>throughput over memcached extstore on the same HDD</span>
+        </div>
+        <div class="metric">
+          <strong>~25%</strong>
+          <span>lower illustrative monthly cost than extstore</span>
+        </div>
+        <div class="metric">
+          <strong>100%</strong>
+          <span>of the disk-sized set retained; extstore shed 41.5% under write load</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="mission-title">
+      <div class="section-inner fit-grid">
+        <div>
+          <p class="section-label">The mission</p>
+          <h2 id="mission-title">Beat memcached on large objects.</h2>
+        </div>
+        <div class="fit-copy">
+          <p>
+            Match memcached’s hit latency with a fraction of its RAM. Beat extstore when cold reads reach disk.
+            Store more bytes per dollar by placing every part of an object on the tier fast enough for when the wire needs it.
+          </p>
+          <ul class="fit-list">
+            <li>Binary artifacts and packages</li>
+            <li>CDN and edge-cache objects</li>
+            <li>Media fragments and model blobs</li>
+            <li>Values from 256 KiB into the multi-MiB range</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="section pipeline" id="how" aria-labelledby="pipeline-title">
+      <div class="section-inner">
+        <div class="section-heading">
+          <p class="section-label">How it works</p>
+          <h2 id="pipeline-title">The network becomes the latency budget.</h2>
+          <p class="lede">
+            As a request lands, Goblin Store launches the storage pipeline. The RAM head starts leaving immediately
+            while SSD and HDD reads run ahead of the client’s current byte position.
+          </p>
+        </div>
+
+        <div class="pipeline-diagram" role="img" aria-label="A request dispatches reads so a RAM head is sent now, an SSD prefix next, and an HDD tail later">
+          <article class="pipeline-step">
+            <small>00 · request</small>
+            <h3>GET arrives</h3>
+            <p>One request triggers every tier. No waiting for the head to finish before touching disk.</p>
+          </article>
+          <div class="pipeline-arrow" aria-hidden="true">→</div>
+          <article class="pipeline-step">
+            <small>01 · now</small>
+            <h3>RAM head</h3>
+            <p>The first 256 KiB is resident and served zero-copy for immediate time-to-first-byte.</p>
+          </article>
+          <div class="pipeline-arrow" aria-hidden="true">→</div>
+          <article class="pipeline-step">
+            <small>02 · next</small>
+            <h3>SSD prefix</h3>
+            <p>The warm middle arrives while the client is still consuming the head.</p>
+          </article>
+          <div class="pipeline-arrow" aria-hidden="true">→</div>
+          <article class="pipeline-step">
+            <small>03 · later</small>
+            <h3>HDD tail</h3>
+            <p>Coarse read-ahead turns cheap spinning capacity into a throughput tier, with seek time hidden upstream.</p>
+          </article>
+        </div>
+
+        <div class="pipeline-note">
+          <article>
+            <h3>Position, not temperature</h3>
+            <p>Placement follows byte offset: head, middle, tail. There is no hotness tracker moving whole objects between tiers.</p>
+          </article>
+          <article>
+            <h3>Bounded all the way down</h3>
+            <p>Fixed head and I/O pools, explicit backpressure, O_DIRECT, and chunked streaming keep RAM independent of object size.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section band" id="benchmarks" aria-labelledby="benchmarks-title">
+      <div class="section-inner">
+        <div class="bench-grid">
+          <div class="benchmark-copy">
+            <p class="section-label">Measured, not imagined</p>
+            <h2 id="benchmarks-title">More object. Less memory.</h2>
+            <p class="lede">
+              A 2-vCPU server faced a 16-vCPU load box across a real NIC with a right-skewed mix of 256 KiB–8 MiB objects.
+              One run fit in memory. The other forced cold reads onto the same slow HDD used by extstore.
+            </p>
+            <a class="bench-link" href="BENCHMARKS.html">Full rig, methodology, tables, and caveats →</a>
+          </div>
+
+          <figure class="bar-chart">
+            <figcaption>Measured results · lower RAM is better · higher throughput is better</figcaption>
+            <div class="bar-group">
+              <span class="bar-title">Memory-sized working set · resident RAM</span>
+              <div class="bar-row">
+                <div class="bar-label"><span>memcached</span><strong>1,974 MiB</strong></div>
+                <div class="bar-track"><div class="bar-fill" style="width:100%"></div></div>
+              </div>
+              <div class="bar-row goblin">
+                <div class="bar-label"><span>Goblin Store</span><strong>267 MiB</strong></div>
+                <div class="bar-track"><div class="bar-fill" style="width:13.5%"></div></div>
+              </div>
+            </div>
+            <div class="bar-group throughput">
+              <span class="bar-title">Disk-sized working set · throughput</span>
+              <div class="bar-row">
+                <div class="bar-label"><span>memcached + extstore</span><strong>70 QPS</strong></div>
+                <div class="bar-track"><div class="bar-fill" style="width:59.3%"></div></div>
+              </div>
+              <div class="bar-row goblin">
+                <div class="bar-label"><span>Goblin Store · three tiers</span><strong>118 QPS</strong></div>
+                <div class="bar-track"><div class="bar-fill" style="width:100%"></div></div>
+              </div>
+            </div>
+          </figure>
+        </div>
+
+        <div class="benchmark-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Disk-sized run</th>
+                <th>QPS</th>
+                <th>Avg latency</th>
+                <th>RAM</th>
+                <th>SSD</th>
+                <th>HDD bulk</th>
+                <th>~$/mo</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>memcached + extstore</td>
+                <td>70</td>
+                <td>226 ms</td>
+                <td>2,188 MiB</td>
+                <td>—</td>
+                <td>9.5 GiB</td>
+                <td>$9.0</td>
+              </tr>
+              <tr>
+                <td>Goblin Store · 2-tier</td>
+                <td>93</td>
+                <td>170 ms</td>
+                <td>1,520 MiB</td>
+                <td>10.7 GiB</td>
+                <td>—</td>
+                <td>$6.9</td>
+              </tr>
+              <tr>
+                <td>Goblin Store · 3-tier</td>
+                <td class="winner">118</td>
+                <td class="winner">135 ms</td>
+                <td class="winner">1,520 MiB</td>
+                <td>2.84 GiB</td>
+                <td>8.9 GiB</td>
+                <td class="winner">$6.6</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="method">Illustrative cost model: RAM $4, gp3 SSD $0.08, st1 HDD $0.045 per GiB-month. Point-in-time numbers on modest AWS hardware; reproduce with your own object mix.</p>
+      </div>
+    </section>
+
+    <section class="section scope" id="fit" aria-labelledby="fit-title">
+      <div class="section-inner scope-grid">
+        <div>
+          <p class="section-label">Choose by object shape</p>
+          <h2 id="fit-title">Big tails belong here. Tiny objects have another goblin.</h2>
+          <p class="lede">
+            Goblin Store’s advantage appears when objects are large enough to tier. Sub-2 KiB values do not have a useful tail to put on disk, so a large-object allocator is the wrong tool.
+          </p>
+        </div>
+        <aside class="scope-card">
+          <span class="card-label">For memory-efficient small objects</span>
+          <h3>Meet Goblin Core.</h3>
+          <p>
+            If your workload is very small object storage, Redis-compatible hashes, or sorted sets, use the compact packed engine built for that shape. Goblin Store is candid about the boundary: memcached wins its sub-2 KiB benchmark.
+          </p>
+          <a class="button primary" href="https://goblin-core.dev">Visit goblin-core.dev</a>
+        </aside>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="features-title">
+      <div class="section-inner">
+        <div class="section-heading">
+          <p class="section-label">Operational shape</p>
+          <h2 id="features-title">Familiar at the edge. Purpose-built underneath.</h2>
+        </div>
+        <div class="features-grid">
+          <article class="feature">
+            <span class="feature-num">01 / protocol</span>
+            <h3>Drop-in memcache surface</h3>
+            <p>Classic text and meta protocols over TCP, with TTL and CAS. HTTP/1.1 adds <code>GET</code>, <code>HEAD</code>, ranges, ETags, and optional HTTPS via OpenSSL + kTLS.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-num">02 / runtime</span>
+            <h3>Thread per core, bytes stay local</h3>
+            <p>Connection-owning workers issue their own io_uring reads and write their own sockets. Shared drive file descriptors, striped parallel reads, no cross-core payload shuffle.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-num">03 / safety</span>
+            <h3>Ephemeral on purpose</h3>
+            <p>Pool directories must be explicitly blessed before startup can wipe them. Atomic publish, bounded memory, and backpressure keep partial objects and surprise OOMs out of the serving path.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section quickstart" id="quickstart" aria-labelledby="quickstart-title">
+      <div class="section-inner quick-grid">
+        <div class="quick-copy">
+          <p class="section-label">Build + run</p>
+          <h2 id="quickstart-title">Put the cave under load.</h2>
+          <p class="lede">Goblin Store targets Linux. Prepare dedicated pool directories once, then choose RAM, SSD, and optional HDD budgets at launch.</p>
+          <div class="requirements" aria-label="Requirements">
+            <span>Linux ≥ 5.19</span>
+            <span>C++23</span>
+            <span>CMake ≥ 3.28</span>
+            <span>liburing</span>
+            <span>OpenSSL</span>
+          </div>
+        </div>
+        <div>
+          <pre class="terminal"><code><span class="comment"># Build and test</span>
+<span class="command">cmake</span> -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+<span class="command">cmake</span> --build build
+<span class="command">ctest</span> --test-dir build --output-on-failure
+
+<span class="comment"># Bless empty, dedicated pool directories once</span>
+<span class="command">./build/goblin-store-path-prep</span> /mnt/ssd/pool /mnt/hdd/pool
+
+<span class="comment"># Serve memcache on 11211 and HTTP on 8080</span>
+<span class="command">./build/goblin-store</span> --memory 4G \
+  --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool \
+  --memcache-port 11211 --http-port 8080</code></pre>
+          <div class="quick-links">
+            <a href="README.html">Complete README →</a>
+            <a href="docs/adr/README.html">18 architecture decisions →</a>
+            <a href="https://github.com/adamdeprince/goblin-store">Source + issues →</a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer-inner">
+      <div class="footer-brand">Goblin Store</div>
+      <div class="footer-copy">
+        First byte from RAM. The rest is already on its way. · © 2026 Adam DePrince ·
+        <a href="LICENSE">Apache-2.0</a> · Built by <a href="https://goblinreactor.com">Goblin Reactor</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

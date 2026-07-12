@@ -7,5 +7,8 @@ compile_commands.json
 *.tmp
 .DS_Store
 
-# generated docs (scripts/build-docs.sh) — HTML is text, not committed
-/html/
+# Generated docs (scripts/build-docs.sh). The hand-built front page and its
+# mascot are committed; Markdown renderings remain build artifacts.
+/html/*
+!/html/index.html
+!/html/goblin.png

@@ -4,10 +4,10 @@
 #
 # Mirrors the source tree (README.md -> html/README.html, docs/adr/0003-*.md ->
 # html/docs/adr/0003-*.html, ...) and rewrites inter-doc `.md` links to `.html` so the output is
-# browsable offline. Also writes html/index.html as a redirect to README.html.
+# browsable offline. The hand-authored html/index.html and mascot are preserved.
 #
-# The html/ output is a GENERATED BUILD ARTIFACT and is .gitignored — HTML from Markdown is text,
-# not a binary LFS candidate, so it is never committed. Re-run any time:
+# The rendered Markdown under html/ is a GENERATED BUILD ARTIFACT and is .gitignored. The front
+# page and mascot are committed source files. Re-run any time:
 #
 #     scripts/build-docs.sh
 #
@@ -29,7 +29,18 @@ import html as H, os, re, shutil
 import markdown
 
 OUT = "html"
-shutil.rmtree(OUT, ignore_errors=True)  # clean rebuild — no orphan HTML from renamed/removed docs
+PRESERVE = {"index.html", "goblin.png"}
+
+# Clean generated output without deleting the hand-authored landing page or its asset.
+os.makedirs(OUT, exist_ok=True)
+for name in os.listdir(OUT):
+    if name in PRESERVE:
+        continue
+    path = os.path.join(OUT, name)
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
 def skip(d): return d in {".git", "third_party", OUT, ".cache"} or d.startswith("build")
 
 CSS = """
@@ -84,26 +95,17 @@ for dp, dn, fns in os.walk("."):
 mds.sort()
 
 for md in mds:
-    # The root README becomes the site index; everything else mirrors its path (incl. docs/adr/README.md).
-    out = os.path.join(OUT, "index.html" if md == "README.md" else md[:-3] + ".html")
+    # Every Markdown page mirrors its source path, including the root README.
+    out = os.path.join(OUT, md[:-3] + ".html")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         f.write(render(md))
     print("  ", out)
-
-# README.html redirects to index.html so links / back-references to README.html still resolve.
-if "README.md" in mds:
-    with open(os.path.join(OUT, "README.html"), "w", encoding="utf-8") as f:
-        f.write('<!doctype html><meta charset="utf-8">'
-                '<meta http-equiv="refresh" content="0; url=index.html">'
-                '<link rel="canonical" href="index.html">'
-                '<a href="index.html">index.html</a>\n')
-    print("   html/README.html (redirect -> index.html)")
 
 # Copy LICENSE into the site so in-page [LICENSE](LICENSE) links resolve.
 if os.path.exists("LICENSE"):
     shutil.copy("LICENSE", os.path.join(OUT, "LICENSE"))
     print("   html/LICENSE")
 
-print(f"==> generated {len(mds)} page(s) in {OUT}/  (root README -> index.html; README.html redirects there)")
+print(f"==> generated {len(mds)} page(s) in {OUT}/  (hand-authored index.html preserved)")
 PYEOF
