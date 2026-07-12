@@ -8,6 +8,8 @@ Status validate(const ServerConfig& c) {
         return err(Errc::invalid_argument, "memory.block_bytes must be a power of two >= 4 KiB");
     if (m.total_bytes < m.block_bytes)
         return err(Errc::invalid_argument, "memory.total_bytes must be >= block size");
+    if (!is_power_of_two(m.small_min_alloc) || m.small_min_alloc < 8 || m.small_min_alloc > m.block_bytes)
+        return err(Errc::invalid_argument, "memory.small_min_alloc must be a power of two in [8, block_bytes]");
 
     const auto& t = c.tiers;
     if (t.ram_head > t.ssd_prefix)

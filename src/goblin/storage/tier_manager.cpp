@@ -147,7 +147,7 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
     auto wp = core::IoBufferPool::create(io_chunk, write_buffers, mem.lock_memory);
     if (!wp) return std::unexpected(wp.error());
     TierManager tm(t, std::move(*ram), std::move(head_policy), std::move(object_policy),
-                   ev.max_ssd_objects, std::move(*sp), std::move(hp), index);
+                   ev.max_ssd_objects, std::move(*sp), std::move(hp), index, mem.small_min_alloc);
     tm.write_pool_ = std::make_unique<core::IoBufferPool>(std::move(*wp));
     return tm;
 }
@@ -220,8 +220,17 @@ Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, 
 
     std::optional<core::BufferPool::Region> head;
     const Size head_len = std::min<Size>(size, tiers_.ram_head);
+    // RAM-only heads (size <= ram_head) pack at the small min-order; larger heads keep the 4 KiB
+    // O_DIRECT-aligned order. Same shared block pool, per-block class (ADR-0008-rev).
+    const Size head_min = (size <= tiers_.ram_head) ? small_min_alloc_ : kDeviceBlock;
     if (head_len > 0) {
-        auto region = ram_.allocate(static_cast<std::uint32_t>(head_len));
+        auto region = ram_.allocate(static_cast<std::uint32_t>(head_len), head_min);
+        // Small class: reclaim dead arena space by sliding compaction before evicting anything live.
+        // Sliding is in-place, so it frees room even at 100% RAM; eviction (below) remains the backstop.
+        if (!region && head_min < kDeviceBlock && ram_.small_dead_total() >= head_len) {
+            compact_small();
+            region = ram_.allocate(static_cast<std::uint32_t>(head_len), head_min);
+        }
         while (!region) {
             const auto victim = policy_->evict();
             if (!victim) break;
@@ -236,7 +245,7 @@ Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, 
                     index_->set_head(*victim, HeadLoc{}); // disk-backed: object stays, served from SSD
                 }
             }
-            region = ram_.allocate(static_cast<std::uint32_t>(head_len));
+            region = ram_.allocate(static_cast<std::uint32_t>(head_len), head_min);
         }
         if (region) head = *region;
     }
@@ -621,6 +630,42 @@ void TierManager::free_head_region(unsigned block, std::uint32_t offset, std::ui
         it->second.orphaned = true;
     else
         ram_.deallocate(block, offset, len);
+}
+
+// Reclaim dead space in fragmented small (arena) blocks by sliding their live heads down to squeeze
+// out the holes and rewinding the frontier -- in-place, so it needs no spare block and works at 100%
+// RAM. A block with any pinned head (a reader is streaming it) is skipped this pass. Heads are movable
+// because they're reachable only through the index (HeadLoc), which we rewrite here (ADR-0008/0018).
+// Called under the exclusive storage lock from the admission path.
+void TierManager::compact_small() {
+    struct Slot { std::uint32_t offset; std::uint32_t len; Digest digest; };
+    std::unordered_map<unsigned, std::vector<Slot>> by_block;
+    for (const auto& [d, h] : index_->resident_heads()) {
+        if (!ram_.small_arena(h.block)) continue; // only small (byte-granular arena) blocks compact here
+        by_block[h.block].push_back(Slot{h.offset, h.len, d});
+    }
+    for (auto& [block, slots] : by_block) {
+        auto* arena = ram_.small_arena(block);
+        if (!arena || arena->dead() == 0) continue; // no holes to squeeze out
+        bool pinned = false;                        // a reader is sending a head here -> leave it, retry later
+        for (const auto& s : slots) {
+            const auto it = pins_.find(region_id(block, s.offset));
+            if (it != pins_.end() && it->second.refcount > 0) { pinned = true; break; }
+        }
+        if (pinned) continue;
+        std::sort(slots.begin(), slots.end(),
+                  [](const Slot& a, const Slot& b) { return a.offset < b.offset; });
+        Size dest = 0;
+        for (const auto& s : slots) {
+            if (s.offset != dest) { // slide down into the reclaimed hole; rewrite the head locator
+                std::memmove(ram_.addr(block, static_cast<std::uint32_t>(dest)),
+                             ram_.addr(block, s.offset), s.len);
+                index_->set_head(s.digest, HeadLoc{block, static_cast<std::uint32_t>(dest), s.len});
+            }
+            dest += arena->slot_size(s.len);
+        }
+        arena->set_frontier(dest); // [dest, block) is free room again; live count is unchanged
+    }
 }
 
 std::optional<TierManager::Snapshot> TierManager::open_snapshot(const Digest& digest) {

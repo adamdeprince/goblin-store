@@ -28,3 +28,34 @@ fragmentation-resistant RAM that also doubles as the io_uring **registered-buffe
 ## Consequences
 - ➕ Bounded, predictable RAM (no unbounded growth); zero-copy into registered buffers; lock-light per core.
 - ➖ Internal fragmentation up to the buddy min-order — mitigated by sizing blocks/orders to the workload.
+
+## Revision (2026-07): per-class allocators — buddy for large heads, byte-granular arena for small
+
+The buddy min-order was `kDeviceBlock` (4 KiB) so every head stayed O_DIRECT-aligned. For the
+**large-object** workload that's free — a `ram_head`-sized head is already a power of two. But once
+small objects became **RAM-only** (head is the only copy — [ADR-0003](0003-cache-semantics-head-as-cache.md)),
+a ~250 B value burned a whole 4 KiB leaf: **~12× worse than memcached** on small values. Two facts
+unlock the fix: a RAM-only head **never DMAs** (it's memcpy-filled and io_uring-*sent*, so it needs
+no 4 KiB alignment), and a head is **movable** — reachable only through the index `HeadLoc`, so its
+bytes can be relocated as long as that locator is rewritten under the write lock ([ADR-0018](0018-atomic-publish-cow.md)).
+
+A block's **class is fixed on first use**, and the two classes never share a block:
+
+- **Large heads (`>= kDeviceBlock`)** keep intra-block **buddy** allocation — power-of-two, O_DIRECT-aligned, self-coalescing. Unchanged.
+- **Small RAM-only heads (`< kDeviceBlock`)** use a **byte-granular bump arena**: heads packed
+  contiguously at an 8/16 B granularity (`--small-min-alloc`, default 16 B), **no power-of-two
+  rounding**. A free only marks bytes dead; the bump frontier never rewinds.
+  - *Phase 1* pared the floor from 4 KiB to the min-order (kills the 4 KiB leaf).
+  - *Phase 2* replaces buddy-in-block with the bump arena (kills the remaining ~power-of-two rounding),
+    and adds **sliding compaction** to reclaim the dead holes bump can't coalesce: within a fragmented
+    block, live heads slide down to squeeze out the holes, each `HeadLoc` is rewritten, and the
+    frontier rewinds. It is **in-place** (needs no spare block, so it works at 100 % RAM), **skips any
+    block with a pinned head** (a reader streaming it zero-copy — [ADR-0017](0017-streaming-io-buffers.md)),
+    runs under the exclusive storage lock, and is triggered from the **admission path before eviction**
+    (reclaim dead space rather than drop live objects). Eviction remains the backstop when there is
+    genuinely more live data than RAM. This is the "beat slab" move — memcached can't relocate objects,
+    so emptied slabs calcify; we compact.
+
+### Consequences
+- ➕ Small-object RAM approaches memcached parity; byte-granular packing removes power-of-two waste; compaction defeats slab-style calcification without a size-class rebalance.
+- ➖ Compaction is an **O(live heads) index walk** per pass (bounded by triggering only under small-pool pressure, and gated on there being ≥ one head's worth of reclaimable dead space); a block with a pinned head defers to a later pass.

@@ -99,4 +99,14 @@ std::vector<Digest> Index::expired_keys(std::uint32_t now) const {
     return out;
 }
 
+std::vector<std::pair<Digest, HeadLoc>> Index::resident_heads() const {
+    std::vector<std::pair<Digest, HeadLoc>> out;
+    for (std::size_t i = 0; i < nshards_; ++i) {
+        std::shared_lock lk(shards_[i].mu);
+        for (const auto& [d, m] : shards_[i].map)
+            if (m.head.resident()) out.push_back({d, m.head});
+    }
+    return out;
+}
+
 } // namespace goblin::storage

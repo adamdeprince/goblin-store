@@ -96,8 +96,8 @@ TEST("buffer_pool: allocate distinct usable regions; write/read; addr matches") 
     CHECK(poolr.has_value());
     auto& pool = *poolr;
 
-    const auto a = pool.allocate(4 * KiB);
-    const auto b = pool.allocate(8 * KiB);
+    const auto a = pool.allocate(4 * KiB, 4 * KiB);
+    const auto b = pool.allocate(8 * KiB, 4 * KiB);
     CHECK(a.has_value());
     CHECK(b.has_value());
     CHECK(a->data != b->data);
@@ -115,16 +115,67 @@ TEST("buffer_pool: too-big alloc fails; exhaustion returns nullopt; free reuses 
     CHECK(poolr.has_value());
     auto& pool = *poolr;
 
-    CHECK(!pool.allocate(128 * KiB).has_value()); // larger than a block
+    CHECK(!pool.allocate(128 * KiB, 4 * KiB).has_value()); // larger than a block
 
-    const auto a = pool.allocate(64 * KiB); // fills block 0's arena
-    const auto b = pool.allocate(64 * KiB); // fills block 1's arena
+    const auto a = pool.allocate(64 * KiB, 4 * KiB); // fills block 0's arena
+    const auto b = pool.allocate(64 * KiB, 4 * KiB); // fills block 1's arena
     CHECK(a.has_value());
     CHECK(b.has_value());
-    CHECK(!pool.allocate(4 * KiB).has_value()); // both blocks in use -> exhausted
+    CHECK(!pool.allocate(4 * KiB, 4 * KiB).has_value()); // both blocks in use -> exhausted
 
     pool.deallocate(a->block, a->offset, a->len); // empties block 0 -> returned to pool
-    CHECK(pool.allocate(64 * KiB).has_value());   // reused
+    CHECK(pool.allocate(64 * KiB, 4 * KiB).has_value());   // reused
+}
+
+TEST("arena: byte-granular bump packing; dead accounting; drains to empty") {
+    ArenaAllocator a(4 * KiB, /*align=*/8);
+    const auto x = a.allocate(100); // rounds to 104
+    const auto y = a.allocate(200); // 200
+    const auto z = a.allocate(30);  // 32
+    CHECK(x.has_value()); CHECK(y.has_value()); CHECK(z.has_value());
+    CHECK_EQ(*x, Offset{0});
+    CHECK_EQ(*y, Offset{104});      // packed right after x -- no power-of-two rounding
+    CHECK_EQ(*z, Offset{304});      // 104 + 200
+    CHECK_EQ(a.used(), Size{336});
+    CHECK_EQ(a.frontier(), Size{336});
+    a.deallocate(*y, 200);          // y dies: dead space grows, frontier does not rewind
+    CHECK_EQ(a.used(), Size{136});
+    CHECK_EQ(a.dead(), Size{200});
+    CHECK_EQ(a.frontier(), Size{336});
+    a.deallocate(*x, 100);
+    a.deallocate(*z, 30);
+    CHECK_EQ(a.used(), Size{0});     // fully dead -> BufferPool would reclaim the block
+}
+
+TEST("arena: zero fails; exact fit succeeds; overflow past the frontier fails") {
+    ArenaAllocator a(256, 8);
+    CHECK(a.allocate(0) == std::nullopt);
+    const auto p = a.allocate(250);          // rounds to 256 -- exact fit
+    CHECK(p.has_value());
+    CHECK_EQ(a.frontier(), Size{256});
+    CHECK(a.allocate(8) == std::nullopt);     // frontier full
+    CHECK(a.allocate(1000) == std::nullopt);  // larger than the arena
+}
+
+TEST("buffer_pool: small min-order packs many objects/block; a large class gets its own block") {
+    auto poolr = BufferPool::create(/*total=*/256 * KiB, /*block=*/64 * KiB, /*min=*/4 * KiB, false);
+    CHECK(poolr.has_value());
+    auto& pool = *poolr;
+    // 200 x 100 B at a 64 B min-order round to 128 B (~25 KiB) -> one 64 KiB block. At the 4 KiB min
+    // they'd need 200 x 4 KiB = 800 KiB and blow the 256 KiB pool -- that gap is the Phase-1 win.
+    unsigned small_block = ~0u;
+    int packed = 0;
+    for (int i = 0; i < 200; ++i) {
+        const auto r = pool.allocate(100, /*min_alloc=*/64);
+        if (!r) break;
+        ++packed;
+        if (small_block == ~0u) small_block = r->block;
+    }
+    CHECK_EQ(packed, 200);
+    // A 4 KiB-class allocation must not share the small (64 B) block.
+    const auto big = pool.allocate(8 * KiB, /*min_alloc=*/4 * KiB);
+    CHECK(big.has_value());
+    if (big) CHECK(big->block != small_block);
 }
 
 TEST("io_buffer_pool: fixed chunks, distinct + usable, exhaustion, release reuses") {

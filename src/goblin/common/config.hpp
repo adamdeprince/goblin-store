@@ -36,6 +36,9 @@ struct PoolConfig {
 struct MemoryConfig {                  // ADR-0008
     Size total_bytes  = 1 * GiB;       // fixed, command-line specified; never grows
     Size block_bytes  = 1 * MiB;       // power-of-two block size
+    Size small_min_alloc = 16;         // buddy min-order for RAM-only (<=ram_head) heads. Large heads
+                                       // keep the 4 KiB (kDeviceBlock) order so they stay O_DIRECT-
+                                       // aligned; RAM-only small objects never DMA, so they pack tight.
     bool lock_memory  = true;          // mlock / MAP_LOCKED (never swap the head out)
     bool use_hugepages = true;
 };

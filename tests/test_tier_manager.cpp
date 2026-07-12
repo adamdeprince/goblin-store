@@ -239,6 +239,91 @@ TEST("tier_manager: small objects (<= ram_head) are RAM-only -- no SSD copy; hea
     fs::remove_all(base);
 }
 
+TEST("tier_manager: sliding compaction reclaims fragmented small heads without evicting survivors") {
+    if (!core::Reactor::available()) {
+        std::println("    (skipped: built without liburing)");
+        return;
+    }
+    auto reactor = core::Reactor::create();
+    if (!reactor) {
+        std::println("    (skipped: io_uring unavailable: {})", reactor.error().detail);
+        return;
+    }
+
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-compact-" + std::to_string(::getpid()))).string();
+    PoolConfig ssd, hdd; // 2-layer; objects are RAM-only so no files are ever written
+    ssd.stripe_unit = 64 * KiB;
+    ssd.dirs.push_back(base + "/s0");
+    for (const auto& d : ssd.dirs) fs::create_directories(d);
+
+    TierSizes tiers;
+    tiers.ram_head = 4 * KiB;
+    tiers.ssd_prefix = 1 * MiB;
+    MemoryConfig mem;
+    mem.total_bytes = 256 * KiB; // 4 blocks x 64 KiB
+    mem.block_bytes = 64 * KiB;
+    mem.lock_memory = false;
+    EvictionConfig ev;
+
+    Index index;
+    auto tm = TierManager::open(tiers, mem, ev, ssd, hdd, index);
+    CHECK(tm.has_value());
+
+    const int kFill = 64;    // 256 KiB / 4 KiB -> fills RAM exactly, no eviction
+    const Size sz = 4 * KiB; // == ram_head -> RAM-only (16-aligned, so packs with zero waste)
+    auto pattern = [sz](int i) {
+        std::vector<std::byte> v(sz);
+        for (Size j = 0; j < v.size(); ++j)
+            v[j] = static_cast<std::byte>((j * 7 + std::size_t(i) * 131) & 0xFF);
+        return v;
+    };
+    auto key = [](int i) { return hash_key("/c/" + std::to_string(i)); };
+
+    for (int i = 0; i < kFill; ++i) {
+        const auto d = pattern(i);
+        CHECK(tm->store(key(i), ByteView(d.data(), d.size()), 0).has_value());
+    }
+    CHECK_EQ(index.size(), std::size_t(kFill)); // everything fit -- no eviction on fill
+
+    // Fragment: remove every other object. Each 64 KiB block keeps 8 of its 16 heads, so no block fully
+    // drains -- the bump arenas are riddled with dead holes they can't reuse without compaction.
+    for (int i = 0; i < kFill; i += 2) CHECK(tm->remove(key(i)));
+    CHECK_EQ(index.size(), std::size_t(kFill / 2));
+
+    // Refill with kFill/2 new objects. Every block is bump-full (frontiers never rewound), so the first
+    // admission fails to allocate and triggers sliding compaction, which squeezes out the holes in
+    // place. If that works, the new objects fit in the reclaimed space and NO odd survivor is evicted.
+    for (int i = kFill; i < kFill + kFill / 2; ++i) {
+        const auto d = pattern(i);
+        CHECK(tm->store(key(i), ByteView(d.data(), d.size()), 0).has_value());
+    }
+    CHECK_EQ(index.size(), std::size_t(kFill));  // 32 survivors + 32 new, still no eviction
+    CHECK_EQ(tm->head_resident(), index.size());
+
+    // Every odd survivor still reads back correctly -- from its NEW, compaction-rewritten HeadLoc.
+    for (int i = 1; i < kFill; i += 2) {
+        std::vector<std::byte> got(sz);
+        const auto n = tm->read(*reactor, key(i), 0, MutBytes(got.data(), got.size()));
+        CHECK(n.has_value() && *n == sz);
+        CHECK(got == pattern(i));
+    }
+    // ...and so do the newly admitted objects.
+    for (int i = kFill; i < kFill + kFill / 2; ++i) {
+        std::vector<std::byte> got(sz);
+        const auto n = tm->read(*reactor, key(i), 0, MutBytes(got.data(), got.size()));
+        CHECK(n.has_value() && *n == sz);
+        CHECK(got == pattern(i));
+    }
+    // Still RAM-only: no per-object SSD files were written.
+    std::size_t files = 0;
+    for (const auto& e : fs::recursive_directory_iterator(base))
+        if (e.is_regular_file()) ++files;
+    CHECK_EQ(files, std::size_t(0));
+
+    fs::remove_all(base);
+}
+
 TEST("tier_manager: streaming begin_store / write(chunks) / commit round-trips") {
     if (!core::Reactor::available()) {
         std::println("    (skipped: built without liburing)");

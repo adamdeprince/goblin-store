@@ -189,8 +189,8 @@ public:
 private:
     TierManager(TierSizes t, core::BufferPool ram, std::unique_ptr<EvictionPolicy> head_policy,
                 std::unique_ptr<EvictionPolicy> object_policy, std::uint64_t max_objects, Pool ssd,
-                std::optional<Pool> hdd, Index& ix)
-        : tiers_(t), ram_(std::move(ram)), policy_(std::move(head_policy)),
+                std::optional<Pool> hdd, Index& ix, Size small_min_alloc)
+        : tiers_(t), small_min_alloc_(small_min_alloc), ram_(std::move(ram)), policy_(std::move(head_policy)),
           object_policy_(std::move(object_policy)), max_objects_(max_objects), ssd_(std::move(ssd)),
           hdd_(std::move(hdd)), index_(&ix),
           store_seq_(std::make_unique<std::atomic<std::uint64_t>>(0)),
@@ -200,11 +200,13 @@ private:
     void drop_object(const Digest&); // free head + unlink files + erase from index & policies
     void enforce_object_bound();     // evict whole objects while over the count limit
     void free_head_region(unsigned block, std::uint32_t offset, std::uint32_t len); // free or orphan
+    void compact_small(); // slide live heads down within fragmented small arenas; reclaim dead space (ADR-0008)
     static std::uint64_t region_id(unsigned block, std::uint32_t offset) {
         return (static_cast<std::uint64_t>(block) << 32) | offset;
     }
 
     TierSizes tiers_;
+    Size small_min_alloc_;                           // buddy min-order for RAM-only heads (ADR-0008-rev)
     core::BufferPool ram_;                           // RAM-head cache (ADR-0003/0008)
     std::unique_ptr<core::IoBufferPool> write_pool_; // bounded aligned CoW write staging (ADR-0011)
     std::unique_ptr<EvictionPolicy> policy_;        // resident-head eviction (ADR-0007)

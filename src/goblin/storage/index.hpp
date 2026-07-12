@@ -75,6 +75,10 @@ public:
     // Digests of objects whose absolute expiry has passed `now` (TTL reaper, lazy-skip is elsewhere).
     std::vector<Digest> expired_keys(std::uint32_t now) const;
 
+    // (digest, head) for every RAM-resident object. The compaction pass buckets these by block to
+    // slide live heads down and reclaim dead arena space (ADR-0008 Phase 2).
+    std::vector<std::pair<Digest, HeadLoc>> resident_heads() const;
+
 private:
     struct Shard {
         mutable std::shared_mutex mu;

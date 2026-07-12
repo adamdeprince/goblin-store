@@ -62,6 +62,24 @@ void BuddyAllocator::deallocate(Offset off, Size bytes) {
     free_[order].push_back(cur);
 }
 
+// ---------------- ArenaAllocator ----------------
+
+std::optional<Offset> ArenaAllocator::allocate(Size bytes) {
+    if (bytes == 0) return std::nullopt;
+    const Size a = round(bytes);
+    if (a > arena_size_ - frontier_) return std::nullopt; // no room below the frontier (no overflow)
+    const Offset off = static_cast<Offset>(frontier_);
+    frontier_ += a;
+    live_ += a;
+    return off;
+}
+
+void ArenaAllocator::deallocate(Offset /*off*/, Size bytes) {
+    // Bump arenas don't reuse individual slots; just drop the live count. When it hits 0 the block is
+    // fully dead and the BufferPool returns it to the pool; short of that, compaction reclaims the holes.
+    live_ -= round(bytes);
+}
+
 // ---------------- BlockPool ----------------
 
 BlockPool::BlockPool(std::byte* base, Size block_bytes, Size num_blocks, bool locked)
@@ -148,29 +166,54 @@ Result<BufferPool> BufferPool::create(Size total_bytes, Size block_bytes, Size m
     return BufferPool(std::move(*bp), min_alloc);
 }
 
-std::optional<BufferPool::Region> BufferPool::allocate(std::uint32_t bytes) {
+std::optional<BufferPool::Region> BufferPool::allocate(std::uint32_t bytes, Size min_alloc) {
     if (bytes == 0 || static_cast<Size>(bytes) > blocks_.block_bytes()) return std::nullopt;
+    const bool small = min_alloc < kDeviceBlock; // small heads never DMA -> byte-granular bump arena;
+                                                 // large heads stay buddy (power-of-two, O_DIRECT-aligned)
 
+    // Reuse a same-class block: a block's kind/class is fixed on first use (ADR-0008), so small
+    // (packed, compactable) and large (aligned) heads never share a block.
     for (unsigned b = 0; b < arenas_.size(); ++b) {
-        if (!arenas_[b]) continue;
-        if (const auto off = arenas_[b]->allocate(bytes)) {
+        std::optional<Offset> off;
+        if (small) {
+            if (auto* ar = std::get_if<ArenaAllocator>(&arenas_[b]); ar && ar->align() == min_alloc)
+                off = ar->allocate(bytes);
+        } else {
+            if (auto* bd = std::get_if<BuddyAllocator>(&arenas_[b]); bd && bd->min_block() == min_alloc)
+                off = bd->allocate(bytes);
+        }
+        if (off) {
             const auto o = static_cast<std::uint32_t>(*off);
             return Region{b, o, bytes, addr(b, o)};
         }
     }
+
     const auto blk = blocks_.acquire();
     if (!blk) return std::nullopt; // RAM full
-    arenas_[*blk].emplace(blocks_.block_bytes(), min_alloc_);
-    const auto off = arenas_[*blk]->allocate(bytes); // fresh arena, bytes <= block -> succeeds
+    std::optional<Offset> off;
+    if (small)
+        off = arenas_[*blk].emplace<ArenaAllocator>(blocks_.block_bytes(), min_alloc).allocate(bytes);
+    else
+        off = arenas_[*blk].emplace<BuddyAllocator>(blocks_.block_bytes(), min_alloc).allocate(bytes);
+    if (!off) { arenas_[*blk] = std::monostate{}; blocks_.release(*blk); return std::nullopt; } // no fit
     const auto o = static_cast<std::uint32_t>(*off);
     return Region{*blk, o, bytes, addr(*blk, o)};
 }
 
 void BufferPool::deallocate(unsigned block, std::uint32_t offset, std::uint32_t bytes) {
-    if (block >= arenas_.size() || !arenas_[block]) return;
-    arenas_[block]->deallocate(offset, bytes);
-    if (arenas_[block]->used() == 0) {
-        arenas_[block].reset();
+    if (block >= arenas_.size()) return;
+    bool empty = false;
+    if (auto* ar = std::get_if<ArenaAllocator>(&arenas_[block])) {
+        ar->deallocate(offset, bytes);
+        empty = ar->used() == 0;
+    } else if (auto* bd = std::get_if<BuddyAllocator>(&arenas_[block])) {
+        bd->deallocate(offset, bytes);
+        empty = bd->used() == 0;
+    } else {
+        return; // monostate: block not in use
+    }
+    if (empty) { // fully dead -> hand the block back to the pool
+        arenas_[block] = std::monostate{};
         blocks_.release(block);
     }
 }

@@ -56,6 +56,7 @@ void print_help() {
         "usage: goblin-store [options]\n"
         "  --memory SIZE       RAM budget, mlock'd (e.g. 4G, 512M)   [default 1G]\n"
         "  --block SIZE        RAM block size, power of two          [default 1M]\n"
+        "  --small-min-alloc SIZE  RAM min-order for <=ram-head heads [default 16]\n"
         "  --ssd-dir DIR       SSD pool directory (repeatable, >=1 required)\n"
         "  --hdd-dir DIR       HDD cold-pool directory (repeatable; enables 3-layer)\n"
         "  --ram-head SIZE     per-object RAM head                   [default 256K]\n"
@@ -132,14 +133,15 @@ int main(int argc, char** argv) {
         else if (a == "--tls-cert")  { auto v = take(a); if (!v) return 2; cfg.tls_cert_paths.emplace_back(*v); }
         else if (a == "--tls-key")   { auto v = take(a); if (!v) return 2; cfg.tls_key_paths.emplace_back(*v); }
         else if (a == "--https-port") { auto v = take(a); if (!v) return 2; auto p = parse_int<std::uint16_t>(*v); if (!p) { bad("port", *v); return 2; } cfg.https_port = *p; }
-        else if (a == "--memory" || a == "--block" || a == "--ram-head" || a == "--ssd-prefix" || a == "--io-chunk") {
+        else if (a == "--memory" || a == "--block" || a == "--ram-head" || a == "--ssd-prefix" || a == "--io-chunk" || a == "--small-min-alloc") {
             auto v = take(a); if (!v) return 2;
             auto s = parse_size(*v); if (!s) { bad("size", *v); return 2; }
-            if (a == "--memory")          cfg.memory.total_bytes = *s;
-            else if (a == "--block")      cfg.memory.block_bytes = *s;
-            else if (a == "--ram-head")   cfg.tiers.ram_head = *s;
-            else if (a == "--ssd-prefix") cfg.tiers.ssd_prefix = *s;
-            else                          cfg.io_chunk_bytes = *s;
+            if (a == "--memory")               cfg.memory.total_bytes = *s;
+            else if (a == "--block")           cfg.memory.block_bytes = *s;
+            else if (a == "--ram-head")        cfg.tiers.ram_head = *s;
+            else if (a == "--ssd-prefix")      cfg.tiers.ssd_prefix = *s;
+            else if (a == "--small-min-alloc") cfg.memory.small_min_alloc = *s;
+            else                               cfg.io_chunk_bytes = *s;
         }
         else if (a == "--memcache-port" || a == "--http-port") {
             auto v = take(a); if (!v) return 2;
