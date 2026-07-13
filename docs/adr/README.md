@@ -21,7 +21,7 @@ these are decisions of record, not laws.
 | [0013](0013-ephemeral-wipe-on-start.md) | Ephemeral v1: no persistence, wipe-on-start (dedicated subdir + marker guard) | Accepted |
 | [0014](0014-keyless-digest-identity.md) | Keyless identity: client keys → 256-bit SHA-256 digest as the internal ID | Accepted |
 | [0015](0015-http-key-derivation.md) | HTTP key derivation: path vs virtual-host mode; `--source` directory preloader | Accepted |
-| [0016](0016-bounded-locked-memory.md) | Bounded, locked total memory: RSS ≈ `--memory` (streaming I/O from the pool) | Accepted (partial) |
+| [0016](0016-bounded-locked-memory.md) | Bounded, locked memory: local `--memory`, optional per-node `--sub-memory`, fixed streaming pools | Accepted (partial) |
 | [0017](0017-buffer-taxonomy.md) | Buffer taxonomy: fixed head pool vs small streaming I/O pool; zero-copy head send | Accepted |
 
 See [`../ARCHITECTURE.md`](../ARCHITECTURE.md) for the readable overview that ties these together.

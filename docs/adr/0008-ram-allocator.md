@@ -7,12 +7,14 @@ RAM is a sized latency tool, not a savings tool. We want fixed, bounded,
 fragmentation-resistant RAM that also doubles as the io_uring **registered-buffer** region.
 
 ## Decision
-- RAM is **one preallocated array of equal-size blocks**; block size is a **power of two**
-  (operator-configured). Whole-block allocation/free is O(1) via a free-list.
+- RAM is **one preallocated virtual array of equal-size blocks**; block size is a **power of two**
+  (operator-configured). The array has one ordered free-list per NUMA region. Whole-block
+  allocation/free is O(1) within a region, and regions are searched local-first.
 - Allocations **smaller than a block** take one block and run **buddy allocation inside it**
   (power-of-two sub-blocks down to a minimum order); split/merge is O(log).
-- The block array is a single large region whose total size is a **fixed,
-  command-line-specified amount** — RAM is a sized latency tool, it never grows. The region is
+- The block array has a **fixed, command-line-specified size** — RAM is a sized latency tool, it
+  never grows. Without subordinate memory its size is `--memory`; with explicit NUMA placement it is
+  `--memory + (other online nodes × --sub-memory)`. The range is
   **`mlock`ed / `MAP_LOCKED` — never swapped** (never page the fast head out to the very disk
   we're trying to avoid), prefers hugepages (THP / `MAP_HUGETLB`), and is **registered once
   with io_uring as a fixed buffer** so reads DMA straight into it. The arena is **aligned to the
@@ -28,6 +30,19 @@ fragmentation-resistant RAM that also doubles as the io_uring **registered-buffe
 ## Consequences
 - ➕ Bounded, predictable RAM (no unbounded growth); zero-copy into registered buffers; lock-light per core.
 - ➖ Internal fragmentation up to the buddy min-order — mitigated by sizing blocks/orders to the workload.
+
+## Revision (2026-07): local-first NUMA regions
+
+`--numa NODE` makes that node local to the serving threads. `--memory` bytes are mapped there;
+optional `--sub-memory` maps that many bytes on every other online node. `--sub-memory` is invalid
+without explicit `--numa`, because automatic NIC selection is intentionally not enough authority to
+commit memory across the entire machine.
+
+The allocator reserves one contiguous virtual range, applies a strict physical-node
+`mbind(MPOL_BIND | MPOL_F_STATIC_NODES)` policy to each local/foreign subrange, then `mlock`s the
+whole range. Region zero is local. Allocation searches compatible local arenas and unused local
+blocks before visiting foreign regions. Separate per-region free lists preserve that ordering even
+when local and foreign blocks are returned in an arbitrary order.
 
 ## Revision (2026-07): per-class allocators — buddy for large heads, byte-granular arena for small
 

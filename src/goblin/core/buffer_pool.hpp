@@ -3,8 +3,8 @@
 //   * BuddyAllocator — subdivides ONE power-of-two arena into power-of-two sub-blocks. It is
 //     offset-based and memory-free, so it can sit over any real block and be unit-tested with
 //     no allocation at all.
-//   * BlockPool — owns one aligned, optionally mlock'd region of equal blocks; O(1) whole-block
-//     acquire/release. This region is the future io_uring fixed-buffer pool (ADR-0002).
+//   * BlockPool — owns one aligned, optionally mlock'd virtual range of equal blocks. The range may
+//     be split into local-first NUMA regions, each with its own Linux memory policy.
 #pragma once
 
 #include "goblin/common/error.hpp"
@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <span>
 #include <variant>
 #include <vector>
 
@@ -70,34 +71,60 @@ private:
     Size live_ = 0;     // sum of live slot sizes (rounded); block is reclaimable when this hits 0
 };
 
+// One contiguous part of a BlockPool. Regions are ordered by allocation preference. A NUMA node
+// applies MPOL_BIND to that virtual range; nullopt is useful for the ordinary allocator and tests.
+struct BlockPoolRegion {
+    Size bytes = 0;
+    std::optional<unsigned> numa_node;
+};
+
 class BlockPool {
 public:
     static Result<BlockPool> create(Size block_bytes, Size num_blocks, bool lock_memory);
+    static Result<BlockPool> create_regions(Size block_bytes,
+                                            std::span<const BlockPoolRegion> regions,
+                                            bool lock_memory);
     ~BlockPool();
     BlockPool(BlockPool&&) noexcept;
     BlockPool& operator=(BlockPool&&) noexcept;
     BlockPool(const BlockPool&) = delete;
     BlockPool& operator=(const BlockPool&) = delete;
 
-    std::optional<unsigned> acquire(); // index of a free block, or nullopt if exhausted
+    std::optional<unsigned> acquire(); // first free block from the highest-priority nonempty region
+    std::optional<unsigned> acquire_from_region(std::size_t region);
     void release(unsigned index);
     std::byte* block_data(unsigned index) const noexcept;
 
     Size block_bytes() const noexcept { return block_bytes_; }
     Size num_blocks() const noexcept { return num_blocks_; }
-    Size free_blocks() const noexcept { return free_.size(); }
+    Size free_blocks() const noexcept { return free_blocks_; }
     std::byte* data() const noexcept { return base_; }
     bool locked() const noexcept { return locked_; }
+    std::size_t region_count() const noexcept { return regions_.size(); }
+    unsigned region_first_block(std::size_t region) const noexcept;
+    unsigned region_end_block(std::size_t region) const noexcept;
+    std::optional<unsigned> region_numa_node(std::size_t region) const noexcept;
 
 private:
-    BlockPool(std::byte* base, Size block_bytes, Size num_blocks, bool locked);
+    struct FreeRegion {
+        unsigned first_block = 0;
+        unsigned end_block = 0; // exclusive
+        std::optional<unsigned> numa_node;
+        std::vector<unsigned> free;
+    };
+
+    BlockPool(std::byte* base, Size block_bytes, Size num_blocks, bool locked, bool mapped,
+              Size mapped_bytes, std::vector<FreeRegion> regions);
     void destroy() noexcept;
 
     std::byte* base_ = nullptr;
     Size block_bytes_ = 0;
     Size num_blocks_ = 0;
+    Size free_blocks_ = 0;
     bool locked_ = false;
-    std::vector<unsigned> free_; // stack of free block indices
+    bool mapped_ = false;
+    Size mapped_bytes_ = 0;
+    std::vector<FreeRegion> regions_;
 };
 
 // Allocator facade over the block pool (ADR-0008): hands out sub-block buffers via buddy
@@ -107,6 +134,8 @@ class BufferPool {
 public:
     static Result<BufferPool> create(Size total_bytes, Size block_bytes, Size min_alloc,
                                      bool lock_memory);
+    static Result<BufferPool> create_regions(std::span<const BlockPoolRegion> regions,
+                                             Size block_bytes, Size min_alloc, bool lock_memory);
 
     struct Region {
         unsigned block = 0;       // BlockPool block index

@@ -333,7 +333,10 @@ void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
 
 Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
              const std::atomic<bool>& shutdown) {
-    unsigned n = cfg.cores ? cfg.cores : std::thread::hardware_concurrency();
+    // main() binds itself before calling serve(), so every thread created below inherits the
+    // selected NUMA node's CPU mask. Direct library callers may leave numa_cpus unresolved.
+    unsigned n = cfg.cores ? cfg.cores : static_cast<unsigned>(cfg.numa_cpus.size());
+    if (n == 0) n = std::thread::hardware_concurrency();
     if (n == 0) n = 1;
     std::vector<std::thread> workers;
     int blocking_lfd = -1; // shared listener for blocking-mode memcache; closed after join

@@ -8,6 +8,15 @@ Status validate(const ServerConfig& c) {
         return err(Errc::invalid_argument, "memory.block_bytes must be a power of two >= 4 KiB");
     if (m.total_bytes < m.block_bytes)
         return err(Errc::invalid_argument, "memory.total_bytes must be >= block size");
+    if (m.total_bytes % m.block_bytes != 0)
+        return err(Errc::invalid_argument, "--memory must be a multiple of --block");
+    if (m.sub_bytes > 0) {
+        if (!c.numa_node)
+            return err(Errc::invalid_argument, "--sub-memory requires an explicit --numa NODE");
+        if (m.sub_bytes < m.block_bytes || m.sub_bytes % m.block_bytes != 0)
+            return err(Errc::invalid_argument,
+                       "--sub-memory must be at least one --block and a multiple of --block");
+    }
     if (!is_power_of_two(m.small_min_alloc) || m.small_min_alloc < 8 || m.small_min_alloc > m.block_bytes)
         return err(Errc::invalid_argument, "memory.small_min_alloc must be a power of two in [8, block_bytes]");
 

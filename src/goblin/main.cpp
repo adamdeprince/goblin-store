@@ -7,6 +7,7 @@
 #include "goblin/core/reactor.hpp"
 #include "goblin/http/key_derivation.hpp"
 #include "goblin/http/source_loader.hpp"
+#include "goblin/net/numa.hpp"
 #include "goblin/protocol/memcache/server.hpp"
 #include "goblin/storage/pool_dir.hpp"
 
@@ -14,9 +15,11 @@
 #include <charconv>
 #include <csignal>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <print>
 #include <span>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -38,6 +41,7 @@ std::optional<Size> parse_size(std::string_view s) {
     const char* end = s.data() + s.size();
     auto [p, ec] = std::from_chars(s.data(), end, v);
     if (ec != std::errc{} || p != end) return std::nullopt;
+    if (v > std::numeric_limits<Size>::max() / mult) return std::nullopt;
     return v * mult;
 }
 
@@ -50,11 +54,19 @@ std::optional<T> parse_int(std::string_view s) {
     return v;
 }
 
+std::string format_size(Size bytes) {
+    if (bytes % GiB == 0) return std::to_string(bytes / GiB) + " GiB";
+    if (bytes % MiB == 0) return std::to_string(bytes / MiB) + " MiB";
+    if (bytes % KiB == 0) return std::to_string(bytes / KiB) + " KiB";
+    return std::to_string(bytes) + " B";
+}
+
 void print_help() {
     std::println(
         "goblin-store — large-object tiered cache / HTTP object server (scaffold)\n"
         "usage: goblin-store [options]\n"
-        "  --memory SIZE       RAM budget, mlock'd (e.g. 4G, 512M)   [default 1G]\n"
+        "  --memory SIZE       local NUMA head RAM, mlock'd          [default 1G]\n"
+        "  --sub-memory SIZE   RAM on each non-local NUMA node       [requires --numa]\n"
         "  --block SIZE        RAM block size, power of two          [default 1M]\n"
         "  --small-min-alloc SIZE  RAM min-order for <=ram-head heads [default 16]\n"
         "  --ssd-dir DIR       SSD pool directory (repeatable, >=1 required)\n"
@@ -66,7 +78,8 @@ void print_help() {
         "  --io-timeout MS     drop a stalled transfer (slow client) [default 30000, 0=off]\n"
         "  --memcache-port N   memcache/TCP port                     [default 11211]\n"
         "  --http-port N       HTTP port                             [default 8080]\n"
-        "  --cores N           worker cores, 0=all                   [default 0]\n"
+        "  --cores N           workers/protocol, 0=node CPU count    [default 0]\n"
+        "  --numa NODE         bind all threads to this NUMA node    [default listener NIC]\n"
         "  --source DIR        preload a directory tree at startup (repeatable)\n"
         "  --http-vhost        HTTP key = Host + URI (default: key = URI path)\n"
         "  --key-on-query      include the query string in the key (default: strip)\n"
@@ -133,10 +146,14 @@ int main(int argc, char** argv) {
         else if (a == "--tls-cert")  { auto v = take(a); if (!v) return 2; cfg.tls_cert_paths.emplace_back(*v); }
         else if (a == "--tls-key")   { auto v = take(a); if (!v) return 2; cfg.tls_key_paths.emplace_back(*v); }
         else if (a == "--https-port") { auto v = take(a); if (!v) return 2; auto p = parse_int<std::uint16_t>(*v); if (!p) { bad("port", *v); return 2; } cfg.https_port = *p; }
-        else if (a == "--memory" || a == "--block" || a == "--ram-head" || a == "--ssd-prefix" || a == "--io-chunk" || a == "--small-min-alloc") {
+        else if (a == "--memory" || a == "--sub-memory" || a == "--block" || a == "--ram-head" || a == "--ssd-prefix" || a == "--io-chunk" || a == "--small-min-alloc") {
             auto v = take(a); if (!v) return 2;
             auto s = parse_size(*v); if (!s) { bad("size", *v); return 2; }
             if (a == "--memory")               cfg.memory.total_bytes = *s;
+            else if (a == "--sub-memory") {
+                if (*s == 0) { bad("sub-memory", *v); return 2; }
+                cfg.memory.sub_bytes = *s;
+            }
             else if (a == "--block")           cfg.memory.block_bytes = *s;
             else if (a == "--ram-head")        cfg.tiers.ram_head = *s;
             else if (a == "--ssd-prefix")      cfg.tiers.ssd_prefix = *s;
@@ -152,6 +169,11 @@ int main(int argc, char** argv) {
             auto v = take(a); if (!v) return 2;
             auto n = parse_int<unsigned>(*v); if (!n) { bad("cores", *v); return 2; }
             cfg.cores = *n;
+        }
+        else if (a == "--numa") {
+            auto v = take(a); if (!v) return 2;
+            auto n = parse_int<unsigned>(*v); if (!n) { bad("NUMA node", *v); return 2; }
+            cfg.numa_node = *n;
         }
         else if (a == "--net") {
             auto v = take(a); if (!v) return 2;
@@ -179,10 +201,44 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Bind before allocating any pools. Local transient pools first-touch on this node; the head
+    // arena receives explicit per-range NUMA policies below. Every subsequently-created worker and
+    // maintenance thread inherits the same local-node CPU mask.
+    auto numa = net::configure_numa(cfg.numa_node);
+    if (!numa) {
+        std::println(stderr, "numa error: {}", numa.error().detail);
+        return 1;
+    }
+    cfg.numa_node = numa->node;
+    cfg.numa_cpus = numa->cpus;
+    auto memory_plan = net::plan_numa_memory(numa->node, numa->online_nodes,
+                                             cfg.memory.total_bytes, cfg.memory.sub_bytes);
+    if (!memory_plan) {
+        std::println(stderr, "numa memory error: {}", memory_plan.error().detail);
+        return 1;
+    }
+    cfg.memory.numa_regions.clear();
+    cfg.memory.numa_regions.reserve(memory_plan->size());
+    for (const auto& region : *memory_plan)
+        cfg.memory.numa_regions.push_back({region.node, region.bytes});
+
     std::println("┌─ goblin-store 0.0.1 ─────────────────────────");
     std::println("│ mode        : {}", cfg.three_layer() ? "3-layer (RAM+SSD+HDD)" : "2-layer (RAM+SSD)");
-    std::println("│ RAM budget  : {} MiB (block {} KiB, mlock={})",
-                 cfg.memory.total_bytes / MiB, cfg.memory.block_bytes / KiB, cfg.memory.lock_memory);
+    std::println("│ RAM local   : {} on NUMA node {}", format_size(cfg.memory.total_bytes),
+                 numa->node);
+    if (cfg.memory.sub_bytes > 0) {
+        const Size foreign_nodes = cfg.memory.numa_regions.size() - 1;
+        std::vector<unsigned> node_ids;
+        node_ids.reserve(static_cast<std::size_t>(foreign_nodes));
+        for (std::size_t i = 1; i < cfg.memory.numa_regions.size(); ++i)
+            node_ids.push_back(cfg.memory.numa_regions[i].node);
+        std::println("│ RAM foreign : {}/node on NUMA nodes {} ({} total)",
+                     format_size(cfg.memory.sub_bytes), net::format_cpu_list(node_ids),
+                     format_size(cfg.memory.sub_bytes * foreign_nodes));
+    }
+    std::println("│ RAM total   : {} (block {} KiB, mlock={})",
+                 format_size(cfg.memory.arena_bytes()), cfg.memory.block_bytes / KiB,
+                 cfg.memory.lock_memory);
     std::println("│ ram_head    : {} KiB / object", cfg.tiers.ram_head / KiB);
     std::println("│ ssd_prefix  : {} MiB / object", cfg.tiers.ssd_prefix / MiB);
     std::println("│ ssd pool    : {} drive(s), stripe {} KiB", cfg.ssd.dirs.size(), cfg.ssd.stripe_unit / KiB);
@@ -194,9 +250,20 @@ int main(int argc, char** argv) {
     std::println("│ https       : {}", cfg.enable_https ? ":" + std::to_string(cfg.https_port)
                                                          : std::string("off"));
     std::println("│ io backend  : {}", GOBLIN_HAVE_URING ? "io_uring (available)" : "stub (no liburing)");
-    std::println("│ net         : {}, {} workers",
+    std::println("│ net         : {}, {} workers/protocol",
                  cfg.net == NetMode::async ? "async (io_uring loop)" : "blocking (thread-per-core)",
-                 cfg.cores ? std::to_string(cfg.cores) : std::string("auto"));
+                 cfg.cores ? std::to_string(cfg.cores)
+                           : std::to_string(cfg.numa_cpus.size()) + " (node CPUs)");
+    std::println("│ numa        : node {} ({}), CPUs {}", numa->node,
+                 numa->automatic ? "automatic" : "explicit --numa",
+                 net::format_cpu_list(numa->cpus));
+    if (numa->automatic) {
+        for (const auto& nic : numa->interfaces) {
+            std::println("│ listener NIC: {} {} -> {}", nic.name, nic.address,
+                         nic.numa_node ? "NUMA node " + std::to_string(*nic.numa_node)
+                                       : std::string("NUMA node unknown"));
+        }
+    }
     std::println("│ io bufs     : {} x {} KiB / worker, stall timeout {}", cfg.io_buffers,
                  cfg.io_chunk_bytes / KiB,
                  cfg.io_timeout_ms ? std::to_string(cfg.io_timeout_ms) + "ms" : std::string("off"));

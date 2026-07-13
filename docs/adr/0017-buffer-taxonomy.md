@@ -23,7 +23,9 @@ and treating them the same is what makes the current GET allocate (and copy) a w
   I/O pool, each sent as read, head-first ([ADR-0006](0006-positional-tiering-pipeline.md)), never
   buffering the whole value. SET = stream socket→disk in chunks. RAM per transfer ≈ a few chunks,
   independent of object size.
-- `--memory` = head pool (bulk) + small I/O pool, both `mlock`'d ⇒ total locked `= --memory`
+- `--memory` sizes the local head pool; `--sub-memory` optionally adds head blocks on every foreign
+  NUMA node. Small I/O pools are separately bounded by `--io-chunk × --io-buffers` per worker (plus
+  one write-staging pool). All are `mlock`'d unless `--no-mlock` is selected
   ([ADR-0016](0016-bounded-locked-memory.md)).
 
 ## Consequences

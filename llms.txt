@@ -12,8 +12,10 @@ latency at ~7× less RAM (working set fits RAM), and beats memcached+extstore on
 on the same spindle when the set spills to disk. For sub-2 KB values memcached's slab allocator wins, and
 the project says so — small objects are not its game.
 
-Built on **io_uring + O_DIRECT**, thread-per-core shared-nothing loops, **atomic copy-on-write publish**
-(readers never see a torn value), a buddy RAM-head allocator, and a bounded, mlock-able RAM budget.
+Built on **io_uring + O_DIRECT**, NUMA-bound thread-per-core shared-nothing loops, **atomic
+copy-on-write publish** (readers never see a torn value), a buddy RAM-head allocator, and bounded,
+mlock-able RAM arenas. NUMA placement is explicit with `--numa NODE` or inferred from listener NICs;
+explicit placement can add `--sub-memory SIZE` on every foreign node with local-first allocation.
 Working memcache + HTTP/HTTPS server; **115 unit tests pass under Release, ASan, and TSan**. Linux-only by
 design (no macOS io_uring/O_DIRECT analog; FreeBSD is a planned port). Trunk branch is `initial`.
 
@@ -38,7 +40,7 @@ design (no macOS io_uring/O_DIRECT analog; FreeBSD is a planned port). Trunk bra
 - [ADR-0013: Ephemeral by design — wipe-on-start, no persistence (v1)](docs/adr/0013-ephemeral-wipe-on-start.md)
 - [ADR-0014: Keyless internal identity — client keys hashed to a digest](docs/adr/0014-keyless-digest-identity.md)
 - [ADR-0015: HTTP key derivation — path vs virtual-host mode, and the `--source` preloader](docs/adr/0015-http-key-derivation.md)
-- [ADR-0016: Bounded, locked total memory (RSS ≈ `--memory`)](docs/adr/0016-bounded-locked-memory.md)
+- [ADR-0016: Bounded, locked memory across NUMA regions](docs/adr/0016-bounded-locked-memory.md)
 - [ADR-0017: Buffer taxonomy — fixed head pool vs small streaming I/O pool; zero-copy head](docs/adr/0017-buffer-taxonomy.md)
 - [ADR-0018: Concurrency — thread-per-core network, shared locked storage](docs/adr/0018-concurrency-model.md)
 

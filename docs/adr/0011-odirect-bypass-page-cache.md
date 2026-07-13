@@ -17,7 +17,8 @@ buffers. Goblin owns **caching** (mlock'd head cache), **read-ahead** (the pipel
 and **eviction** (multi-resource).
 
 ## Rationale
-- **Deterministic footprint:** total RAM == exactly the operator's `--memory`. The page cache
+- **Deterministic footprint:** head-cache RAM is exactly `--memory + (other NUMA nodes ×
+  --sub-memory)`, plus separately bounded streaming pools. The page cache
   would add *unbudgeted* RAM on top and evict unpredictably — breaking the "fixed amount" promise.
 - **No double-caching, no competition** with the mlock'd region; the kernel won't cache cold HDD
   tail bytes we stream once.

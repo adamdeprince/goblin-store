@@ -125,12 +125,22 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
                                       const EvictionConfig& ev, const PoolConfig& ssd,
                                       const PoolConfig& hdd, Index& index, Size io_chunk,
                                       unsigned write_buffers, bool direct_io) {
-    auto ram = core::BufferPool::create(mem.total_bytes, mem.block_bytes, kDeviceBlock,
-                                        mem.lock_memory);
+    auto make_ram = [&]() -> Result<core::BufferPool> {
+        if (mem.numa_regions.empty())
+            return core::BufferPool::create(mem.total_bytes, mem.block_bytes, kDeviceBlock,
+                                            mem.lock_memory);
+        std::vector<core::BlockPoolRegion> regions;
+        regions.reserve(mem.numa_regions.size());
+        for (const auto& region : mem.numa_regions)
+            regions.push_back({region.bytes, region.node});
+        return core::BufferPool::create_regions(regions, mem.block_bytes, kDeviceBlock,
+                                                mem.lock_memory);
+    };
+    auto ram = make_ram();
     if (!ram) return std::unexpected(ram.error());
 
     const std::size_t cap_hint =
-        t.ram_head ? static_cast<std::size_t>(mem.total_bytes / t.ram_head) : 1;
+        t.ram_head ? static_cast<std::size_t>(mem.arena_bytes() / t.ram_head) : 1;
     auto head_policy = make_eviction_policy(ev.policy, cap_hint);
     const std::size_t obj_cap =
         ev.max_ssd_objects ? static_cast<std::size_t>(ev.max_ssd_objects) : cap_hint;

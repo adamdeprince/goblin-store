@@ -115,11 +115,33 @@ ctest --test-dir build --output-on-failure
 ./build/goblin-store --memory 4G \
     --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool \
     --memcache-port 11211 --http-port 8080
+
+# Four NUMA nodes: 100 GiB on the serving/NIC-local node, 20 GiB on each of the other three.
+# Total head-cache capacity = 100 + (3 x 20) = 160 GiB.
+./build/goblin-store --numa 0 --memory 100G --sub-memory 20G \
+    --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool
 ```
 
 Key knobs (see `--help`): `--ram-head`, `--ssd-prefix` (positional tier sizes), `--io-buffers` /
 `--io-chunk` (bounded streaming RAM), `--eviction`, `--max-objects`, `--no-mlock` (dev), `--tls-cert`/
-`--tls-key` (HTTPS), `--source` (preload a directory tree).
+`--tls-key` (HTTPS), `--source` (preload a directory tree), `--numa NODE` (explicit NUMA
+placement), and `--sub-memory SIZE` (head-cache RAM on each non-local NUMA node).
+
+On Linux, Goblin Store binds the main thread before allocating its fixed RAM arenas; the worker and
+maintenance threads inherit that affinity, and `--cores 0` uses the number of CPUs available on the
+selected NUMA node as the worker count for each enabled protocol. Without `--numa`, the node is
+derived from the UP Ethernet interfaces covered by the wildcard listeners. If those interface
+addresses belong to different nodes—or locality is unknown on a multi-node host—startup stops and
+reports each Linux interface name, listening address, NUMA node, and the corresponding `--numa NODE`
+override.
+
+With explicit `--numa`, `--memory` is the head-cache budget on that local node. Optional
+`--sub-memory` adds the stated budget on **each** other online NUMA node and is rejected without an
+explicit `--numa`. Each arena range is bound to its physical node with Linux `mbind(MPOL_BIND)`. The
+allocator always searches local blocks first—including local blocks returned after foreign memory
+has been used—and falls through to foreign regions only when the local region cannot satisfy the
+allocation. Total head-cache capacity is `--memory + (other_nodes × --sub-memory)`; bounded streaming
+I/O pools remain additional per-worker memory.
 
 ## Layout
 ```

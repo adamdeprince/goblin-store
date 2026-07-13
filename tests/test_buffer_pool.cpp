@@ -2,6 +2,7 @@
 
 #include "goblin/core/buffer_pool.hpp"
 
+#include <array>
 #include <cstdint>
 
 using namespace goblin;
@@ -85,6 +86,36 @@ TEST("block_pool: release returns a block to the pool") {
     CHECK(p.acquire().has_value());
 }
 
+TEST("block_pool: region priority survives out-of-order releases") {
+    const std::array<BlockPoolRegion, 2> regions{{
+        {128 * KiB, std::nullopt}, // preferred/local: blocks 0-1
+        {128 * KiB, std::nullopt}, // subordinate: blocks 2-3
+    }};
+    auto pool = BlockPool::create_regions(64 * KiB, regions, false);
+    CHECK(pool.has_value());
+    if (!pool) return;
+    CHECK_EQ(pool->region_count(), std::size_t(2));
+
+    const auto local0 = pool->acquire();
+    const auto local1 = pool->acquire();
+    const auto foreign0 = pool->acquire();
+    CHECK(local0 && local1 && foreign0);
+    if (!(local0 && local1 && foreign0)) return;
+    CHECK_EQ(*local0, 0u);
+    CHECK_EQ(*local1, 1u);
+    CHECK_EQ(*foreign0, 2u);
+
+    pool->release(*local0);
+    pool->release(*foreign0); // released last, but must not jump ahead of a free local block
+    const auto reacquired_local = pool->acquire();
+    const auto reacquired_foreign = pool->acquire();
+    CHECK(reacquired_local && reacquired_foreign);
+    if (reacquired_local && reacquired_foreign) {
+        CHECK_EQ(*reacquired_local, *local0);
+        CHECK_EQ(*reacquired_foreign, *foreign0);
+    }
+}
+
 TEST("block_pool: rejects bad geometry") {
     CHECK(!BlockPool::create(1000, 4, false).has_value());   // not a power of two
     CHECK(!BlockPool::create(1 * KiB, 4, false).has_value()); // below the 4 KiB device block
@@ -125,6 +156,29 @@ TEST("buffer_pool: too-big alloc fails; exhaustion returns nullopt; free reuses 
 
     pool.deallocate(a->block, a->offset, a->len); // empties block 0 -> returned to pool
     CHECK(pool.allocate(64 * KiB, 4 * KiB).has_value());   // reused
+}
+
+TEST("buffer_pool: a freed local block wins over space in an existing foreign arena") {
+    const std::array<BlockPoolRegion, 2> regions{{
+        {64 * KiB, std::nullopt}, // one local block
+        {64 * KiB, std::nullopt}, // one foreign block
+    }};
+    auto poolr = BufferPool::create_regions(regions, 64 * KiB, 4 * KiB, false);
+    CHECK(poolr.has_value());
+    if (!poolr) return;
+    auto& pool = *poolr;
+
+    const auto local = pool.allocate(64 * KiB, 4 * KiB); // exhaust local region
+    const auto foreign = pool.allocate(32 * KiB, 4 * KiB); // opens a half-full foreign arena
+    CHECK(local && foreign);
+    if (!(local && foreign)) return;
+    CHECK_EQ(local->block, 0u);
+    CHECK_EQ(foreign->block, 1u);
+
+    pool.deallocate(local->block, local->offset, local->len); // local is available again
+    const auto next = pool.allocate(4 * KiB, 4 * KiB);
+    CHECK(next.has_value());
+    if (next) CHECK_EQ(next->block, 0u);
 }
 
 TEST("arena: byte-granular bump packing; dead accounting; drains to empty") {

@@ -63,3 +63,27 @@ TEST("config: rejects when no listener at all is enabled") {
     c.enable_https = false;
     CHECK(!validate(c).has_value());
 }
+
+TEST("config: --sub-memory requires an explicit --numa node") {
+    auto c = good_2layer();
+    c.memory.sub_bytes = 4 * GiB;
+    auto invalid = validate(c);
+    CHECK(!invalid.has_value());
+    if (!invalid)
+        CHECK(invalid.error().detail.find("--sub-memory requires an explicit --numa") !=
+              std::string::npos);
+
+    c.numa_node = 0;
+    CHECK(validate(c).has_value());
+}
+
+TEST("config: local and subordinate NUMA budgets contain whole blocks") {
+    auto c = good_2layer();
+    c.memory.total_bytes += 4 * KiB;
+    CHECK(!validate(c).has_value());
+
+    c.memory.total_bytes = 1 * GiB;
+    c.numa_node = 0;
+    c.memory.sub_bytes = 4 * KiB;
+    CHECK(!validate(c).has_value());
+}

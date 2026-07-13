@@ -117,11 +117,33 @@ ctest --test-dir build --output-on-failure
 ./build/goblin-store --memory 4G \
     --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool \
     --memcache-port 11211 --http-port 8080
+
+# Four NUMA nodes: 100 GiB on the serving/NIC-local node, 20 GiB on each of the other three.
+# Total head-cache capacity = 100 + (3 x 20) = 160 GiB.
+./build/goblin-store --numa 0 --memory 100G --sub-memory 20G \
+    --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool
 ```
 
 Key knobs (see `--help`): `--ram-head`, `--ssd-prefix` (positional tier sizes), `--io-buffers` /
 `--io-chunk` (bounded streaming RAM), `--eviction`, `--max-objects`, `--no-mlock` (dev), `--tls-cert`/
-`--tls-key` (HTTPS), `--source` (preload a directory tree).
+`--tls-key` (HTTPS), `--source` (preload a directory tree), `--numa NODE` (explicit NUMA
+placement), and `--sub-memory SIZE` (head-cache RAM on each non-local NUMA node).
+
+On Linux, Goblin Store binds the main thread before allocating its fixed RAM arenas; the worker and
+maintenance threads inherit that affinity, and `--cores 0` uses the number of CPUs available on the
+selected NUMA node as the worker count for each enabled protocol. Without `--numa`, the node is
+derived from the UP Ethernet interfaces covered by the wildcard listeners. If those interface
+addresses belong to different nodes—or locality is unknown on a multi-node host—startup stops and
+reports each Linux interface name, listening address, NUMA node, and the corresponding `--numa NODE`
+override.
+
+With explicit `--numa`, `--memory` is the head-cache budget on that local node. Optional
+`--sub-memory` adds the stated budget on **each** other online NUMA node and is rejected without an
+explicit `--numa`. Each arena range is bound to its physical node with Linux `mbind(MPOL_BIND)`. The
+allocator always searches local blocks first—including local blocks returned after foreign memory
+has been used—and falls through to foreign regions only when the local region cannot satisfy the
+allocation. Total head-cache capacity is `--memory + (other_nodes × --sub-memory)`; bounded streaming
+I/O pools remain additional per-worker memory.
 
 ## Layout
 ```
@@ -279,7 +301,7 @@ these are decisions of record, not laws.
 | [0013](0013-ephemeral-wipe-on-start.md) | Ephemeral v1: no persistence, wipe-on-start (dedicated subdir + marker guard) | Accepted |
 | [0014](0014-keyless-digest-identity.md) | Keyless identity: client keys → 256-bit SHA-256 digest as the internal ID | Accepted |
 | [0015](0015-http-key-derivation.md) | HTTP key derivation: path vs virtual-host mode; `--source` directory preloader | Accepted |
-| [0016](0016-bounded-locked-memory.md) | Bounded, locked total memory: RSS ≈ `--memory` (streaming I/O from the pool) | Accepted (partial) |
+| [0016](0016-bounded-locked-memory.md) | Bounded, locked memory: local `--memory`, optional per-node `--sub-memory`, fixed streaming pools | Accepted (partial) |
 | [0017](0017-buffer-taxonomy.md) | Buffer taxonomy: fixed head pool vs small streaming I/O pool; zero-copy head send | Accepted |
 
 See [`../ARCHITECTURE.md`](../ARCHITECTURE.md) for the readable overview that ties these together.
@@ -604,12 +626,14 @@ RAM is a sized latency tool, not a savings tool. We want fixed, bounded,
 fragmentation-resistant RAM that also doubles as the io_uring **registered-buffer** region.
 
 ## Decision
-- RAM is **one preallocated array of equal-size blocks**; block size is a **power of two**
-  (operator-configured). Whole-block allocation/free is O(1) via a free-list.
+- RAM is **one preallocated virtual array of equal-size blocks**; block size is a **power of two**
+  (operator-configured). The array has one ordered free-list per NUMA region. Whole-block
+  allocation/free is O(1) within a region, and regions are searched local-first.
 - Allocations **smaller than a block** take one block and run **buddy allocation inside it**
   (power-of-two sub-blocks down to a minimum order); split/merge is O(log).
-- The block array is a single large region whose total size is a **fixed,
-  command-line-specified amount** — RAM is a sized latency tool, it never grows. The region is
+- The block array has a **fixed, command-line-specified size** — RAM is a sized latency tool, it
+  never grows. Without subordinate memory its size is `--memory`; with explicit NUMA placement it is
+  `--memory + (other online nodes × --sub-memory)`. The range is
   **`mlock`ed / `MAP_LOCKED` — never swapped** (never page the fast head out to the very disk
   we're trying to avoid), prefers hugepages (THP / `MAP_HUGETLB`), and is **registered once
   with io_uring as a fixed buffer** so reads DMA straight into it. The arena is **aligned to the
@@ -625,6 +649,19 @@ fragmentation-resistant RAM that also doubles as the io_uring **registered-buffe
 ## Consequences
 - ➕ Bounded, predictable RAM (no unbounded growth); zero-copy into registered buffers; lock-light per core.
 - ➖ Internal fragmentation up to the buddy min-order — mitigated by sizing blocks/orders to the workload.
+
+## Revision (2026-07): local-first NUMA regions
+
+`--numa NODE` makes that node local to the serving threads. `--memory` bytes are mapped there;
+optional `--sub-memory` maps that many bytes on every other online node. `--sub-memory` is invalid
+without explicit `--numa`, because automatic NIC selection is intentionally not enough authority to
+commit memory across the entire machine.
+
+The allocator reserves one contiguous virtual range, applies a strict physical-node
+`mbind(MPOL_BIND | MPOL_F_STATIC_NODES)` policy to each local/foreign subrange, then `mlock`s the
+whole range. Region zero is local. Allocation searches compatible local arenas and unused local
+blocks before visiting foreign regions. Separate per-region free lists preserve that ordering even
+when local and foreign blocks are returned in an arbitrary order.
 
 
 -------------------------------------------------------------------------------
@@ -787,7 +824,8 @@ buffers. Goblin owns **caching** (mlock'd head cache), **read-ahead** (the pipel
 and **eviction** (multi-resource).
 
 ## Rationale
-- **Deterministic footprint:** total RAM == exactly the operator's `--memory`. The page cache
+- **Deterministic footprint:** head-cache RAM is exactly `--memory + (other NUMA nodes ×
+  --sub-memory)`, plus separately bounded streaming pools. The page cache
   would add *unbudgeted* RAM on top and evict unpredictably — breaking the "fixed amount" promise.
 - **No double-caching, no competition** with the mlock'd region; the kernel won't cache cold HDD
   tail bytes we stream once.
@@ -1018,20 +1056,23 @@ component *is* the host.
 source: docs/adr/0016-bounded-locked-memory.md
 -------------------------------------------------------------------------------
 
-# ADR-0016: Bounded, locked total memory (RSS ≈ `--memory`)
+# ADR-0016: Bounded, locked memory across NUMA regions
 
 **Status:** Accepted (2026-06-09) — invariant; **partially implemented** (see status below).
 
 ## Context
-Operator requirement: specify a memory budget (`--memory`), have it **locked** (no swap of the
-hot head), and **never OOM**. RAM is a sized latency tool ([ADR-0008](0008-ram-allocator.md)) — its
-footprint must be a hard, predictable cap, not best-effort.
+Operator requirement: specify a local head-cache budget (`--memory`), optionally add a smaller
+budget on each foreign NUMA node (`--sub-memory`), have it **locked** (no swap of the hot head), and
+**never OOM**. RAM is a sized latency tool ([ADR-0008](0008-ram-allocator.md)) — its footprint must
+be a hard, predictable cap, not best-effort.
 
 ## Decision
-- **The one `mlock`'d `BufferPool` (`--memory`) is the only home for large/streaming RAM:** RAM
-  heads **and** all I/O chunk buffers (SET ingest, GET egress, read-ahead staging). Allocation from
-  it is bounded; when full → **backpressure** ([ADR-0006](0006-positional-tiering-pipeline.md)),
-  never heap growth.
+- **The `mlock`'d head `BufferPool` is fixed:** `--memory` bytes on the explicit/automatic local NUMA
+  node, plus `--sub-memory` bytes on every other online node when explicitly requested. The latter
+  requires `--numa NODE`. Head allocation is local-first, then foreign, and never grows.
+- **Streaming I/O pools are separate and fixed:** read pools are `--io-chunk × --io-buffers` per
+  worker; one write-staging pool uses the same geometry. Pool exhaustion produces backpressure
+  ([ADR-0006](0006-positional-tiering-pipeline.md)), never heap growth.
 - **No operation buffers a whole object.** SET streams socket→disk in fixed chunks; GET streams
   disk→socket head-first in fixed chunks. RAM per transfer = a few pool chunks, *independent of
   object size* (so a 1 GB GET/SET uses a handful of chunks, not 1 GB).
@@ -1039,15 +1080,18 @@ footprint must be a hard, predictable cap, not best-effort.
   so its size is `O(count_limit)`. Locking the pool already covers the latency-critical data (heads
   + buffers never swap); the index is bounded-by-count and may be locked later if needed.
 - **Connection state uses bounded fixed buffers** (cap the command line; stream the body).
-- Size `--memory` below physical RAM ⇒ the locked pool can't swap, everything else is bounded ⇒
-  **no OOM**. Result: `RSS ≈ --memory + bounded index + small fixed overhead`.
+- Size every node budget below the corresponding physical RAM and reserve room for I/O pools and
+  metadata ⇒ the locked pools cannot swap and all growth is bounded. Head-cache capacity is exactly
+  `--memory + (other_nodes × --sub-memory)`.
 
 ## Consequences
-- ➕ Hard, predictable footprint; the `mlock`'d pool never swaps (no major-fault latency on the head); no OOM when `--memory` is sized with headroom.
+- ➕ Hard, predictable footprint; the `mlock`'d pools never swap; local heads stay local until that
+  region is exhausted; no OOM when every node is sized with headroom.
 - ➖ Requires **streaming I/O everywhere** (no whole-value buffers) and enforcing the index count-bound.
 
 ## Implementation status (2026-06-10)
-- ✅ Fixed, `mlock`'d pool backs the RAM-head cache, **bounded by S3-FIFO eviction** (ADR-0007/0012).
+- ✅ Fixed, `mlock`'d, per-NUMA-region pool backs the RAM-head cache, with strict local-first
+  allocation and **S3-FIFO eviction** (ADR-0007/0012).
 - ✅ **Streaming GET** (head zero-copy + chunked egress) and **streaming SET** (chunked ingest) —
   no whole-value buffers; RAM per transfer = O(chunk).
 - ✅ **Object-count bound** (`--max-objects`) caps the index/store via whole-object eviction + unlink.
@@ -1084,7 +1128,9 @@ and treating them the same is what makes the current GET allocate (and copy) a w
   I/O pool, each sent as read, head-first ([ADR-0006](0006-positional-tiering-pipeline.md)), never
   buffering the whole value. SET = stream socket→disk in chunks. RAM per transfer ≈ a few chunks,
   independent of object size.
-- `--memory` = head pool (bulk) + small I/O pool, both `mlock`'d ⇒ total locked `= --memory`
+- `--memory` sizes the local head pool; `--sub-memory` optionally adds head blocks on every foreign
+  NUMA node. Small I/O pools are separately bounded by `--io-chunk × --io-buffers` per worker (plus
+  one write-staging pool). All are `mlock`'d unless `--no-mlock` is selected
   ([ADR-0016](0016-bounded-locked-memory.md)).
 
 ## Consequences
@@ -1110,9 +1156,18 @@ The v1 server is a blocking, single-connection loop — correct, but it caps thr
 in-flight request. Throughput is the headline benchmark vs memcached extstore.
 
 ## Decision
-- **Thread-per-core.** N worker threads (`--cores`, default = hardware concurrency), each with its
-  own io_uring `Reactor` + I/O-buffer pool. A connection is served end-to-end on its accepting core
-  — no cross-core byte movement (ADR-0001).
+- **Thread-per-core.** N worker threads per enabled protocol (`--cores`; zero means the CPU count
+  available on the selected NUMA node), each with its own io_uring `Reactor` + I/O-buffer pool. A
+  connection is served end-to-end on its accepting core — no cross-core byte movement (ADR-0001).
+  - **NUMA affinity before allocation.** `--numa NODE` selects a node explicitly. Otherwise the node
+    comes from the Linux NUMA locality of the UP Ethernet interfaces reached by the wildcard IPv4
+    listeners. Interfaces on different nodes, an unknown interface locality on a multi-node host,
+    or no discoverable listening interface make startup fail with every interface name, address,
+    node, and usable `--numa NODE` command. The main thread is bound before the fixed head and
+    write-staging arenas are allocated; all worker and TTL-reaper threads inherit its affinity.
+    With explicit `--numa`, `--memory` is strictly bound to that local node and `--sub-memory` may
+    add an equal-sized subordinate region on every other online node. Automatic NUMA selection may
+    not use `--sub-memory`. Head allocation exhausts the local region before visiting foreign ones.
   - **Blocking interim: one shared listen socket.** All workers `accept()` from a single listener so
     the kernel hands each new connection to a *free* worker. Per-core `SO_REUSEPORT` listeners are
     wrong here: SO_REUSEPORT pins a connection to a fixed listener by 4-tuple hash, so when two

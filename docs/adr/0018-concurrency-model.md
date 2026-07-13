@@ -7,9 +7,18 @@ The v1 server is a blocking, single-connection loop — correct, but it caps thr
 in-flight request. Throughput is the headline benchmark vs memcached extstore.
 
 ## Decision
-- **Thread-per-core.** N worker threads (`--cores`, default = hardware concurrency), each with its
-  own io_uring `Reactor` + I/O-buffer pool. A connection is served end-to-end on its accepting core
-  — no cross-core byte movement (ADR-0001).
+- **Thread-per-core.** N worker threads per enabled protocol (`--cores`; zero means the CPU count
+  available on the selected NUMA node), each with its own io_uring `Reactor` + I/O-buffer pool. A
+  connection is served end-to-end on its accepting core — no cross-core byte movement (ADR-0001).
+  - **NUMA affinity before allocation.** `--numa NODE` selects a node explicitly. Otherwise the node
+    comes from the Linux NUMA locality of the UP Ethernet interfaces reached by the wildcard IPv4
+    listeners. Interfaces on different nodes, an unknown interface locality on a multi-node host,
+    or no discoverable listening interface make startup fail with every interface name, address,
+    node, and usable `--numa NODE` command. The main thread is bound before the fixed head and
+    write-staging arenas are allocated; all worker and TTL-reaper threads inherit its affinity.
+    With explicit `--numa`, `--memory` is strictly bound to that local node and `--sub-memory` may
+    add an equal-sized subordinate region on every other online node. Automatic NUMA selection may
+    not use `--sub-memory`. Head allocation exhausts the local region before visiting foreign ones.
   - **Blocking interim: one shared listen socket.** All workers `accept()` from a single listener so
     the kernel hands each new connection to a *free* worker. Per-core `SO_REUSEPORT` listeners are
     wrong here: SO_REUSEPORT pins a connection to a fixed listener by 4-tuple hash, so when two

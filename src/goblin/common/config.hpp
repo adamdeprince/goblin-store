@@ -5,6 +5,7 @@
 #include "goblin/common/types.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,14 +34,30 @@ struct PoolConfig {
     Size stripe_unit = 64 * KiB;       // round-robin stripe granularity (HDD wants MBs)
 };
 
+struct NumaMemoryRegionConfig {
+    unsigned node = 0;
+    Size bytes = 0;
+};
+
 struct MemoryConfig {                  // ADR-0008
-    Size total_bytes  = 1 * GiB;       // fixed, command-line specified; never grows
+    Size total_bytes  = 1 * GiB;       // --memory: head arena bytes on the selected/local NUMA node
+    Size sub_bytes    = 0;             // --sub-memory: head arena bytes on each other NUMA node
     Size block_bytes  = 1 * MiB;       // power-of-two block size
     Size small_min_alloc = 16;         // buddy min-order for RAM-only (<=ram_head) heads. Large heads
                                        // keep the 4 KiB (kDeviceBlock) order so they stay O_DIRECT-
                                        // aligned; RAM-only small objects never DMA, so they pack tight.
     bool lock_memory  = true;          // mlock / MAP_LOCKED (never swap the head out)
     bool use_hugepages = true;
+    // Runtime-resolved local-first layout. Empty for direct library/test callers that want the
+    // ordinary single-region allocator; main() populates it after NUMA selection.
+    std::vector<NumaMemoryRegionConfig> numa_regions;
+
+    Size arena_bytes() const noexcept {
+        if (numa_regions.empty()) return total_bytes;
+        Size total = 0;
+        for (const auto& region : numa_regions) total += region.bytes;
+        return total;
+    }
 };
 
 enum class EvictionPolicyKind { sieve, s3fifo, tinylfu }; // selectable (ADR-0007)
@@ -63,7 +80,9 @@ struct ServerConfig {
     // One cert/key pair per domain (SNI selects, ADR-0005); paired by index. Repeat --tls-cert/--tls-key.
     std::vector<std::string> tls_cert_paths; // PEM certificate chains
     std::vector<std::string> tls_key_paths;  // PEM private keys
-    unsigned      cores = 0;              // 0 => all available
+    unsigned      cores = 0;              // 0 => all CPUs allowed on the selected NUMA node
+    std::optional<unsigned> numa_node;     // --numa NODE; null => derive from listener NIC locality
+    std::vector<unsigned> numa_cpus;       // runtime-resolved node CPUs allowed by process/cgroup
 
     // HTTP key derivation (ADR-0015)
     bool          http_vhost   = false;   // key = Host + URI  (default: key = URI path)
