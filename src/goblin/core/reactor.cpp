@@ -20,7 +20,7 @@ bool Reactor::submit_read(int fd, std::uint64_t offset, MutBytes buf, std::uint6
     io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
     if (!sqe) return false; // SQ full
     io_uring_prep_read(sqe, fd, buf.data(), static_cast<unsigned>(buf.size()), offset);
-    io_uring_sqe_set_data64(sqe, user_data);
+    sqe->user_data = user_data; // the stable field works with liburing 2.0 and newer
     return true;
 }
 
@@ -28,7 +28,7 @@ bool Reactor::submit_recv(int fd, MutBytes buf, std::uint64_t user_data) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
     if (!sqe) return false;
     io_uring_prep_recv(sqe, fd, buf.data(), buf.size(), 0);
-    io_uring_sqe_set_data64(sqe, user_data);
+    sqe->user_data = user_data;
     return true;
 }
 
@@ -36,7 +36,7 @@ bool Reactor::submit_send(int fd, ByteView buf, std::uint64_t user_data) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
     if (!sqe) return false;
     io_uring_prep_send(sqe, fd, buf.data(), buf.size(), MSG_NOSIGNAL);
-    io_uring_sqe_set_data64(sqe, user_data);
+    sqe->user_data = user_data;
     return true;
 }
 
@@ -44,7 +44,7 @@ bool Reactor::submit_accept(int listen_fd, std::uint64_t user_data) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
     if (!sqe) return false;
     io_uring_prep_accept(sqe, listen_fd, nullptr, nullptr, 0);
-    io_uring_sqe_set_data64(sqe, user_data);
+    sqe->user_data = user_data;
     return true;
 }
 
@@ -52,7 +52,7 @@ bool Reactor::submit_poll(int fd, unsigned poll_mask, std::uint64_t user_data) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
     if (!sqe) return false;
     io_uring_prep_poll_add(sqe, fd, poll_mask);
-    io_uring_sqe_set_data64(sqe, user_data);
+    sqe->user_data = user_data;
     return true;
 }
 
@@ -78,7 +78,7 @@ unsigned Reactor::reap(std::span<Completion> out) {
     unsigned n = 0;
     io_uring_cqe* cqe = nullptr;
     while (n < out.size() && io_uring_peek_cqe(ring_.get(), &cqe) == 0) {
-        const std::uint64_t ud = io_uring_cqe_get_data64(cqe);
+        const std::uint64_t ud = cqe->user_data;
         const int res = cqe->res;
         io_uring_cqe_seen(ring_.get(), cqe);
         if (ud == LIBURING_UDATA_TIMEOUT) continue; // internal marker from wait_cqe_timeout

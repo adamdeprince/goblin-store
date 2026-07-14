@@ -29,7 +29,7 @@ Status bind_mapping(void* base, Size bytes, unsigned node, unsigned flags = 0) {
     const Size words = static_cast<Size>(node) / bits_per_word + 1;
     std::vector<unsigned long> mask(static_cast<std::size_t>(words), 0);
     mask[node / bits_per_word] |= 1UL << (node % bits_per_word);
-    const unsigned long maxnode = static_cast<unsigned long>(node) + 1UL;
+    const unsigned long maxnode = static_cast<unsigned long>(words * bits_per_word);
     if (::syscall(SYS_mbind, base, static_cast<unsigned long>(bytes),
                   MPOL_BIND | MPOL_F_STATIC_NODES, mask.data(), maxnode, flags) != 0)
         return err(Errc::out_of_memory,
@@ -60,7 +60,7 @@ void* try_hugetlb_mapping(Size bytes, Size hugepage_bytes, std::optional<unsigne
                 const Size words = static_cast<Size>(*node) / bits_per_word + 1;
                 std::vector<unsigned long> mask(static_cast<std::size_t>(words), 0);
                 mask[*node / bits_per_word] |= 1UL << (*node % bits_per_word);
-                const unsigned long maxnode = static_cast<unsigned long>(*node) + 1UL;
+                const unsigned long maxnode = static_cast<unsigned long>(words * bits_per_word);
                 if (::syscall(SYS_set_mempolicy, MPOL_BIND | MPOL_F_STATIC_NODES, mask.data(),
                               maxnode) != 0)
                     return;
@@ -433,21 +433,23 @@ std::optional<unsigned> BlockPool::block_index(const std::byte* address) const n
 // ---------------- BufferPool ----------------
 
 Result<BufferPool> BufferPool::create(Size total_bytes, Size block_bytes, Size min_alloc,
-                                      bool lock_memory, bool try_hugetlb) {
+                                      bool lock_memory, bool try_hugetlb, Size hugetlb_bytes) {
     const BlockPoolRegion region{total_bytes, std::nullopt};
     return create_regions(std::span<const BlockPoolRegion>(&region, 1), block_bytes, min_alloc,
-                          lock_memory, try_hugetlb);
+                          lock_memory, try_hugetlb, hugetlb_bytes);
 }
 
 Result<BufferPool> BufferPool::create_regions(std::span<const BlockPoolRegion> regions,
                                               Size block_bytes, Size min_alloc,
-                                              bool lock_memory, bool try_hugetlb) {
+                                              bool lock_memory, bool try_hugetlb,
+                                              Size hugetlb_bytes) {
     if (!is_power_of_two(min_alloc) || min_alloc < kDeviceBlock)
         return err(Errc::invalid_argument, "min_alloc must be a power of two >= 4 KiB");
     if (block_bytes < min_alloc)
         return err(Errc::invalid_argument, "block_bytes must be >= min_alloc");
 
-    auto bp = BlockPool::create_regions(block_bytes, regions, lock_memory, try_hugetlb);
+    auto bp = BlockPool::create_regions(block_bytes, regions, lock_memory, try_hugetlb,
+                                        hugetlb_bytes);
     if (!bp) return std::unexpected(bp.error());
     return BufferPool(std::move(*bp));
 }

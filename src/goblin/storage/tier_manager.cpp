@@ -4,6 +4,7 @@
 #include "goblin/storage/striped_io.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio> // renameat
 #include <cstring>
 #include <fcntl.h>
@@ -130,13 +131,15 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
     auto make_ram = [&]() -> Result<core::BufferPool> {
         if (mem.numa_regions.empty())
             return core::BufferPool::create(mem.total_bytes, mem.block_bytes, kDeviceBlock,
-                                            mem.lock_memory, mem.use_hugepages);
+                                            mem.lock_memory, mem.use_hugepages,
+                                            mem.hugetlb_page_bytes);
         std::vector<core::BlockPoolRegion> regions;
         regions.reserve(mem.numa_regions.size());
         for (const auto& region : mem.numa_regions)
             regions.push_back({region.bytes, region.node});
         return core::BufferPool::create_regions(regions, mem.block_bytes, kDeviceBlock,
-                                                mem.lock_memory, mem.use_hugepages);
+                                                mem.lock_memory, mem.use_hugepages,
+                                                mem.hugetlb_page_bytes);
     };
     auto ram = make_ram();
     if (!ram) return std::unexpected(ram.error());
@@ -157,7 +160,7 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
         hp.emplace(std::move(*h));
     }
     auto wp = core::IoBufferPool::create(io_chunk, write_buffers, mem.lock_memory,
-                                         mem.use_hugepages, mem.block_bytes);
+                                         mem.use_hugepages, mem.hugetlb_page_bytes);
     if (!wp) return std::unexpected(wp.error());
     TierManager tm(t, std::move(*ram), std::move(head_policy), std::move(object_policy),
                    ev.max_ssd_objects, std::move(*sp), std::move(hp), index, mem.small_min_alloc,
@@ -234,9 +237,10 @@ Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, 
 
     std::optional<core::BufferPool::Region> head;
     const Size head_len = std::min<Size>(size, tiers_.ram_head);
-    // RAM-only heads (size <= ram_head) pack at the small min-order; larger heads keep the 4 KiB
-    // O_DIRECT-aligned order. Same shared block pool, per-block class (ADR-0008-rev).
-    const Size head_min = (size <= tiers_.ram_head) ? small_min_alloc_ : kDeviceBlock;
+    // Fractional RAM-only objects use the compact arena. An object exactly one ram_head uses the
+    // same fixed buddy slot as a larger object's head: these slots pack exactly into --block and a
+    // completely occupied block is eligible for NUMA promotion (ADR-0008-rev).
+    const Size head_min = (size < tiers_.ram_head) ? small_min_alloc_ : kDeviceBlock;
     if (head_len > 0) {
         auto region = ram_.allocate(static_cast<std::uint32_t>(head_len), head_min);
         // Small class: reclaim dead arena space by sliding compaction before evicting anything live.
@@ -679,9 +683,30 @@ bool TierManager::promote_hot_remote_block() {
     }
 
     if (!cold_local || !hot_remote || hot_remote->score <= cold_local->score) return false;
+    const auto started = std::chrono::steady_clock::now();
     if (!ram_.swap_blocks(cold_local->block, hot_remote->block)) return false;
     index_->swap_head_blocks(cold_local->block, hot_remote->block);
+    const auto elapsed = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+    constexpr auto relaxed = std::memory_order_relaxed;
+    numa_promotion_count_->fetch_add(1, relaxed);
+    numa_promotion_bytes_->fetch_add(2 * ram_.block_bytes(), relaxed);
+    numa_promotion_total_ns_->fetch_add(elapsed, relaxed);
+    std::uint64_t old_max = numa_promotion_max_ns_->load(relaxed);
+    while (old_max < elapsed &&
+           !numa_promotion_max_ns_->compare_exchange_weak(old_max, elapsed, relaxed)) {}
     return true;
+}
+
+TierManager::NumaPromotionStats TierManager::numa_promotion_stats() const noexcept {
+    constexpr auto relaxed = std::memory_order_relaxed;
+    return {
+        numa_promotion_count_->load(relaxed),
+        numa_promotion_bytes_->load(relaxed),
+        numa_promotion_total_ns_->load(relaxed),
+        numa_promotion_max_ns_->load(relaxed),
+    };
 }
 
 std::size_t TierManager::head_resident() const {

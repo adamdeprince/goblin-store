@@ -345,3 +345,16 @@ TEST("io_buffer_pool: backing hugepage order does not change chunk geometry") {
     for (unsigned i = 0; i < chunks; ++i) CHECK(pr->acquire().has_value());
     CHECK(!pr->acquire().has_value());
 }
+
+TEST("buffer_pool: logical allocation block may span multiple HugeTLB pages") {
+    auto pr = BufferPool::create(/*total=*/8 * MiB, /*block=*/4 * MiB,
+                                 /*min=*/4 * KiB, /*lock_memory=*/false,
+                                 /*try_hugetlb=*/true, /*hugetlb_bytes=*/2 * MiB);
+    CHECK(pr.has_value()); // also covers graceful ordinary-memory fallback when no pool is reserved
+    if (!pr) return;
+    CHECK_EQ(pr->block_bytes(), Size(4 * MiB));
+
+    const auto first = pr->allocate(256 * KiB, 4 * KiB);
+    CHECK(first.has_value());
+    if (first) CHECK_EQ(first->len, std::uint32_t(256 * KiB));
+}

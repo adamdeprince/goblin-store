@@ -7,25 +7,29 @@ RAM is a sized latency tool, not a savings tool. We want fixed, bounded,
 fragmentation-resistant RAM that also doubles as the io_uring **registered-buffer** region.
 
 ## Decision
-- RAM is **one preallocated logical array of equal-size blocks**; block size is a **power of two**
-  (operator-configured; default 2 MiB on x86 and 32 MiB on Arm/LoongArch). These defaults match the
-  intended platform hugetlb geometry so hugepage-backed mappings do not change allocator packing.
-  The array has one ordered free-list per NUMA region. Whole-block allocation/free is O(1) within a
-  region, and regions are searched local-first.
-- Allocations **smaller than a block** take one block and run **buddy allocation inside it**
-  (power-of-two sub-blocks down to a minimum order); split/merge is O(log).
+- RAM is **one preallocated logical array of equal-size allocation/promotion blocks**; `--block` is
+  a **power of two** (default 2 MiB on x86 and 32 MiB on Arm/LoongArch). It is distinct from the
+  per-object `--ram-head` (default 256 KiB): heads pack exactly inside it, so the x86 defaults hold
+  eight heads per block. The array has one ordered free-list per NUMA region. Whole-block
+  allocation/free is O(1) within a region, and regions are searched local-first.
+- Fixed-size heads use **buddy allocation inside each block**. `--ram-head` is a power of two no
+  larger than `--block`; split/merge is O(log). Fractional RAM-only objects smaller than
+  `--ram-head` use the compact bump arena described below.
 - The block array has a **fixed, command-line-specified size** — RAM is a sized latency tool, it
   never grows. Without subordinate memory its size is `--memory`; with explicit NUMA placement it is
   `--memory + (other online nodes × --sub-memory)`. The range is
   **resident and unswappable** — never page the fast head out to the very disk we're trying to
-  avoid. On Linux, every fixed block pool first attempts an explicit `MAP_HUGETLB` mapping whose page
-  order matches `--block`; streaming pools keep the smaller `--io-chunk` allocation granule within
-  that backing mapping. Each NUMA region is attempted independently against that node's pool. An
-  unavailable size, insufficient pages for the complete region, or failed placement check silently
-  falls back to ordinary memory plus the configured `mlock`. Registering the arena with io_uring as
-  a fixed buffer remains a design target. A pool's total size must be a whole multiple of the
-  requested hugepage size; no hidden rounding is allowed because that would violate its configured
-  memory bound. The arena is **aligned to the
+  avoid. On Linux, every fixed block pool first attempts an explicit `MAP_HUGETLB` mapping using the
+  platform's physical page order (2 MiB on x86, 32 MiB on Arm/LoongArch). `--block` must be a
+  power-of-two multiple of that size; a 4 MiB x86 allocation block is backed by two 2 MiB huge pages,
+  not a nonexistent 4 MiB huge-page order. Streaming pools keep the smaller `--io-chunk` allocation
+  granule within that backing mapping. Each NUMA region is attempted independently against that
+  node's pool. An unavailable page order, insufficient pages for the complete region, or failed
+  placement check silently falls back to ordinary memory plus the configured `mlock`. The logical
+  block/head geometry and configured capacity never change on fallback. Registering the arena with
+  io_uring as a fixed buffer remains a design target. A pool's total size must be a whole multiple
+  of the physical HugeTLB page size; no hidden rounding is allowed because that would violate its
+  configured memory bound. The arena is **aligned to the
   device block size (≥ 4 KiB)** and blocks are power-of-two ≥ that — which hands us **O_DIRECT
   alignment for free** (see [ADR-0011](0011-odirect-bypass-page-cache.md)). *Ops:* raise
   `RLIMIT_MEMLOCK` (or grant `CAP_IPC_LOCK`) for multi-GB locked regions; fail fast at startup if
@@ -61,6 +65,13 @@ occupied local buddy block with a hotter completely occupied foreign buddy block
 bytes and per-block allocator state, then rewrites every affected `HeadLoc`. Partial blocks and the
 small-object bump arena are not promotion candidates in this revision.
 
+The benchmark-only `--perverse` flag separates CPU/NIC locality from head-memory locality. Threads,
+the key index, streaming pools, and the inherited default policy stay on the selected serving node,
+while region zero (`--memory`) is mapped on the online node with the greatest NUMA distance from it.
+The region remains first in allocation and promotion order, deliberately inverting the policy. This
+produces a normal/perverse latency A/B with the same serving CPU and PCI path. It is invalid with
+`--no-numa` or on a machine with fewer than two online NUMA nodes.
+
 ## Revision (2026-07): per-class allocators — buddy for large heads, byte-granular arena for small
 
 The buddy min-order was `kDeviceBlock` (4 KiB) so every head stayed O_DIRECT-aligned. For the
@@ -73,8 +84,10 @@ bytes can be relocated as long as that locator is rewritten under the write lock
 
 A block's **class is fixed on first use**, and the two classes never share a block:
 
-- **Large heads (`>= kDeviceBlock`)** keep intra-block **buddy** allocation — power-of-two, O_DIRECT-aligned, self-coalescing. Unchanged.
-- **Small RAM-only heads (`< kDeviceBlock`)** use a **byte-granular bump arena**: heads packed
+- **Fixed heads (objects `>= ram_head`)** use an exact `ram_head`-sized intra-block **buddy** slot —
+  power-of-two, O_DIRECT-aligned, and self-coalescing. An object exactly equal to `ram_head` is still
+  RAM-only, but uses this class so a complete block can participate in NUMA promotion.
+- **Fractional RAM-only heads (objects `< ram_head`)** use a **byte-granular bump arena**: heads packed
   contiguously at an 8/16 B granularity (`--small-min-alloc`, default 16 B), **no power-of-two
   rounding**. A free only marks bytes dead; the bump frontier never rewinds.
   - *Phase 1* pared the floor from 4 KiB to the min-order (kills the 4 KiB leaf).

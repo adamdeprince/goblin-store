@@ -58,6 +58,8 @@ SSD only.  Large objects across RAM, SSD and HDD.
 
 
 - **RAM head** — first `ram_head` bytes (default 256 KiB), served zero-copy for instant time-to-first-byte.
+  Heads are packed inside larger allocation/promotion blocks (default 2 MiB on x86, so eight default
+  heads per block); the allocation block is not a per-file reservation.
 - **SSD prefix** — the warm middle (default up to 32 MiB/object) on fast storage.
 - **HDD tail** — the cold remainder on cheap, throughput-optimized disk (3-layer mode).
 
@@ -70,6 +72,10 @@ copy-on-write publish** (readers never see a torn value, [ADR-0018](docs/adr/001
 digest identity** ([ADR-0014](docs/adr/0014-keyless-digest-identity.md)), and a **bounded, mlock-able** memory model ([ADR-0016](docs/adr/0016-bounded-locked-memory.md)).
 
 Start at **[`docs/adr/README.md`](docs/adr/README.md)** — 19 ADRs covering the full design.
+For a focused explanation of the NUMA-aware head cache, HugeTLB geometry, and the two-R820
+interconnect test, read **[NUMA-local RAM heads and interconnect bandwidth](docs/numa-interconnect-bandwidth.md)**.
+The longer direct-link experiment—including nanosecond traces, tail percentiles, and probability of
+superiority—is **[Looking for NUMA latency below the network noise floor](docs/numa-first-byte-latency.md)**.
 
 ## Protocols
 
@@ -81,7 +87,7 @@ Start at **[`docs/adr/README.md`](docs/adr/README.md)** — 19 ADRs covering the
   front). **HTTPS** via OpenSSL + **kTLS** with SNI cert selection.
 
 > **Status:** working memcache + HTTP/HTTPS server on io_uring + O_DIRECT — 3-tier store, atomic
-> publish, zero-copy head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **146 unit-test cases
+> publish, zero-copy head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **153 unit-test cases
 > run under Release, ASan, and TSan.** macOS is a non-goal (no io_uring / O_DIRECT analog); FreeBSD
 > (kqueue/aio) is a planned port.
 
@@ -122,21 +128,26 @@ ctest --test-dir build --output-on-failure
     --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool
 ```
 
-Key knobs (see `--help`): `--ram-head`, `--ssd-prefix` (positional tier sizes), `--block` (allocator
-backing block, default 2 MiB on x86 and 32 MiB on Arm/LoongArch), `--io-buffers` /
+Key knobs (see `--help`): `--ram-head` (power-of-two per-object resident head, default 256 KiB),
+`--ssd-prefix` (positional tier size), `--block` (power-of-two allocation/promotion block, default
+2 MiB on x86 and 32 MiB on Arm/LoongArch), `--io-buffers` /
 `--io-chunk` (bounded streaming RAM), `--eviction`, `--max-objects`, `--no-mlock` (dev), `--tls-cert`/
 `--tls-key` (HTTPS), `--source` (preload a directory tree), `--numa NODE` (explicit NUMA
 placement), `--sub-memory SIZE` (head-cache RAM on each non-local NUMA node), `--increment FLOAT`
-(score added per successful key read), and `--decay FLOAT` (per-minute score multiplier in `(0, 1)`).
+(score added per successful key read), `--decay FLOAT` (per-minute score multiplier in `(0, 1)`),
+and `--perverse` (benchmark-only inversion of preferred head-memory placement).
 
-On Linux, every fixed block pool first requests explicit hugetlb pages of the `--block` size; streaming
-pools retain their smaller `--io-chunk` allocation granule within that mapping. Each NUMA region is
-attempted independently against that node's hugetlb pool. If the requested page size or enough pages
-for the entire region are unavailable, that region silently falls back to ordinary memory; allocator
-geometry and capacity do not change. Explicit huge pages are resident and unswappable; fallback head
-and streaming pools retain the configured `mlock` behavior. A pool must total a whole number of huge
-pages; for example, the default 16 MiB streaming pool on 32 MiB-page Arm/LoongArch falls back unless
-it is resized (such as `--io-buffers 128` with the default 256 KiB chunks).
+On Linux, every fixed pool first requests explicit HugeTLB backing using the platform page order
+(2 MiB on x86, 32 MiB on Arm/LoongArch). `--block` is a logical allocator and promotion unit: it must
+be a power-of-two multiple of that page size, and a larger block spans several real HugeTLB pages.
+Streaming pools retain their smaller `--io-chunk` allocation granule within the same kind of backing
+mapping. Each NUMA region is attempted independently against that node's pool. If the page order,
+page count, or requested placement is unavailable, that region silently falls back to ordinary
+memory; allocator geometry and capacity do not change. Explicit huge pages are resident and
+unswappable; fallback head and streaming pools retain the configured `mlock` behavior. A pool must
+total a whole number of HugeTLB pages; for example, the default 16 MiB streaming pool on 32 MiB-page
+Arm/LoongArch falls back unless it is resized (such as `--io-buffers 128` with the default 256 KiB
+chunks).
 
 On Linux, Goblin Store binds the main thread before allocating its fixed RAM arenas; the worker and
 maintenance threads inherit that affinity, and `--cores 0` uses the number of CPUs available on the
@@ -147,13 +158,21 @@ those interface addresses belong to different nodes—or locality is unknown on 
 host—startup stops and reports each Linux interface name, listening address, NUMA node, and the
 corresponding `--numa NODE` override.
 
+`--perverse` leaves the serving threads, key index, I/O pools, and inherited default memory policy on
+that selected NIC-local node, but maps the preferred region-zero `--memory` head arena on the online
+node with the greatest Linux NUMA distance. Equal distances choose the lowest node ID. This is a
+benchmark control for comparing local and remote DRAM with an otherwise identical CPU/NIC path; it
+is rejected with `--no-numa` and on a single-node machine.
+
 With explicit `--numa`, `--memory` is the head-cache budget on that local node. Optional
 `--sub-memory` adds the stated budget on **each** other online NUMA node and is rejected without an
 explicit `--numa`. Each arena range is bound to its physical node with Linux `mbind(MPOL_BIND)`. The
 allocator always searches local blocks first—including local blocks returned after foreign memory
 has been used—and falls through to foreign regions only when the local region cannot satisfy the
 allocation. Total head-cache capacity is `--memory + (other_nodes × --sub-memory)`; bounded streaming
-I/O pools remain additional per-worker memory.
+I/O pools remain additional per-worker memory. In benchmark-only perverse mode, "local" in this
+allocator policy means the deliberately far preferred region; subordinate regions include the real
+serving node, so promotion is intentionally inverted as well.
 
 Each key starts with a score of zero. A successful logical read adds `--increment` (default `1.0`),
 and once per minute every score is multiplied by `--decay` (default `0.5`). With foreign head-memory
@@ -164,6 +183,10 @@ in-flight, and compactable small-object arena blocks are not moved. When no safe
 exists, the thread waits one second before scanning again. The minute rescore has priority: once it
 announces that it is pending, no new promotion starts; an active block exchange finishes and then the
 entire decay traversal runs without promotion ([ADR-0019](docs/adr/0019-access-score-numa-promotion.md)).
+
+FPGA NICs and direct userspace networking are on the product development path. They will allow NIC
+queues, workers, RAM heads, and hardware timestamps to share one NUMA node while removing the kernel
+TCP path from first-payload-byte measurements.
 
 ## Layout
 ```

@@ -47,7 +47,7 @@ std::string EventLoop::format_stats() const {
     };
     o += std::format("STAT pid {}\r\n", ::getpid());
     line("uptime", uptime);
-    o += "STAT version goblin-store 0.0.1\r\n"; // keep in sync with kVersion
+    o += "STAT version goblin-store 0.0.2\r\n"; // keep in sync with kVersion
     line("curr_connections", s.curr_conns);
     line("total_connections", s.conns);
     line("cmd_get", s.get_hits + s.get_misses);
@@ -61,6 +61,11 @@ std::string EventLoop::format_stats() const {
     line("get_backpressure", s.get_backpressure);
     line("set_backpressure", s.set_backpressure);
     line("slow_drops", s.slow_drops);
+    const auto promotion = tm_.numa_promotion_stats();
+    line("numa_promotions", promotion.count);
+    line("numa_promotion_bytes", promotion.bytes_moved);
+    line("numa_promotion_total_ns", promotion.total_ns);
+    line("numa_promotion_max_ns", promotion.max_ns);
     o += kEnd; // "END\r\n"
     return o;
 }

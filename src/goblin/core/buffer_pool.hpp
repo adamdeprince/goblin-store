@@ -147,10 +147,11 @@ private:
 class BufferPool {
 public:
     static Result<BufferPool> create(Size total_bytes, Size block_bytes, Size min_alloc,
-                                     bool lock_memory, bool try_hugetlb = true);
+                                     bool lock_memory, bool try_hugetlb = true,
+                                     Size hugetlb_bytes = 0);
     static Result<BufferPool> create_regions(std::span<const BlockPoolRegion> regions,
                                              Size block_bytes, Size min_alloc, bool lock_memory,
-                                             bool try_hugetlb = true);
+                                             bool try_hugetlb = true, Size hugetlb_bytes = 0);
 
     struct Region {
         unsigned block = 0;       // BlockPool block index

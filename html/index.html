@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Goblin Store is a large-object memcache clone and HTTP object server that keeps object heads in RAM while streaming tails from SSD and HDD.">
+  <meta name="description" content="Goblin Store is a NUMA-aware large-object memcache clone and HTTP object server that keeps object heads in RAM while streaming tails from SSD and HDD.">
   <meta name="theme-color" content="#11130f">
   <meta property="og:title" content="Goblin Store — first byte from RAM, the rest already on its way">
   <meta property="og:description" content="Memcache latency for large objects with 7.4× less RAM. A RAM head hides SSD and HDD latency while a read-ahead pipeline keeps the wire fed.">
@@ -293,7 +293,7 @@
           <a class="button primary" href="#quickstart">Build Goblin Store</a>
           <a class="button secondary" href="BENCHMARKS.html">Read the full benchmarks</a>
         </div>
-        <p class="hero-note">Open source · Apache-2.0 · C++23 · Linux io_uring · memcache text + meta · HTTP/HTTPS</p>
+        <p class="hero-note">Open source · Apache-2.0 · C++23 · NUMA-aware · HugeTLB · Linux io_uring · memcache text + meta · HTTP/HTTPS</p>
       </div>
     </section>
 
@@ -400,6 +400,8 @@
               One run fit in memory. The other forced cold reads onto the same slow HDD used by extstore.
             </p>
             <a class="bench-link" href="BENCHMARKS.html">Full rig, methodology, tables, and caveats →</a>
+            <p><a class="bench-link" href="docs/numa-interconnect-bandwidth.html">NUMA interconnect-bandwidth report →</a></p>
+            <p><a class="bench-link" href="docs/numa-first-byte-latency.html">68 million requests: local vs remote first-byte latency →</a></p>
           </div>
 
           <figure class="bar-chart">
@@ -511,8 +513,8 @@
           </article>
           <article class="feature">
             <span class="feature-num">02 / runtime</span>
-            <h3>Thread per core, bytes stay local</h3>
-            <p>Connection-owning workers issue their own io_uring reads and write their own sockets. Shared drive file descriptors, striped parallel reads, no cross-core payload shuffle.</p>
+            <h3>NUMA-aware, thread per core</h3>
+            <p>Workers, key space, and NIC-facing traffic stay local. Heads pack into HugeTLB-backed blocks, and hot full blocks move off remote memory. FPGA NICs and direct userspace networking are on the development path.</p>
           </article>
           <article class="feature">
             <span class="feature-num">03 / safety</span>
@@ -552,7 +554,9 @@
   --memcache-port 11211 --http-port 8080</code></pre>
           <div class="quick-links">
             <a href="README.html">Complete README →</a>
-            <a href="docs/adr/README.html">18 architecture decisions →</a>
+            <a href="docs/adr/README.html">19 architecture decisions →</a>
+            <a href="docs/numa-interconnect-bandwidth.html">NUMA interconnect-bandwidth report →</a>
+            <a href="docs/numa-first-byte-latency.html">Direct-link NUMA latency study →</a>
             <a href="https://github.com/adamdeprince/goblin-store">Source + issues →</a>
           </div>
         </div>

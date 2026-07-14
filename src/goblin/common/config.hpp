@@ -42,22 +42,25 @@ struct NumaMemoryRegionConfig {
 };
 
 #if defined(__aarch64__) || defined(__arm__) || defined(__loongarch__)
-inline constexpr Size kDefaultMemoryBlock = 32 * MiB;
+inline constexpr Size kDefaultHugeTlbPage = 32 * MiB;
 #else
-inline constexpr Size kDefaultMemoryBlock = 2 * MiB;
+inline constexpr Size kDefaultHugeTlbPage = 2 * MiB;
 #endif
+inline constexpr Size kDefaultMemoryBlock = kDefaultHugeTlbPage;
 
 struct MemoryConfig {                  // ADR-0008
-    Size total_bytes  = 1 * GiB;       // --memory: head arena bytes on the selected/local NUMA node
+    Size total_bytes  = 1 * GiB;       // --memory: preferred head arena (selected node normally)
     Size sub_bytes    = 0;             // --sub-memory: head arena bytes on each other NUMA node
-    // Match the platform's intended hugetlb geometry so enabling hugetlb does not reshape arenas.
-    Size block_bytes  = kDefaultMemoryBlock; // x86: 2 MiB; Arm/LoongArch: 32 MiB
-    Size small_min_alloc = 16;         // buddy min-order for RAM-only (<=ram_head) heads. Large heads
-                                       // keep the 4 KiB (kDeviceBlock) order so they stay O_DIRECT-
-                                       // aligned; RAM-only small objects never DMA, so they pack tight.
+    // Logical allocation/promotion blocks may span several physical HugeTLB pages. Keeping the two
+    // sizes distinct prevents --block 4M on x86 from requesting a nonexistent 4 MiB page order.
+    Size block_bytes  = kDefaultMemoryBlock; // --block; power-of-two multiple of hugetlb_page_bytes
+    Size hugetlb_page_bytes = kDefaultHugeTlbPage; // platform backing-page order (not a CLI knob)
+    Size small_min_alloc = 16;         // arena alignment for RAM-only objects smaller than ram_head.
+                                       // Exact ram_head objects and larger-object heads use buddy
+                                       // slots, making complete allocation blocks promotable.
     bool lock_memory  = true;          // mlock normal mappings; explicit hugetlb is unswappable
     bool use_hugepages = true;          // best-effort explicit hugetlb; normal memory on failure
-    // Runtime-resolved local-first layout. Empty for direct library/test callers that want the
+    // Runtime-resolved preferred-first layout. Empty for direct library/test callers that want the
     // ordinary single-region allocator; main() populates it after NUMA selection.
     std::vector<NumaMemoryRegionConfig> numa_regions;
 
@@ -95,6 +98,9 @@ struct ServerConfig {
     std::vector<std::string> tls_cert_paths; // PEM certificate chains
     std::vector<std::string> tls_key_paths;  // PEM private keys
     unsigned      cores = 0;              // 0 => all CPUs allowed on the selected NUMA node
+    bool          numa_enabled = true;    // --no-numa disables affinity, placement, and promotion
+    bool          numa_promotion = true;  // --no-numa-promotion keeps placement but disables swaps
+    bool          numa_perverse = false;  // --perverse: prefer farthest head-memory node (test only)
     std::optional<unsigned> numa_node;     // --numa NODE; null => derive from listener NIC locality
     std::vector<unsigned> numa_cpus;       // runtime-resolved node CPUs allowed by process/cgroup
 

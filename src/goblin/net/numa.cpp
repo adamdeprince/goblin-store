@@ -89,6 +89,31 @@ Result<std::vector<unsigned>> online_numa_nodes() {
     return parse_cpu_list(*line);
 }
 
+Result<std::vector<unsigned>> node_distances(unsigned node) {
+    const std::string path =
+        "/sys/devices/system/node/node" + std::to_string(node) + "/distance";
+    auto line = read_line(path);
+    if (!line) return std::unexpected(line.error());
+
+    std::vector<unsigned> distances;
+    std::string_view remaining = trim(*line);
+    while (!remaining.empty()) {
+        std::size_t end = 0;
+        while (end < remaining.size() &&
+               !std::isspace(static_cast<unsigned char>(remaining[end])))
+            ++end;
+        const auto distance = parse_unsigned(remaining.substr(0, end));
+        if (!distance)
+            return err(Errc::invalid_argument,
+                       "invalid NUMA distance row in " + path + ": " + *line);
+        distances.push_back(*distance);
+        remaining = trim(remaining.substr(end));
+    }
+    if (distances.empty())
+        return err(Errc::invalid_argument, "empty NUMA distance row in " + path);
+    return distances;
+}
+
 Result<std::vector<unsigned>> node_cpus(unsigned node) {
     const std::string path =
         "/sys/devices/system/node/node" + std::to_string(node) + "/cpulist";
@@ -175,7 +200,10 @@ Status bind_current_thread_memory(unsigned node) {
     const std::size_t words = static_cast<std::size_t>(node) / bits_per_word + 1;
     std::vector<unsigned long> mask(words, 0);
     mask[node / bits_per_word] |= 1UL << (node % bits_per_word);
-    const unsigned long maxnode = static_cast<unsigned long>(node) + 1UL;
+    // The raw Linux syscall interprets maxnode as a nodemask bit count with an historical
+    // off-by-one convention. Pass the complete storage width, as libnuma does, so node zero does
+    // not become an empty mask on kernels such as Ubuntu 5.15.
+    const unsigned long maxnode = static_cast<unsigned long>(words * bits_per_word);
     if (::syscall(SYS_set_mempolicy, MPOL_BIND | MPOL_F_STATIC_NODES, mask.data(), maxnode) != 0)
         return err(Errc::io_error,
                    "set_mempolicy NUMA node " + std::to_string(node) + ": " +
@@ -260,7 +288,35 @@ Result<unsigned> select_numa_node(std::optional<unsigned> requested,
     return err(Errc::invalid_argument, ambiguity_detail(interfaces, online_nodes));
 }
 
-Result<NumaBinding> configure_numa(std::optional<unsigned> requested) {
+Result<unsigned> select_farthest_numa_node(
+    unsigned serving_node, std::span<const unsigned> online_nodes,
+    std::span<const unsigned> distance_by_node) {
+    if (std::find(online_nodes.begin(), online_nodes.end(), serving_node) == online_nodes.end())
+        return err(Errc::invalid_argument,
+                   "serving NUMA node " + std::to_string(serving_node) + " is not online");
+
+    std::optional<unsigned> farthest;
+    unsigned farthest_distance = 0;
+    for (const unsigned node : online_nodes) {
+        if (node == serving_node) continue;
+        if (node >= distance_by_node.size())
+            return err(Errc::invalid_argument,
+                       "NUMA distance row for node " + std::to_string(serving_node) +
+                           " has no entry for online node " + std::to_string(node));
+        const unsigned distance = distance_by_node[node];
+        if (!farthest || distance > farthest_distance ||
+            (distance == farthest_distance && node < *farthest)) {
+            farthest = node;
+            farthest_distance = distance;
+        }
+    }
+    if (!farthest)
+        return err(Errc::invalid_argument,
+                   "--perverse requires at least two online NUMA nodes");
+    return *farthest;
+}
+
+Result<NumaBinding> configure_numa(std::optional<unsigned> requested, bool perverse) {
 #if defined(__linux__)
     auto online = online_numa_nodes();
     if (!online) return std::unexpected(online.error());
@@ -273,6 +329,16 @@ Result<NumaBinding> configure_numa(std::optional<unsigned> requested) {
     }
     auto node = select_numa_node(requested, interfaces, *online);
     if (!node) return std::unexpected(node.error());
+    unsigned preferred_memory_node = *node;
+    std::optional<unsigned> preferred_memory_distance;
+    if (perverse) {
+        auto distances = node_distances(*node);
+        if (!distances) return std::unexpected(distances.error());
+        auto farthest = select_farthest_numa_node(*node, *online, *distances);
+        if (!farthest) return std::unexpected(farthest.error());
+        preferred_memory_node = *farthest;
+        preferred_memory_distance = (*distances)[*farthest];
+    }
     auto cpus = node_cpus(*node);
     if (!cpus) return std::unexpected(cpus.error());
     auto effective = bind_current_thread(*cpus);
@@ -281,6 +347,8 @@ Result<NumaBinding> configure_numa(std::optional<unsigned> requested) {
         return std::unexpected(memory.error());
     NumaBinding binding;
     binding.node = *node;
+    binding.preferred_memory_node = preferred_memory_node;
+    binding.preferred_memory_distance = preferred_memory_distance;
     binding.cpus = std::move(*effective);
     binding.interfaces = std::move(interfaces);
     binding.online_nodes = std::move(*online);
@@ -288,6 +356,7 @@ Result<NumaBinding> configure_numa(std::optional<unsigned> requested) {
     return binding;
 #else
     (void)requested;
+    (void)perverse;
     return err(Errc::unsupported, "NUMA affinity is supported only on Linux");
 #endif
 }

@@ -135,6 +135,13 @@ public:
 
     void decay_access_scores();         // multiply every key score by --decay
     bool promote_hot_remote_block();    // one local/foreign full-block exchange, or false if sorted
+    struct NumaPromotionStats {
+        std::uint64_t count = 0;
+        std::uint64_t bytes_moved = 0;
+        std::uint64_t total_ns = 0;
+        std::uint64_t max_ns = 0;
+    };
+    NumaPromotionStats numa_promotion_stats() const noexcept;
 
     // Head pinning (ADR-0017/0018): keep a resident head's RAM alive while a reader sends it
     // zero-copy. Evicting/overwriting a pinned head defers the RAM free until the last unpin.
@@ -211,7 +218,11 @@ private:
           etag_seq_(std::make_unique<std::atomic<std::uint64_t>>(0)),
           any_ttl_(std::make_unique<std::atomic<bool>>(false)),
           mu_(std::make_unique<std::shared_mutex>()),
-          score_maintenance_(std::make_unique<ScoreMaintenanceGate>()) {}
+          score_maintenance_(std::make_unique<ScoreMaintenanceGate>()),
+          numa_promotion_count_(std::make_unique<std::atomic<std::uint64_t>>(0)),
+          numa_promotion_bytes_(std::make_unique<std::atomic<std::uint64_t>>(0)),
+          numa_promotion_total_ns_(std::make_unique<std::atomic<std::uint64_t>>(0)),
+          numa_promotion_max_ns_(std::make_unique<std::atomic<std::uint64_t>>(0)) {}
     void drop_object(const Digest&); // free head + unlink files + erase from index & policies
     void enforce_object_bound();     // evict whole objects while over the count limit
     void free_head_region(unsigned block, std::uint32_t offset, std::uint32_t len); // free or orphan
@@ -237,6 +248,10 @@ private:
     std::unique_ptr<std::shared_mutex> mu_; // rwlock: shared for reads, exclusive for writes (ADR-0018)
     // Decay announces itself before taking operation, so the tight promotion loop cannot overtake it.
     std::unique_ptr<ScoreMaintenanceGate> score_maintenance_;
+    std::unique_ptr<std::atomic<std::uint64_t>> numa_promotion_count_;
+    std::unique_ptr<std::atomic<std::uint64_t>> numa_promotion_bytes_;
+    std::unique_ptr<std::atomic<std::uint64_t>> numa_promotion_total_ns_;
+    std::unique_ptr<std::atomic<std::uint64_t>> numa_promotion_max_ns_;
     struct RegionPin {
         std::uint32_t len = 0;
         unsigned refcount = 0;

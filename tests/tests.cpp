@@ -33,10 +33,33 @@ TEST("config: defaults validate (2-layer)") {
 
 TEST("config: default backing block follows platform hugetlb geometry") {
 #if defined(__aarch64__) || defined(__arm__) || defined(__loongarch__)
+    CHECK_EQ(kDefaultHugeTlbPage, Size(32 * MiB));
     CHECK_EQ(kDefaultMemoryBlock, Size(32 * MiB));
 #else
+    CHECK_EQ(kDefaultHugeTlbPage, Size(2 * MiB));
     CHECK_EQ(kDefaultMemoryBlock, Size(2 * MiB));
 #endif
+}
+
+TEST("config: allocation block is a power-of-two multiple of the HugeTLB page") {
+    auto c = good_2layer();
+    c.memory.block_bytes = 2 * kDefaultHugeTlbPage;
+    CHECK(validate(c).has_value());
+
+    c.memory.block_bytes = kDefaultHugeTlbPage / 2;
+    CHECK(!validate(c).has_value());
+}
+
+TEST("config: ram_head is a power of two that packs exactly into allocation blocks") {
+    auto c = good_2layer();
+    c.tiers.ram_head = 384 * KiB;
+    CHECK(!validate(c).has_value());
+
+    c.tiers.ram_head = 512 * KiB;
+    CHECK(validate(c).has_value());
+
+    c.tiers.ram_head = 2 * c.memory.block_bytes;
+    CHECK(!validate(c).has_value());
 }
 
 TEST("config: ram_head must be <= ssd_prefix") {
@@ -86,6 +109,31 @@ TEST("config: --sub-memory requires an explicit --numa node") {
 
     c.numa_node = 0;
     CHECK(validate(c).has_value());
+}
+
+TEST("config: --no-numa rejects explicit NUMA placement") {
+    auto c = good_2layer();
+    c.numa_enabled = false;
+    CHECK(validate(c).has_value());
+
+    c.numa_node = 0;
+    CHECK(!validate(c).has_value());
+    c.numa_node.reset();
+    c.memory.sub_bytes = 4 * GiB;
+    CHECK(!validate(c).has_value());
+}
+
+TEST("config: --perverse requires NUMA mode") {
+    auto c = good_2layer();
+    c.numa_perverse = true;
+    CHECK(validate(c).has_value());
+
+    c.numa_enabled = false;
+    auto invalid = validate(c);
+    CHECK(!invalid.has_value());
+    if (!invalid)
+        CHECK(invalid.error().detail.find("--perverse cannot be used with --no-numa") !=
+              std::string::npos);
 }
 
 TEST("config: local and subordinate NUMA budgets contain whole blocks") {

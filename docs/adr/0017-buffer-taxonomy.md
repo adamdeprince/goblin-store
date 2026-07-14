@@ -25,9 +25,11 @@ and treating them the same is what makes the current GET allocate (and copy) a w
   independent of object size.
 - `--memory` sizes the local head pool; `--sub-memory` optionally adds head blocks on every foreign
   NUMA node. Small I/O pools are separately bounded by `--io-chunk × --io-buffers` per worker (plus
-  one write-staging pool). On Linux all first attempt `--block`-sized explicit hugetlb backing;
-  ordinary fallback memory is `mlock`'d unless `--no-mlock` is selected
-  ([ADR-0016](0016-bounded-locked-memory.md)). Chunk geometry is unchanged by the backing choice.
+  one write-staging pool). On Linux all first attempt explicit HugeTLB backing at the platform page
+  order; `--block` is the separate logical head-allocation/promotion unit and may span multiple huge
+  pages. Ordinary fallback memory is `mlock`'d unless `--no-mlock` is selected
+  ([ADR-0016](0016-bounded-locked-memory.md)). Chunk and head geometry are unchanged by the backing
+  choice.
 
 ## Consequences
 - ➕ RAM per request is O(chunks), not O(object size); head served with no userspace payload copy; the two pools have clean, independent lifetimes.

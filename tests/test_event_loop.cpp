@@ -765,7 +765,7 @@ TEST("event loop: stats reports connections, hits/misses, sets and bytes") {
         if (write_all(c, "stats\r\n", 7)) reply = read_until(c, "END\r\n");
         ok = stored && hit && *hit == val && !miss &&
              reply.find("STAT pid ") != std::string::npos &&
-             reply.find("STAT version goblin-store 0.0.1\r\n") != std::string::npos &&
+             reply.find("STAT version goblin-store 0.0.2\r\n") != std::string::npos &&
              stat_u64(reply, "get_hits") == 1 && stat_u64(reply, "get_misses") == 1 &&
              stat_u64(reply, "cmd_get") == 2 && stat_u64(reply, "sets_stored") == 1 &&
              stat_u64(reply, "cmd_set") == 1 && stat_u64(reply, "bytes_stored") == val.size() &&

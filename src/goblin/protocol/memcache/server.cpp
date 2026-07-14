@@ -244,7 +244,7 @@ void worker_loop(int lfd, const ServerConfig& cfg, storage::TierManager& tm, sto
     if (!reactor) { std::println(stderr, "worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
         core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory,
-                                   cfg.memory.use_hugepages, cfg.memory.block_bytes);
+                                   cfg.memory.use_hugepages, cfg.memory.hugetlb_page_bytes);
     if (!iobufs) { std::println(stderr, "worker {}: {}", id, iobufs.error().detail); return; }
 
     while (!shutdown.load(std::memory_order_relaxed)) {
@@ -278,7 +278,7 @@ void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     if (!reactor) { std::println(stderr, "worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
         core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory,
-                                   cfg.memory.use_hugepages, cfg.memory.block_bytes);
+                                   cfg.memory.use_hugepages, cfg.memory.hugetlb_page_bytes);
     if (!iobufs) { std::println(stderr, "worker {}: {}", id, iobufs.error().detail); return; }
     auto lfd = make_listener(cfg.memcache_port, /*reuseport=*/true);
     if (!lfd) { std::println(stderr, "worker {}: {}", id, lfd.error().detail); return; }
@@ -297,7 +297,7 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
     if (!reactor) { std::println(stderr, "http worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
         core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory,
-                                   cfg.memory.use_hugepages, cfg.memory.block_bytes);
+                                   cfg.memory.use_hugepages, cfg.memory.hugetlb_page_bytes);
     if (!iobufs) { std::println(stderr, "http worker {}: {}", id, iobufs.error().detail); return; }
     auto lfd = make_listener(cfg.http_port, /*reuseport=*/true);
     if (!lfd) { std::println(stderr, "http worker {}: {}", id, lfd.error().detail); return; }
@@ -324,7 +324,7 @@ void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     if (!reactor) { std::println(stderr, "https worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
         core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory,
-                                   cfg.memory.use_hugepages, cfg.memory.block_bytes);
+                                   cfg.memory.use_hugepages, cfg.memory.hugetlb_page_bytes);
     if (!iobufs) { std::println(stderr, "https worker {}: {}", id, iobufs.error().detail); return; }
     auto lfd = make_listener(cfg.https_port, /*reuseport=*/true);
     if (!lfd) { std::println(stderr, "https worker {}: {}", id, lfd.error().detail); return; }
@@ -423,7 +423,7 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
 
     // Region zero is local. Drain current score inversions as quickly as block copies permit, except
     // while a rescore is pending/running; once sorted (or yielding to rescore), poll in one second.
-    if (cfg.memory.numa_regions.size() > 1)
+    if (cfg.numa_promotion && cfg.memory.numa_regions.size() > 1)
         workers.emplace_back([&tm, &shutdown] {
             while (!shutdown.load(std::memory_order_relaxed)) {
                 if (tm.promote_hot_remote_block()) continue;

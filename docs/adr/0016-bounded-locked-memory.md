@@ -11,8 +11,10 @@ be a hard, predictable cap, not best-effort.
 ## Decision
 - **The resident head `BufferPool` is fixed:** `--memory` bytes on the explicit/automatic local NUMA
   node, plus `--sub-memory` bytes on every other online node when explicitly requested. Each region
-  first attempts explicit hugetlb backing and otherwise uses ordinary `mlock`'d memory. Using
-  `--sub-memory` requires `--numa NODE`. Head allocation is local-first, then foreign, and never grows.
+  first attempts explicit HugeTLB backing using the platform's physical page size and otherwise uses
+  ordinary `mlock`'d memory. The logical `--block` may span several HugeTLB pages; fallback preserves
+  its packing exactly. Using `--sub-memory` requires `--numa NODE`. Head allocation is local-first,
+  then foreign, and never grows.
 - **Streaming I/O pools are separate and fixed:** read pools are `--io-chunk × --io-buffers` per
   worker; one write-staging pool uses the same geometry. Pool exhaustion produces backpressure
   ([ADR-0006](0006-positional-tiering-pipeline.md)), never heap growth.

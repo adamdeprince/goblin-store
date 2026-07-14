@@ -738,6 +738,11 @@ TEST("tier_manager: hotter full foreign block replaces colder local block") {
     if (pin) tm->unpin_head(*pin);
 
     CHECK(tm->promote_hot_remote_block());
+    const auto promotion = tm->numa_promotion_stats();
+    CHECK_EQ(promotion.count, std::uint64_t(1));
+    CHECK_EQ(promotion.bytes_moved, std::uint64_t(128 * KiB));
+    CHECK(promotion.total_ns > 0);
+    CHECK(promotion.max_ns > 0);
     const auto cold_meta = index.lookup(cold_key);
     const auto hot_meta = index.lookup(hot_key);
     CHECK(cold_meta && hot_meta);
@@ -780,5 +785,81 @@ TEST("tier_manager: hotter full foreign block replaces colder local block") {
     rescoring_done.store(true, std::memory_order_release);
     promoter.join();
     CHECK(promotion_calls.load(std::memory_order_relaxed) > 0);
+    fs::remove_all(base);
+}
+
+TEST("tier_manager: exact ram_head objects pack into promotable allocation blocks") {
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-head-pack-" + std::to_string(::getpid()))).string();
+    PoolConfig ssd, hdd;
+    ssd.stripe_unit = 64 * KiB;
+    ssd.dirs.push_back(base + "/ssd");
+    fs::create_directories(ssd.dirs.front());
+
+    TierSizes tiers;
+    tiers.ram_head = 256 * KiB;
+    tiers.ssd_prefix = 1 * MiB;
+    MemoryConfig mem;
+    mem.total_bytes = 2 * MiB;
+    mem.block_bytes = 2 * MiB;
+    mem.lock_memory = false;
+    mem.use_hugepages = false;
+    mem.numa_regions = {{std::nullopt, 2 * MiB}, {std::nullopt, 2 * MiB}};
+    EvictionConfig ev;
+    Index index;
+    auto tm = TierManager::open(tiers, mem, ev, ssd, hdd, index, 256 * KiB, 8,
+                                /*direct_io=*/false);
+    CHECK(tm.has_value());
+    if (!tm) {
+        fs::remove_all(base);
+        return;
+    }
+
+    constexpr unsigned kHeadsPerBlock = 8;
+    constexpr unsigned kObjects = 2 * kHeadsPerBlock;
+    std::vector<Digest> keys;
+    keys.reserve(kObjects);
+    for (unsigned i = 0; i < kObjects; ++i) {
+        keys.push_back(hash_key("/packed/" + std::to_string(i)));
+        std::vector<std::byte> value(tiers.ram_head, static_cast<std::byte>(i));
+        CHECK(tm->store(keys.back(), ByteView(value.data(), value.size()), 0).has_value());
+    }
+
+    // Eight exact-size heads occupy each 2 MiB buddy block. They are RAM-only, so no backing
+    // object files should have been created in the SSD pool.
+    for (unsigned i = 0; i < kHeadsPerBlock; ++i) {
+        const auto meta = index.lookup(keys[i]);
+        CHECK(meta.has_value());
+        if (meta) CHECK_EQ(meta->head.block, 0u);
+    }
+    for (unsigned i = kHeadsPerBlock; i < kObjects; ++i) {
+        const auto meta = index.lookup(keys[i]);
+        CHECK(meta.has_value());
+        if (meta) CHECK_EQ(meta->head.block, 1u);
+    }
+    std::size_t files = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(base))
+        if (entry.is_regular_file()) ++files;
+    CHECK_EQ(files, std::size_t(0));
+
+    // One remote hit makes that complete block hotter. Promotion moves all eight heads together
+    // and rewrites each key's locator while preserving its bytes.
+    CHECK(tm->head_view(keys[kHeadsPerBlock]).has_value());
+    CHECK(tm->promote_hot_remote_block());
+    const auto promotion = tm->numa_promotion_stats();
+    CHECK_EQ(promotion.count, std::uint64_t(1));
+    CHECK_EQ(promotion.bytes_moved, std::uint64_t(4 * MiB));
+    for (unsigned i = 0; i < kObjects; ++i) {
+        const auto meta = index.lookup(keys[i]);
+        CHECK(meta.has_value());
+        if (!meta) continue;
+        CHECK_EQ(meta->head.block, i < kHeadsPerBlock ? 1u : 0u);
+        const auto head = tm->head_view(keys[i]);
+        CHECK(head.has_value());
+        if (head)
+            CHECK(std::all_of(head->begin(), head->end(), [i](std::byte b) {
+                return b == static_cast<std::byte>(i);
+            }));
+    }
     fs::remove_all(base);
 }

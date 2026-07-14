@@ -47,7 +47,10 @@ less cross-NUMA traffic, so this revision deliberately leaves arena blocks out o
 - An eligible block is a **completely occupied buddy block** whose published index entries account
   for its entire allocation footprint. Bump-arena blocks, partially occupied buddy blocks, pinned or
   orphaned heads, and blocks containing an uncommitted store are excluded. This makes the exchange
-  safe under the existing exclusive TierManager lock and zero-copy head pinning rules.
+  safe under the existing exclusive TierManager lock and zero-copy head pinning rules. Objects
+  exactly equal to `--ram-head` are RAM-only but deliberately use fixed buddy slots, so (with the
+  defaults) eight 256 KiB objects fill one promotable 2 MiB block. Smaller fractional RAM-only
+  objects remain in the non-promotable compact arena.
 
 ## Consequences
 
@@ -60,3 +63,7 @@ less cross-NUMA traffic, so this revision deliberately leaves arena blocks out o
   bounds the pause, and close scores can cause extra movement until the ordering stabilizes.
 - ➖ Small-object arena promotion is deferred; it needs an arena-aware aggregate/movement policy and
   is lower priority because those heads generate less cross-node bandwidth.
+- `--perverse` is a benchmark-only policy inversion: region zero is deliberately placed on the
+  farthest node and still treated as preferred, while workers and ordinary allocations remain on the
+  serving node. It permits a controlled remote-DRAM latency comparison and must not be interpreted as
+  a production placement recommendation.

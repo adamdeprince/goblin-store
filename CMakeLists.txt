@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(goblin-store LANGUAGES CXX C VERSION 0.0.1)
+project(goblin-store LANGUAGES CXX C VERSION 0.0.2)
 
 # ---- Standard (ADR-0004): C++23, no extensions, modules off for now ----
 set(CMAKE_CXX_STANDARD 23)

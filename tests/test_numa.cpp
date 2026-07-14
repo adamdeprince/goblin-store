@@ -103,6 +103,44 @@ TEST("Unknown NIC locality on a multi-node host requires an explicit override") 
     }
 }
 
+TEST("Perverse NUMA selection chooses the farthest node from the serving node") {
+    const std::array<unsigned, 4> online{0, 1, 2, 3};
+    const std::array<unsigned, 4> distances{10, 20, 30, 20};
+    auto node = select_farthest_numa_node(0, online, distances);
+    CHECK(node.has_value());
+    if (node) CHECK_EQ(*node, 2u);
+}
+
+TEST("Perverse NUMA selection is deterministic for ties and sparse node IDs") {
+    const std::array<unsigned, 4> tied_online{3, 0, 2, 1};
+    const std::array<unsigned, 4> tied_distances{10, 20, 30, 30};
+    auto tied = select_farthest_numa_node(0, tied_online, tied_distances);
+    CHECK(tied.has_value());
+    if (tied) CHECK_EQ(*tied, 2u);
+
+    const std::array<unsigned, 3> sparse_online{0, 2, 7};
+    const std::array<unsigned, 8> sparse_distances{10, 0, 30, 0, 0, 0, 0, 20};
+    auto sparse = select_farthest_numa_node(0, sparse_online, sparse_distances);
+    CHECK(sparse.has_value());
+    if (sparse) CHECK_EQ(*sparse, 2u);
+}
+
+TEST("Perverse NUMA selection rejects one-node and incomplete topologies") {
+    const std::array<unsigned, 1> one_node{0};
+    const std::array<unsigned, 1> one_distance{10};
+    auto alone = select_farthest_numa_node(0, one_node, one_distance);
+    CHECK(!alone.has_value());
+    if (!alone)
+        CHECK(alone.error().detail.find("at least two online NUMA nodes") != std::string::npos);
+
+    const std::array<unsigned, 2> sparse_online{0, 7};
+    const std::array<unsigned, 4> short_row{10, 20, 20, 20};
+    auto missing = select_farthest_numa_node(0, sparse_online, short_row);
+    CHECK(!missing.has_value());
+    if (!missing)
+        CHECK(missing.error().detail.find("no entry for online node 7") != std::string::npos);
+}
+
 TEST("NUMA memory planning puts the local budget first and sub-memory on every other node") {
     const std::array<unsigned, 4> online{0, 1, 2, 3};
     auto plan = plan_numa_memory(/*local_node=*/2, online, 100 * GiB, 20 * GiB);
