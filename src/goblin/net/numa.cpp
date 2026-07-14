@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <set>
 #include <string>
@@ -114,7 +115,7 @@ Result<std::vector<unsigned>> node_distances(unsigned node) {
     return distances;
 }
 
-Result<std::vector<unsigned>> node_cpus(unsigned node) {
+Result<std::vector<unsigned>> read_node_cpus(unsigned node) {
     const std::string path =
         "/sys/devices/system/node/node" + std::to_string(node) + "/cpulist";
     auto line = read_line(path);
@@ -169,30 +170,34 @@ Result<std::vector<NicAddress>> discover_listener_interfaces() {
     return out;
 }
 
-Result<std::vector<unsigned>> bind_current_thread(std::span<const unsigned> node_cpus_list) {
+Result<std::vector<unsigned>> current_thread_cpus() {
     cpu_set_t allowed;
-    cpu_set_t target;
     CPU_ZERO(&allowed);
-    CPU_ZERO(&target);
     if (::sched_getaffinity(0, sizeof allowed, &allowed) != 0)
         return err(Errc::io_error, std::string("sched_getaffinity: ") + std::strerror(errno));
 
-    std::vector<unsigned> effective;
-    for (const unsigned cpu : node_cpus_list) {
+    std::vector<unsigned> cpus;
+    for (unsigned cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+        if (CPU_ISSET(cpu, &allowed)) cpus.push_back(cpu);
+    if (cpus.empty())
+        return err(Errc::invalid_argument, "this process has no CPUs in its affinity mask");
+    return cpus;
+}
+
+Status bind_current_thread(std::span<const unsigned> cpus) {
+    cpu_set_t target;
+    CPU_ZERO(&target);
+    if (cpus.empty())
+        return err(Errc::invalid_argument, "cannot bind a thread to an empty CPU list");
+    for (const unsigned cpu : cpus) {
         if (cpu >= CPU_SETSIZE)
             return err(Errc::unsupported,
                        "CPU " + std::to_string(cpu) + " exceeds this build's CPU_SETSIZE");
-        if (CPU_ISSET(cpu, &allowed)) {
-            CPU_SET(cpu, &target);
-            effective.push_back(cpu);
-        }
+        CPU_SET(cpu, &target);
     }
-    if (effective.empty())
-        return err(Errc::invalid_argument,
-                   "the selected NUMA node has no CPUs allowed by this process/cgroup");
     if (::sched_setaffinity(0, sizeof target, &target) != 0)
         return err(Errc::io_error, std::string("sched_setaffinity: ") + std::strerror(errno));
-    return effective;
+    return {};
 }
 
 Status bind_current_thread_memory(unsigned node) {
@@ -316,8 +321,44 @@ Result<unsigned> select_farthest_numa_node(
     return *farthest;
 }
 
+Result<std::vector<unsigned>> numa_node_cpus(unsigned node,
+                                             std::span<const unsigned> allowed_cpus) {
+#if defined(__linux__)
+    auto node_list = read_node_cpus(node);
+    if (!node_list) return std::unexpected(node_list.error());
+    std::vector<unsigned> allowed(allowed_cpus.begin(), allowed_cpus.end());
+    std::sort(allowed.begin(), allowed.end());
+    allowed.erase(std::unique(allowed.begin(), allowed.end()), allowed.end());
+    std::vector<unsigned> effective;
+    std::set_intersection(node_list->begin(), node_list->end(), allowed.begin(), allowed.end(),
+                          std::back_inserter(effective));
+    if (effective.empty())
+        return err(Errc::invalid_argument,
+                   "NUMA node " + std::to_string(node) +
+                       " has no CPUs allowed by this process/cgroup/taskset");
+    return effective;
+#else
+    (void)node;
+    (void)allowed_cpus;
+    return err(Errc::unsupported, "NUMA affinity is supported only on Linux");
+#endif
+}
+
+Status bind_numa_worker(unsigned node, std::span<const unsigned> cpus) {
+#if defined(__linux__)
+    if (auto affinity = bind_current_thread(cpus); !affinity) return affinity;
+    return bind_current_thread_memory(node);
+#else
+    (void)node;
+    (void)cpus;
+    return err(Errc::unsupported, "NUMA affinity is supported only on Linux");
+#endif
+}
+
 Result<NumaBinding> configure_numa(std::optional<unsigned> requested, bool perverse) {
 #if defined(__linux__)
+    auto allowed = current_thread_cpus();
+    if (!allowed) return std::unexpected(allowed.error());
     auto online = online_numa_nodes();
     if (!online) return std::unexpected(online.error());
 
@@ -339,10 +380,10 @@ Result<NumaBinding> configure_numa(std::optional<unsigned> requested, bool perve
         preferred_memory_node = *farthest;
         preferred_memory_distance = (*distances)[*farthest];
     }
-    auto cpus = node_cpus(*node);
-    if (!cpus) return std::unexpected(cpus.error());
-    auto effective = bind_current_thread(*cpus);
+    auto effective = numa_node_cpus(*node, *allowed);
     if (!effective) return std::unexpected(effective.error());
+    if (auto affinity = bind_current_thread(*effective); !affinity)
+        return std::unexpected(affinity.error());
     if (auto memory = bind_current_thread_memory(*node); !memory)
         return std::unexpected(memory.error());
     NumaBinding binding;
@@ -350,6 +391,7 @@ Result<NumaBinding> configure_numa(std::optional<unsigned> requested, bool perve
     binding.preferred_memory_node = preferred_memory_node;
     binding.preferred_memory_distance = preferred_memory_distance;
     binding.cpus = std::move(*effective);
+    binding.allowed_cpus = std::move(*allowed);
     binding.interfaces = std::move(interfaces);
     binding.online_nodes = std::move(*online);
     binding.automatic = !requested.has_value();

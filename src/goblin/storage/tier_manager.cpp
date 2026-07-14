@@ -144,6 +144,23 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
     auto ram = make_ram();
     if (!ram) return std::unexpected(ram.error());
 
+    // Fixed-head scores are dense by physical head slot and backed on the same NUMA node as the
+    // corresponding head blocks. Region-local scanner threads therefore never pull the O(N) score
+    // array through the interconnect just to choose one block.
+    std::vector<NumaScoreRegionConfig> score_regions;
+    score_regions.reserve(ram->region_count());
+    for (std::size_t region = 0; region < ram->region_count(); ++region) {
+        NumaScoreRegionConfig score_region;
+        score_region.first_block = ram->region_first_block(region);
+        score_region.block_count =
+            static_cast<std::size_t>(ram->region_end_block(region) - score_region.first_block);
+        score_region.numa_node = ram->region_numa_node(region);
+        if (region < mem.numa_regions.size()) score_region.cpus = mem.numa_regions[region].cpus;
+        score_regions.push_back(std::move(score_region));
+    }
+    auto head_scores = NumaHeadScoreTable::create(mem.block_bytes, t.ram_head, score_regions);
+    if (!head_scores) return std::unexpected(head_scores.error());
+
     const std::size_t cap_hint =
         t.ram_head ? static_cast<std::size_t>(mem.arena_bytes() / t.ram_head) : 1;
     auto head_policy = make_eviction_policy(ev.policy, cap_hint);
@@ -164,7 +181,8 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
     if (!wp) return std::unexpected(wp.error());
     TierManager tm(t, std::move(*ram), std::move(head_policy), std::move(object_policy),
                    ev.max_ssd_objects, std::move(*sp), std::move(hp), index, mem.small_min_alloc,
-                   access_score);
+                   access_score,
+                   std::make_unique<NumaHeadScoreTable>(std::move(*head_scores)));
     tm.write_pool_ = std::make_unique<core::IoBufferPool>(std::move(*wp));
     return tm;
 }
@@ -433,7 +451,19 @@ Status TierManager::StoreHandle::commit(std::uint32_t flags, std::uint32_t expir
     if (head_) meta.head = HeadLoc{head_->block, head_->offset, head_->len};
     if (expiry != 0) tm_->any_ttl_->store(true, std::memory_order_relaxed); // arm the reaper
     tm_->index_->set(digest_, meta);
-    if (head_) tm_->policy_->insert(digest_);
+    if (head_) {
+        // Index::set preserves a replacement key's accumulated score. Publish that canonical
+        // value into the new physical fixed-head slot after retiring the old slot above. Fractional
+        // small-arena heads deliberately have no dense slot.
+        const double score = tm_->index_->score(digest_).value_or(0.0);
+        if (meta.head.len == tm_->tiers_.ram_head &&
+            tm_->numa_scores_healthy_->load(std::memory_order_relaxed)) {
+            if (auto status = tm_->head_scores_->publish(meta.head, score); !status) {
+                tm_->disable_numa_scores(status.error());
+            }
+        }
+        tm_->policy_->insert(digest_);
+    }
     if (!old) tm_->object_policy_->insert(digest_); // only new objects count toward the SSD bound
     tm_->write_pool_->release(stage_);              // return the staging buffer (under the lock)
     stage_ = {};
@@ -517,10 +547,17 @@ static void add_drive_segs(TierManager::ReadStream::Plan& p, const DrivePool& dp
 }
 
 Result<TierManager::ReadStream> TierManager::open_read(const Digest& digest) {
-    const auto meta = index_->lookup(digest);
-    if (!meta) return err(Errc::not_found, "object not in index");
-    index_->increment_score(digest, access_score_.increment);
-    const ObjectLayout layout = compute_layout(meta->size, tiers_, three_layer());
+    ObjectMeta meta;
+    {
+        // Dense slot scores are ordinary SIMD-readable memory. Join the same quiescence domain as
+        // every other score update so a node scanner never races this legacy streaming path.
+        std::unique_lock<std::shared_mutex> lk(*mu_);
+        const auto found = index_->lookup(digest);
+        if (!found) return err(Errc::not_found, "object not in index");
+        meta = *found;
+        record_access_locked(digest, meta);
+    }
+    const ObjectLayout layout = compute_layout(meta.size, tiers_, three_layer());
     ObjectFiles ssd; // RAM-only objects have no SSD extent -> empty files; plan() then yields head-only
     if (layout.ssd_bytes > 0) {
         auto f = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/false);
@@ -533,7 +570,7 @@ Result<TierManager::ReadStream> TierManager::open_read(const Digest& digest) {
         if (!h) return std::unexpected(h.error());
         hdd.emplace(std::move(*h));
     }
-    return ReadStream(this, digest, meta->size, layout, std::move(ssd), std::move(hdd));
+    return ReadStream(this, digest, meta.size, layout, std::move(ssd), std::move(hdd));
 }
 
 TierManager::ReadStream::Plan TierManager::ReadStream::plan(Offset off, MutBytes out) {
@@ -606,9 +643,25 @@ std::optional<ByteView> TierManager::head_view(const Digest& digest) {
 
 void TierManager::touch(const Digest& digest) {
     std::unique_lock<std::shared_mutex> lk(*mu_); // touch mutates the policy (visited bit)
+    const auto meta = index_->lookup(digest);
     policy_->touch(digest);
     object_policy_->touch(digest);
-    index_->increment_score(digest, access_score_.increment);
+    if (meta) record_access_locked(digest, *meta);
+}
+
+void TierManager::record_access_locked(const Digest& digest, const ObjectMeta& meta) {
+    if (!index_->increment_score(digest, access_score_.increment)) return;
+    if (meta.head.resident() && meta.head.len == tiers_.ram_head &&
+        numa_scores_healthy_->load(std::memory_order_relaxed)) {
+        if (auto status = head_scores_->increment(meta.head, access_score_.increment); !status) {
+            disable_numa_scores(status.error());
+        }
+    }
+}
+
+void TierManager::disable_numa_scores(const Error& error) {
+    if (!numa_scores_healthy_->exchange(false, std::memory_order_relaxed)) return;
+    std::fprintf(stderr, "NUMA score maintenance disabled: %s\n", error.detail.c_str());
 }
 
 void TierManager::decay_access_scores() {
@@ -622,18 +675,27 @@ void TierManager::decay_access_scores() {
     } pending(gate.rescore_pending);
 
     // A current block exchange may finish, but its tight loop sees rescore_pending before starting
-    // another. Holding operation keeps the index traversal and all block ranking/copying disjoint.
+    // another. The storage lock makes the ordinary SIMD arrays quiescent while node-local workers
+    // decay them; operation keeps the two maintenance jobs disjoint.
     std::lock_guard maintenance(gate.operation);
+    std::unique_lock<std::shared_mutex> lk(*mu_);
     index_->decay_scores(access_score_.decay);
+    if (numa_scores_healthy_->load(std::memory_order_relaxed)) {
+        if (auto status = head_scores_->decay(access_score_.decay); !status) {
+            disable_numa_scores(status.error());
+        }
+    }
 }
 
 bool TierManager::promote_hot_remote_block() {
     auto& gate = *score_maintenance_;
+    if (!numa_scores_healthy_->load(std::memory_order_relaxed)) return false;
     if (gate.rescore_pending.load(std::memory_order_acquire)) return false;
 
-    // Do not reserve the maintenance gate while waiting for ordinary storage readers/writers: decay
-    // does not need mu_ and must only ever wait for a promotion that is actually ready to run.
+    // Do not reserve the maintenance gate while waiting for ordinary storage readers/writers. A
+    // pending decay announces itself first, so this lock order cannot starve or deadlock it.
     std::unique_lock<std::shared_mutex> lk(*mu_);
+    if (!numa_scores_healthy_->load(std::memory_order_relaxed)) return false;
     if (gate.rescore_pending.load(std::memory_order_acquire)) return false;
     std::unique_lock maintenance(gate.operation, std::try_to_lock);
     if (!maintenance.owns_lock()) return false;
@@ -643,49 +705,27 @@ bool TierManager::promote_hot_remote_block() {
 
     if (ram_.region_count() < 2) return false;
 
-    struct Heat {
-        double score = 0.0;
-        Size indexed_bytes = 0;
-    };
-    std::unordered_map<unsigned, Heat> heat;
-    for (const auto& scored : index_->scored_resident_heads()) {
-        const auto footprint = ram_.buddy_allocation_bytes(scored.head.block, scored.head.len);
-        if (!footprint) continue; // bump-arena heads do not participate in NUMA promotion
-        auto& block = heat[scored.head.block];
-        if (*footprint > std::numeric_limits<Size>::max() - block.indexed_bytes)
-            block.indexed_bytes = std::numeric_limits<Size>::max();
-        else
-            block.indexed_bytes += *footprint;
-        block.score += scored.score; // total accesses drive the cross-node traffic for this block
-    }
-
-    const auto pinned = [&](unsigned block) {
-        for (const auto& [id, pin] : pins_)
-            if (pin.refcount > 0 && static_cast<unsigned>(id >> 32) == block) return true;
+    // The node workers see only their node-bound dense doubles. This coordinator supplies the
+    // comparatively tiny set of pinned block numbers and receives one extrema summary per node.
+    std::vector<unsigned> pinned_blocks;
+    pinned_blocks.reserve(pins_.size());
+    for (const auto& [id, pin] : pins_)
+        if (pin.refcount > 0) pinned_blocks.push_back(static_cast<unsigned>(id >> 32));
+    const auto candidates = head_scores_->promotion_candidates(pinned_blocks);
+    if (!candidates) {
+        disable_numa_scores(candidates.error());
         return false;
-    };
-    struct Candidate {
-        unsigned block;
-        double score;
-    };
-    std::optional<Candidate> cold_local;
-    std::optional<Candidate> hot_remote;
-    for (const auto& [block, value] : heat) {
-        if (pinned(block) || !ram_.full_buddy_block(block, value.indexed_bytes)) continue;
-        if (ram_.block_is_local(block)) {
-            if (!cold_local || value.score < cold_local->score ||
-                (value.score == cold_local->score && block < cold_local->block))
-                cold_local = Candidate{block, value.score};
-        } else if (!hot_remote || value.score > hot_remote->score ||
-                   (value.score == hot_remote->score && block < hot_remote->block)) {
-            hot_remote = Candidate{block, value.score};
-        }
     }
-
+    const auto& cold_local = candidates->cold_preferred;
+    const auto& hot_remote = candidates->hot_foreign;
     if (!cold_local || !hot_remote || hot_remote->score <= cold_local->score) return false;
     const auto started = std::chrono::steady_clock::now();
-    if (!ram_.swap_blocks(cold_local->block, hot_remote->block)) return false;
-    index_->swap_head_blocks(cold_local->block, hot_remote->block);
+    const auto cold_block = static_cast<unsigned>(cold_local->index);
+    const auto hot_block = static_cast<unsigned>(hot_remote->index);
+    if (!ram_.swap_blocks(cold_block, hot_block)) return false;
+    index_->swap_head_blocks(cold_block, hot_block);
+    if (auto status = head_scores_->swap_blocks(cold_block, hot_block); !status)
+        disable_numa_scores(status.error());
     const auto elapsed = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count());
@@ -718,7 +758,7 @@ std::optional<TierManager::HeadPin> TierManager::pin_head(const Digest& digest) 
     std::unique_lock<std::shared_mutex> lk(*mu_);
     const auto meta = index_->lookup(digest);
     if (!meta) return std::nullopt;
-    index_->increment_score(digest, access_score_.increment);
+    record_access_locked(digest, *meta);
     object_policy_->touch(digest); // the whole object was accessed
     if (!meta->head.resident()) return std::nullopt;
     policy_->touch(digest); // head-cache hit
@@ -746,6 +786,11 @@ ByteView TierManager::pinned_bytes(const HeadPin& pin) const {
 // Free a head's RAM, or — if a reader has it pinned — orphan it so the last unpin frees it.
 // Called under the storage lock (by begin_store / drop_object).
 void TierManager::free_head_region(unsigned block, std::uint32_t offset, std::uint32_t len) {
+    if (len == tiers_.ram_head && numa_scores_healthy_->load(std::memory_order_relaxed)) {
+        if (auto status = head_scores_->erase(HeadLoc{block, offset, len}); !status) {
+            disable_numa_scores(status.error());
+        }
+    }
     const auto it = pins_.find(region_id(block, offset));
     if (it != pins_.end() && it->second.refcount > 0)
         it->second.orphaned = true;
@@ -795,7 +840,7 @@ std::optional<TierManager::Snapshot> TierManager::open_snapshot(const Digest& di
     const auto m = index_->lookup(digest);
     if (!m) return std::nullopt;
     if (is_expired(*m, now_unix())) return std::nullopt; // TTL passed -> lazy miss (reaper reclaims)
-    if (record_access) index_->increment_score(digest, access_score_.increment);
+    if (record_access) record_access_locked(digest, *m);
     object_policy_->touch(digest); // the whole object was accessed
     const Size head_len = m->head.resident() ? m->head.len : 0;
 

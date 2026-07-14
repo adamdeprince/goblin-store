@@ -706,8 +706,10 @@ TEST("tier_manager: hotter full foreign block replaces colder local block") {
     mem.block_bytes = 64 * KiB;
     mem.lock_memory = false;
     // Two unbound logical regions exercise local/foreign ordering portably; production supplies the
-    // physical node IDs and BlockPool installs mbind policies for the same ranges.
-    mem.numa_regions = {{std::nullopt, 64 * KiB}, {std::nullopt, 64 * KiB}};
+    // physical node IDs and BlockPool installs mbind policies for the same ranges. The extra local
+    // block holds a fractional small-object arena, which must not enter or disable the fixed-head
+    // score table.
+    mem.numa_regions = {{std::nullopt, 128 * KiB}, {std::nullopt, 64 * KiB}};
     EvictionConfig ev;
     AccessScoreConfig score;
     score.increment = 2.0;
@@ -722,14 +724,18 @@ TEST("tier_manager: hotter full foreign block replaces colder local block") {
     }
 
     constexpr Size kSize = 68 * KiB; // disk-backed object with one whole 64 KiB buddy head
+    const std::array<std::byte, 128> small{};
     std::vector<std::byte> cold(kSize, std::byte{0x19});
     std::vector<std::byte> hot(kSize, std::byte{0x5A});
+    const auto small_key = hash_key("/fractional-local");
     const auto cold_key = hash_key("/cold-local");
     const auto hot_key = hash_key("/hot-remote");
+    CHECK(tm->store(small_key, ByteView(small.data(), small.size()), 0).has_value());
     CHECK(tm->store(cold_key, ByteView(cold.data(), cold.size()), 0).has_value());
     CHECK(tm->store(hot_key, ByteView(hot.data(), hot.size()), 0).has_value());
-    CHECK_EQ(index.lookup(cold_key)->head.block, 0u);
-    CHECK_EQ(index.lookup(hot_key)->head.block, 1u);
+    CHECK_EQ(index.lookup(small_key)->head.block, 0u);
+    CHECK_EQ(index.lookup(cold_key)->head.block, 1u);
+    CHECK_EQ(index.lookup(hot_key)->head.block, 2u);
 
     // An active zero-copy reader pins the remote block, so the first pass must leave it in place.
     const auto pin = tm->pin_head(hot_key); // one successful read: remote score becomes 2
@@ -747,8 +753,8 @@ TEST("tier_manager: hotter full foreign block replaces colder local block") {
     const auto hot_meta = index.lookup(hot_key);
     CHECK(cold_meta && hot_meta);
     if (cold_meta && hot_meta) {
-        CHECK_EQ(cold_meta->head.block, 1u);
-        CHECK_EQ(hot_meta->head.block, 0u);
+        CHECK_EQ(cold_meta->head.block, 2u);
+        CHECK_EQ(hot_meta->head.block, 1u);
         CHECK_EQ(*index.score(hot_key), 2.0); // score follows the key, not the physical block
     }
     const auto cold_head = tm->head_view(cold_key);

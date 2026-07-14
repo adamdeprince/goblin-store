@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace goblin {
@@ -39,6 +40,15 @@ struct NumaMemoryRegionConfig {
     // portable library callers and tests without asking a non-Linux host to install NUMA policy.
     std::optional<unsigned> node;
     Size bytes = 0;
+    // CPUs on `node` that were allowed before main narrowed itself to the serving node. The
+    // per-node score scanners use this saved intersection to broaden their inherited affinity
+    // safely without escaping an operator-supplied taskset/cgroup restriction.
+    std::vector<unsigned> cpus;
+
+    NumaMemoryRegionConfig() = default;
+    NumaMemoryRegionConfig(std::optional<unsigned> region_node, Size region_bytes,
+                           std::vector<unsigned> region_cpus = {})
+        : node(region_node), bytes(region_bytes), cpus(std::move(region_cpus)) {}
 };
 
 #if defined(__aarch64__) || defined(__arm__) || defined(__loongarch__)

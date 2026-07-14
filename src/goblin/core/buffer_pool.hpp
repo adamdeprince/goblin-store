@@ -169,6 +169,15 @@ public:
     Size block_bytes() const noexcept { return blocks_.block_bytes(); }
     Size free_blocks() const noexcept { return blocks_.free_blocks(); }
     std::size_t region_count() const noexcept { return blocks_.region_count(); }
+    unsigned region_first_block(std::size_t region) const noexcept {
+        return blocks_.region_first_block(region);
+    }
+    unsigned region_end_block(std::size_t region) const noexcept {
+        return blocks_.region_end_block(region);
+    }
+    std::optional<unsigned> region_numa_node(std::size_t region) const noexcept {
+        return blocks_.region_numa_node(region);
+    }
     bool block_is_local(unsigned block) const noexcept;
     std::optional<std::size_t> block_region(unsigned block) const noexcept {
         return blocks_.block_region(block);

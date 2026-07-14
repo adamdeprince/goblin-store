@@ -22,6 +22,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace {
 using namespace goblin;
@@ -225,8 +226,8 @@ int main(int argc, char** argv) {
     }
 
     // Bind before allocating any pools. Local transient pools first-touch on this node; the head
-    // arena receives explicit per-range NUMA policies below. Every subsequently-created worker and
-    // maintenance thread inherits the same local-node CPU mask.
+    // arena receives explicit per-range NUMA policies below. Protocol workers inherit this node;
+    // each score scanner later overrides the inherited CPU and memory policy for its own node.
     std::optional<net::NumaBinding> numa;
     if (cfg.numa_enabled) {
         auto configured = net::configure_numa(cfg.numa_node, cfg.numa_perverse);
@@ -245,8 +246,15 @@ int main(int argc, char** argv) {
         }
         cfg.memory.numa_regions.clear();
         cfg.memory.numa_regions.reserve(memory_plan->size());
-        for (const auto& region : *memory_plan)
-            cfg.memory.numa_regions.push_back({region.node, region.bytes});
+        for (const auto& region : *memory_plan) {
+            auto cpus = net::numa_node_cpus(region.node, numa->allowed_cpus);
+            if (!cpus) {
+                std::println(stderr, "numa worker error: {}", cpus.error().detail);
+                return 1;
+            }
+            cfg.memory.numa_regions.push_back(
+                {region.node, region.bytes, std::move(*cpus)});
+        }
     }
 
     std::println("┌─ goblin-store 0.0.2 ─────────────────────────");

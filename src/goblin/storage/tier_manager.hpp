@@ -16,6 +16,7 @@
 #include "goblin/storage/drive_pool.hpp"
 #include "goblin/storage/index.hpp"
 #include "goblin/storage/layout.hpp"
+#include "goblin/storage/numa_head_scores.hpp"
 
 #include <memory>
 #include <mutex>
@@ -209,16 +210,19 @@ private:
     TierManager(TierSizes t, core::BufferPool ram, std::unique_ptr<EvictionPolicy> head_policy,
                 std::unique_ptr<EvictionPolicy> object_policy, std::uint64_t max_objects, Pool ssd,
                 std::optional<Pool> hdd, Index& ix, Size small_min_alloc,
-                AccessScoreConfig access_score)
+                AccessScoreConfig access_score,
+                std::unique_ptr<NumaHeadScoreTable> head_scores)
         : tiers_(t), access_score_(access_score), small_min_alloc_(small_min_alloc),
           ram_(std::move(ram)), policy_(std::move(head_policy)),
           object_policy_(std::move(object_policy)), max_objects_(max_objects), ssd_(std::move(ssd)),
           hdd_(std::move(hdd)), index_(&ix),
+          head_scores_(std::move(head_scores)),
           store_seq_(std::make_unique<std::atomic<std::uint64_t>>(0)),
           etag_seq_(std::make_unique<std::atomic<std::uint64_t>>(0)),
           any_ttl_(std::make_unique<std::atomic<bool>>(false)),
           mu_(std::make_unique<std::shared_mutex>()),
           score_maintenance_(std::make_unique<ScoreMaintenanceGate>()),
+          numa_scores_healthy_(std::make_unique<std::atomic<bool>>(true)),
           numa_promotion_count_(std::make_unique<std::atomic<std::uint64_t>>(0)),
           numa_promotion_bytes_(std::make_unique<std::atomic<std::uint64_t>>(0)),
           numa_promotion_total_ns_(std::make_unique<std::atomic<std::uint64_t>>(0)),
@@ -227,6 +231,10 @@ private:
     void enforce_object_bound();     // evict whole objects while over the count limit
     void free_head_region(unsigned block, std::uint32_t offset, std::uint32_t len); // free or orphan
     void compact_small(); // slide live heads down within fragmented small arenas; reclaim dead space (ADR-0008)
+    // Caller holds mu_ exclusively. Keep the canonical key score and its NUMA-local fixed-head
+    // slot in step; headless and fractional-arena objects have no dense slot.
+    void record_access_locked(const Digest&, const ObjectMeta&);
+    void disable_numa_scores(const Error&); // log once and prevent unsafe score-based swaps
     static std::uint64_t region_id(unsigned block, std::uint32_t offset) {
         return (static_cast<std::uint64_t>(block) << 32) | offset;
     }
@@ -242,12 +250,14 @@ private:
     Pool ssd_;
     std::optional<Pool> hdd_;
     Index* index_;
+    std::unique_ptr<NumaHeadScoreTable> head_scores_;
     std::unique_ptr<std::atomic<std::uint64_t>> store_seq_; // unique CoW scratch-file suffixes
     std::unique_ptr<std::atomic<std::uint64_t>> etag_seq_;  // monotonic store generation -> ETag
     std::unique_ptr<std::atomic<bool>> any_ttl_; // a TTL has been set -> reaper scans (else O(1) skip)
     std::unique_ptr<std::shared_mutex> mu_; // rwlock: shared for reads, exclusive for writes (ADR-0018)
     // Decay announces itself before taking operation, so the tight promotion loop cannot overtake it.
     std::unique_ptr<ScoreMaintenanceGate> score_maintenance_;
+    std::unique_ptr<std::atomic<bool>> numa_scores_healthy_;
     std::unique_ptr<std::atomic<std::uint64_t>> numa_promotion_count_;
     std::unique_ptr<std::atomic<std::uint64_t>> numa_promotion_bytes_;
     std::unique_ptr<std::atomic<std::uint64_t>> numa_promotion_total_ns_;

@@ -25,6 +25,7 @@ struct NumaBinding {
     unsigned preferred_memory_node = 0;   // region-zero head arena; normally == node
     std::optional<unsigned> preferred_memory_distance; // populated by --perverse
     std::vector<unsigned> cpus;       // node CPUs intersected with this process's allowed CPU mask
+    std::vector<unsigned> allowed_cpus; // affinity mask captured before selecting/narrowing a node
     std::vector<NicAddress> interfaces; // populated for automatic NIC-derived selection
     std::vector<unsigned> online_nodes; // physical node IDs reported by Linux sysfs
     bool automatic = false;
@@ -50,10 +51,17 @@ Result<unsigned> select_farthest_numa_node(unsigned serving_node,
                                            std::span<const unsigned> distance_by_node);
 
 // Discover/select a node, bind the calling thread to its effective CPUs, and install a strict local
-// default memory policy. Threads subsequently created by it inherit both policies, keeping index,
-// protocol, I/O, and maintenance allocations on the selected node. Explicit head ranges may still
-// override the default with mbind() for --sub-memory.
+// default memory policy. Ordinary threads subsequently created by it inherit both policies,
+// keeping index, protocol, and I/O allocations on the selected node. Per-node score scanners
+// explicitly override both policies; explicit head ranges may override memory with mbind().
 Result<NumaBinding> configure_numa(std::optional<unsigned> requested, bool perverse = false);
+
+// Intersect a node's Linux cpulist with the affinity mask captured before configure_numa() narrowed
+// the main thread. Scanner workers inherit that narrow mask, so bind_numa_worker() deliberately
+// installs this saved, already-vetted list and changes their default memory policy to the same node.
+Result<std::vector<unsigned>> numa_node_cpus(unsigned node,
+                                             std::span<const unsigned> allowed_cpus);
+Status bind_numa_worker(unsigned node, std::span<const unsigned> cpus);
 
 // Build a local-first memory layout: --memory on local_node, followed by --sub-memory on every
 // other online node. A nonzero foreign_bytes budget needs at least one foreign node.
