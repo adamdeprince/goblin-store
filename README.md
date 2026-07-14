@@ -69,7 +69,7 @@ copy-on-write publish** (readers never see a torn value, [ADR-0018](docs/adr/001
 ([ADR-0008](docs/adr/0008-ram-allocator.md)), **s3fifo** + whole-object multi-resource eviction ([ADR-0007](docs/adr/0007-eviction-policy.md)/[ADR-0012](docs/adr/0012-multi-resource-eviction.md)), keyless **SHA-256
 digest identity** ([ADR-0014](docs/adr/0014-keyless-digest-identity.md)), and a **bounded, mlock-able** memory model ([ADR-0016](docs/adr/0016-bounded-locked-memory.md)).
 
-Start at **[`docs/adr/README.md`](docs/adr/README.md)** — 18 ADRs covering the full design.
+Start at **[`docs/adr/README.md`](docs/adr/README.md)** — 19 ADRs covering the full design.
 
 ## Protocols
 
@@ -81,8 +81,8 @@ Start at **[`docs/adr/README.md`](docs/adr/README.md)** — 18 ADRs covering the
   front). **HTTPS** via OpenSSL + **kTLS** with SNI cert selection.
 
 > **Status:** working memcache + HTTP/HTTPS server on io_uring + O_DIRECT — 3-tier store, atomic
-> publish, zero-copy head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **115 unit tests pass
-> under Release, ASan, and TSan.** macOS is a non-goal (no io_uring / O_DIRECT analog); FreeBSD
+> publish, zero-copy head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **146 unit-test cases
+> run under Release, ASan, and TSan.** macOS is a non-goal (no io_uring / O_DIRECT analog); FreeBSD
 > (kqueue/aio) is a planned port.
 
 ## Dependencies
@@ -122,18 +122,30 @@ ctest --test-dir build --output-on-failure
     --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool
 ```
 
-Key knobs (see `--help`): `--ram-head`, `--ssd-prefix` (positional tier sizes), `--io-buffers` /
+Key knobs (see `--help`): `--ram-head`, `--ssd-prefix` (positional tier sizes), `--block` (allocator
+backing block, default 2 MiB on x86 and 32 MiB on Arm/LoongArch), `--io-buffers` /
 `--io-chunk` (bounded streaming RAM), `--eviction`, `--max-objects`, `--no-mlock` (dev), `--tls-cert`/
 `--tls-key` (HTTPS), `--source` (preload a directory tree), `--numa NODE` (explicit NUMA
-placement), and `--sub-memory SIZE` (head-cache RAM on each non-local NUMA node).
+placement), `--sub-memory SIZE` (head-cache RAM on each non-local NUMA node), `--increment FLOAT`
+(score added per successful key read), and `--decay FLOAT` (per-minute score multiplier in `(0, 1)`).
+
+On Linux, every fixed block pool first requests explicit hugetlb pages of the `--block` size; streaming
+pools retain their smaller `--io-chunk` allocation granule within that mapping. Each NUMA region is
+attempted independently against that node's hugetlb pool. If the requested page size or enough pages
+for the entire region are unavailable, that region silently falls back to ordinary memory; allocator
+geometry and capacity do not change. Explicit huge pages are resident and unswappable; fallback head
+and streaming pools retain the configured `mlock` behavior. A pool must total a whole number of huge
+pages; for example, the default 16 MiB streaming pool on 32 MiB-page Arm/LoongArch falls back unless
+it is resized (such as `--io-buffers 128` with the default 256 KiB chunks).
 
 On Linux, Goblin Store binds the main thread before allocating its fixed RAM arenas; the worker and
 maintenance threads inherit that affinity, and `--cores 0` uses the number of CPUs available on the
-selected NUMA node as the worker count for each enabled protocol. Without `--numa`, the node is
-derived from the UP Ethernet interfaces covered by the wildcard listeners. If those interface
-addresses belong to different nodes—or locality is unknown on a multi-node host—startup stops and
-reports each Linux interface name, listening address, NUMA node, and the corresponding `--numa NODE`
-override.
+selected NUMA node as the worker count for each enabled protocol. A strict inherited local memory
+policy also keeps the dynamic key index, I/O buffers, and thread allocations on that node. Without
+`--numa`, the node is derived from the UP Ethernet interfaces covered by the wildcard listeners. If
+those interface addresses belong to different nodes—or locality is unknown on a multi-node
+host—startup stops and reports each Linux interface name, listening address, NUMA node, and the
+corresponding `--numa NODE` override.
 
 With explicit `--numa`, `--memory` is the head-cache budget on that local node. Optional
 `--sub-memory` adds the stated budget on **each** other online NUMA node and is rejected without an
@@ -142,6 +154,16 @@ allocator always searches local blocks first—including local blocks returned a
 has been used—and falls through to foreign regions only when the local region cannot satisfy the
 allocation. Total head-cache capacity is `--memory + (other_nodes × --sub-memory)`; bounded streaming
 I/O pools remain additional per-worker memory.
+
+Each key starts with a score of zero. A successful logical read adds `--increment` (default `1.0`),
+and once per minute every score is multiplied by `--decay` (default `0.5`). With foreign head-memory
+regions, a local maintenance thread compares the summed key score of complete buddy blocks: while the
+hottest eligible foreign block is hotter than the coldest eligible local block, their contents and
+allocator state are exchanged and the affected key locators are rewritten. Pinned, partially filled,
+in-flight, and compactable small-object arena blocks are not moved. When no safe score inversion
+exists, the thread waits one second before scanning again. The minute rescore has priority: once it
+announces that it is pending, no new promotion starts; an active block exchange finishes and then the
+entire decay traversal runs without promotion ([ADR-0019](docs/adr/0019-access-score-numa-promotion.md)).
 
 ## Layout
 ```
@@ -155,7 +177,7 @@ src/goblin/http/      HTTP request/response, key derivation
 src/goblin/tls/       OpenSSL + kTLS, SNI
 src/goblin/tools/     goblin-store-path-prep, goblin-bench
 tests/                dependency-free unit tests (Release + ASan + TSan)
-docs/adr/             18 architecture decision records
+docs/adr/             19 architecture decision records
 ```
 
 ## License

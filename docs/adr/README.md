@@ -23,5 +23,7 @@ these are decisions of record, not laws.
 | [0015](0015-http-key-derivation.md) | HTTP key derivation: path vs virtual-host mode; `--source` directory preloader | Accepted |
 | [0016](0016-bounded-locked-memory.md) | Bounded, locked memory: local `--memory`, optional per-node `--sub-memory`, fixed streaming pools | Accepted (partial) |
 | [0017](0017-buffer-taxonomy.md) | Buffer taxonomy: fixed head pool vs small streaming I/O pool; zero-copy head send | Accepted |
+| [0018](0018-concurrency-model.md) | Concurrency: thread-per-core network, shared locked storage | Accepted |
+| [0019](0019-access-score-numa-promotion.md) | Decayed per-key access scores and hot full-block NUMA promotion | Accepted |
 
 See [`../ARCHITECTURE.md`](../ARCHITECTURE.md) for the readable overview that ties these together.

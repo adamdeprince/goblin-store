@@ -7,17 +7,25 @@ RAM is a sized latency tool, not a savings tool. We want fixed, bounded,
 fragmentation-resistant RAM that also doubles as the io_uring **registered-buffer** region.
 
 ## Decision
-- RAM is **one preallocated virtual array of equal-size blocks**; block size is a **power of two**
-  (operator-configured). The array has one ordered free-list per NUMA region. Whole-block
-  allocation/free is O(1) within a region, and regions are searched local-first.
+- RAM is **one preallocated logical array of equal-size blocks**; block size is a **power of two**
+  (operator-configured; default 2 MiB on x86 and 32 MiB on Arm/LoongArch). These defaults match the
+  intended platform hugetlb geometry so hugepage-backed mappings do not change allocator packing.
+  The array has one ordered free-list per NUMA region. Whole-block allocation/free is O(1) within a
+  region, and regions are searched local-first.
 - Allocations **smaller than a block** take one block and run **buddy allocation inside it**
   (power-of-two sub-blocks down to a minimum order); split/merge is O(log).
 - The block array has a **fixed, command-line-specified size** — RAM is a sized latency tool, it
   never grows. Without subordinate memory its size is `--memory`; with explicit NUMA placement it is
   `--memory + (other online nodes × --sub-memory)`. The range is
-  **`mlock`ed / `MAP_LOCKED` — never swapped** (never page the fast head out to the very disk
-  we're trying to avoid), prefers hugepages (THP / `MAP_HUGETLB`), and is **registered once
-  with io_uring as a fixed buffer** so reads DMA straight into it. The arena is **aligned to the
+  **resident and unswappable** — never page the fast head out to the very disk we're trying to
+  avoid. On Linux, every fixed block pool first attempts an explicit `MAP_HUGETLB` mapping whose page
+  order matches `--block`; streaming pools keep the smaller `--io-chunk` allocation granule within
+  that backing mapping. Each NUMA region is attempted independently against that node's pool. An
+  unavailable size, insufficient pages for the complete region, or failed placement check silently
+  falls back to ordinary memory plus the configured `mlock`. Registering the arena with io_uring as
+  a fixed buffer remains a design target. A pool's total size must be a whole multiple of the
+  requested hugepage size; no hidden rounding is allowed because that would violate its configured
+  memory bound. The arena is **aligned to the
   device block size (≥ 4 KiB)** and blocks are power-of-two ≥ that — which hands us **O_DIRECT
   alignment for free** (see [ADR-0011](0011-odirect-bypass-page-cache.md)). *Ops:* raise
   `RLIMIT_MEMLOCK` (or grant `CAP_IPC_LOCK`) for multi-GB locked regions; fail fast at startup if
@@ -38,11 +46,20 @@ optional `--sub-memory` maps that many bytes on every other online node. `--sub-
 without explicit `--numa`, because automatic NIC selection is intentionally not enough authority to
 commit memory across the entire machine.
 
-The allocator reserves one contiguous virtual range, applies a strict physical-node
-`mbind(MPOL_BIND | MPOL_F_STATIC_NODES)` policy to each local/foreign subrange, then `mlock`s the
-whole range. Region zero is local. Allocation searches compatible local arenas and unused local
-blocks before visiting foreign regions. Separate per-region free lists preserve that ordering even
-when local and foreign blocks are returned in an arbitrary order.
+The allocator owns one independently mapped range per region. It attempts to populate each range
+from the selected node's explicit hugetlb pool and verifies residency and strict physical placement;
+if that attempt cannot be satisfied, it maps the same bytes normally, installs
+`mbind(MPOL_BIND | MPOL_F_STATIC_NODES)`, and `mlock`s them. Region zero is local. Allocation searches
+compatible local arenas and unused local blocks before visiting foreign regions. Separate per-region
+free lists preserve that ordering even when local and foreign blocks are returned in an arbitrary
+order. A global block ID resolves through a block-to-region table, so physical mappings need not be
+virtually contiguous.
+
+Once foreign blocks are in use, static local-first admission is augmented by score-based promotion
+([ADR-0019](0019-access-score-numa-promotion.md)). The maintenance pass may exchange a completely
+occupied local buddy block with a hotter completely occupied foreign buddy block. It swaps both the
+bytes and per-block allocator state, then rewrites every affected `HeadLoc`. Partial blocks and the
+small-object bump arena are not promotion candidates in this revision.
 
 ## Revision (2026-07): per-class allocators — buddy for large heads, byte-granular arena for small
 

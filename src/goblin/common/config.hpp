@@ -35,19 +35,28 @@ struct PoolConfig {
 };
 
 struct NumaMemoryRegionConfig {
-    unsigned node = 0;
+    // main() always supplies a physical node. nullopt keeps logical multi-region layouts usable by
+    // portable library callers and tests without asking a non-Linux host to install NUMA policy.
+    std::optional<unsigned> node;
     Size bytes = 0;
 };
+
+#if defined(__aarch64__) || defined(__arm__) || defined(__loongarch__)
+inline constexpr Size kDefaultMemoryBlock = 32 * MiB;
+#else
+inline constexpr Size kDefaultMemoryBlock = 2 * MiB;
+#endif
 
 struct MemoryConfig {                  // ADR-0008
     Size total_bytes  = 1 * GiB;       // --memory: head arena bytes on the selected/local NUMA node
     Size sub_bytes    = 0;             // --sub-memory: head arena bytes on each other NUMA node
-    Size block_bytes  = 1 * MiB;       // power-of-two block size
+    // Match the platform's intended hugetlb geometry so enabling hugetlb does not reshape arenas.
+    Size block_bytes  = kDefaultMemoryBlock; // x86: 2 MiB; Arm/LoongArch: 32 MiB
     Size small_min_alloc = 16;         // buddy min-order for RAM-only (<=ram_head) heads. Large heads
                                        // keep the 4 KiB (kDeviceBlock) order so they stay O_DIRECT-
                                        // aligned; RAM-only small objects never DMA, so they pack tight.
-    bool lock_memory  = true;          // mlock / MAP_LOCKED (never swap the head out)
-    bool use_hugepages = true;
+    bool lock_memory  = true;          // mlock normal mappings; explicit hugetlb is unswappable
+    bool use_hugepages = true;          // best-effort explicit hugetlb; normal memory on failure
     // Runtime-resolved local-first layout. Empty for direct library/test callers that want the
     // ordinary single-region allocator; main() populates it after NUMA selection.
     std::vector<NumaMemoryRegionConfig> numa_regions;
@@ -62,6 +71,11 @@ struct MemoryConfig {                  // ADR-0008
 
 enum class EvictionPolicyKind { sieve, s3fifo, tinylfu }; // selectable (ADR-0007)
 enum class NetMode { blocking, async };                   // --net (ADR-0018: async = io_uring loop)
+
+struct AccessScoreConfig {
+    double decay = 0.5;     // once/minute multiplier; strictly between zero and one
+    double increment = 1.0; // added once for each successful logical object read
+};
 
 struct EvictionConfig {                // ADR-0007 / ADR-0012
     EvictionPolicyKind policy = EvictionPolicyKind::s3fifo;
@@ -106,6 +120,7 @@ struct ServerConfig {
     PoolConfig     ssd;
     PoolConfig     hdd;                   // empty dirs => 2-layer mode
     EvictionConfig eviction;
+    AccessScoreConfig access_score;
     WriteMode      memcache_write_mode = WriteMode::evict;  // cache default
     WriteMode      http_write_mode     = WriteMode::block;  // origin default
     CacheBypass    cache_bypass = CacheBypass::o_direct;

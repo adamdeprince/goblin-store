@@ -3,6 +3,8 @@
 #include "goblin/common/config.hpp"
 #include "goblin/common/types.hpp"
 
+#include <limits>
+
 using namespace goblin;
 
 TEST("types: power-of-two & alignment helpers") {
@@ -26,6 +28,15 @@ TEST("config: defaults validate (2-layer)") {
     auto c = good_2layer();
     CHECK(validate(c).has_value());
     CHECK(!c.three_layer());
+    CHECK_EQ(c.memory.block_bytes, kDefaultMemoryBlock);
+}
+
+TEST("config: default backing block follows platform hugetlb geometry") {
+#if defined(__aarch64__) || defined(__arm__) || defined(__loongarch__)
+    CHECK_EQ(kDefaultMemoryBlock, Size(32 * MiB));
+#else
+    CHECK_EQ(kDefaultMemoryBlock, Size(2 * MiB));
+#endif
 }
 
 TEST("config: ram_head must be <= ssd_prefix") {
@@ -86,4 +97,27 @@ TEST("config: local and subordinate NUMA budgets contain whole blocks") {
     c.numa_node = 0;
     c.memory.sub_bytes = 4 * KiB;
     CHECK(!validate(c).has_value());
+}
+
+TEST("config: access score increment is finite and positive") {
+    auto c = good_2layer();
+    for (const double invalid : {0.0, -0.25, std::numeric_limits<double>::infinity(),
+                                 std::numeric_limits<double>::quiet_NaN()}) {
+        c.access_score.increment = invalid;
+        CHECK(!validate(c).has_value());
+    }
+    c.access_score.increment = 0.25;
+    CHECK(validate(c).has_value());
+}
+
+TEST("config: access score decay is strictly between zero and one") {
+    auto c = good_2layer();
+    for (const double invalid : {0.0, 1.0, -0.1, 1.1,
+                                 std::numeric_limits<double>::infinity(),
+                                 std::numeric_limits<double>::quiet_NaN()}) {
+        c.access_score.decay = invalid;
+        CHECK(!validate(c).has_value());
+    }
+    c.access_score.decay = 0.5;
+    CHECK(validate(c).has_value());
 }

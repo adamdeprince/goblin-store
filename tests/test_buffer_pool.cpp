@@ -2,6 +2,7 @@
 
 #include "goblin/core/buffer_pool.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 
@@ -91,10 +92,17 @@ TEST("block_pool: region priority survives out-of-order releases") {
         {128 * KiB, std::nullopt}, // preferred/local: blocks 0-1
         {128 * KiB, std::nullopt}, // subordinate: blocks 2-3
     }};
-    auto pool = BlockPool::create_regions(64 * KiB, regions, false);
+    auto pool = BlockPool::create_regions(64 * KiB, regions, false,
+                                          /*try_hugetlb=*/false);
     CHECK(pool.has_value());
     if (!pool) return;
     CHECK_EQ(pool->region_count(), std::size_t(2));
+    CHECK_EQ(pool->block_region(0), std::optional<std::size_t>(0));
+    CHECK_EQ(pool->block_region(1), std::optional<std::size_t>(0));
+    CHECK_EQ(pool->block_region(2), std::optional<std::size_t>(1));
+    CHECK(!pool->block_region(4).has_value());
+    CHECK(!pool->region_uses_hugetlb(0));
+    CHECK(!pool->region_uses_hugetlb(1));
 
     const auto local0 = pool->acquire();
     const auto local1 = pool->acquire();
@@ -114,6 +122,24 @@ TEST("block_pool: region priority survives out-of-order releases") {
         CHECK_EQ(*reacquired_local, *local0);
         CHECK_EQ(*reacquired_foreign, *foreign0);
     }
+
+    for (unsigned block = 0; block < 4; ++block) {
+        CHECK_EQ(pool->block_index(pool->block_data(block)), std::optional<unsigned>(block));
+        CHECK_EQ(pool->block_index(pool->block_data(block) + 17), std::optional<unsigned>(block));
+    }
+}
+
+TEST("block_pool: unavailable hugetlb silently falls back to ordinary memory") {
+    // 64 KiB is deliberately not the platform default huge-page size on supported production
+    // targets. The pool must remain usable whether the kernel rejects that order or happens to have
+    // such a pool configured.
+    auto pool = BlockPool::create(64 * KiB, 2, /*lock_memory=*/false,
+                                  /*try_hugetlb=*/true);
+    CHECK(pool.has_value());
+    if (!pool) return;
+    const auto block = pool->acquire();
+    CHECK(block.has_value());
+    if (block) pool->block_data(*block)[0] = std::byte{0x5a};
 }
 
 TEST("block_pool: rejects bad geometry") {
@@ -179,6 +205,60 @@ TEST("buffer_pool: a freed local block wins over space in an existing foreign ar
     const auto next = pool.allocate(4 * KiB, 4 * KiB);
     CHECK(next.has_value());
     if (next) CHECK_EQ(next->block, 0u);
+}
+
+TEST("buffer_pool: swaps full buddy blocks across logical NUMA regions") {
+    const std::array<BlockPoolRegion, 2> regions{{
+        {64 * KiB, std::nullopt}, // preferred/local block 0
+        {64 * KiB, std::nullopt}, // foreign block 1
+    }};
+    auto poolr = BufferPool::create_regions(regions, 64 * KiB, 4 * KiB, false);
+    CHECK(poolr.has_value());
+    if (!poolr) return;
+    auto& pool = *poolr;
+    const auto local = pool.allocate(64 * KiB, 4 * KiB);
+    const auto remote_a = pool.allocate(32 * KiB, 4 * KiB);
+    const auto remote_b = pool.allocate(32 * KiB, 4 * KiB);
+    CHECK(local && remote_a && remote_b);
+    if (!(local && remote_a && remote_b)) return;
+    CHECK(pool.block_is_local(local->block));
+    CHECK(!pool.block_is_local(remote_a->block));
+    CHECK_EQ(remote_a->block, remote_b->block);
+    CHECK(pool.full_buddy_block(local->block, 64 * KiB));
+    CHECK(pool.full_buddy_block(remote_a->block, 64 * KiB));
+    CHECK(!pool.full_buddy_block(local->block, 32 * KiB)); // incomplete index accounting is unsafe
+
+    std::fill_n(local->data, local->len, std::byte{0x11});
+    std::fill_n(remote_a->data, remote_a->len, std::byte{0x77});
+    std::fill_n(remote_b->data, remote_b->len, std::byte{0x55});
+    CHECK(pool.swap_blocks(local->block, remote_a->block));
+    CHECK(std::all_of(local->data + remote_a->offset,
+                      local->data + remote_a->offset + remote_a->len,
+                      [](std::byte b) { return b == std::byte{0x77}; }));
+    CHECK(std::all_of(local->data + remote_b->offset,
+                      local->data + remote_b->offset + remote_b->len,
+                      [](std::byte b) { return b == std::byte{0x55}; }));
+    CHECK(std::all_of(remote_a->data - remote_a->offset,
+                      remote_a->data - remote_a->offset + local->len,
+                      [](std::byte b) { return b == std::byte{0x11}; }));
+
+    // Allocator metadata moves with the bytes: the two former-remote halves now free block 0,
+    // while the former-local whole allocation now frees block 1.
+    pool.deallocate(local->block, remote_a->offset, remote_a->len);
+    pool.deallocate(local->block, remote_b->offset, remote_b->len);
+    pool.deallocate(remote_a->block, local->offset, local->len);
+    CHECK_EQ(pool.free_blocks(), Size(2));
+}
+
+TEST("buffer_pool: bump-arena blocks are excluded from full-block NUMA swaps") {
+    auto poolr = BufferPool::create(64 * KiB, 64 * KiB, 4 * KiB, false);
+    CHECK(poolr.has_value());
+    if (!poolr) return;
+    const auto small = poolr->allocate(1024, /*min_alloc=*/16);
+    CHECK(small.has_value());
+    if (!small) return;
+    CHECK(!poolr->buddy_allocation_bytes(small->block, small->len).has_value());
+    CHECK(!poolr->full_buddy_block(small->block, 64 * KiB));
 }
 
 TEST("arena: byte-granular bump packing; dead accounting; drains to empty") {
@@ -253,4 +333,15 @@ TEST("io_buffer_pool: fixed chunks, distinct + usable, exhaustion, release reuse
 
     p.release(*a);
     CHECK(p.acquire().has_value()); // reused
+}
+
+TEST("io_buffer_pool: backing hugepage order does not change chunk geometry") {
+    constexpr unsigned chunks = 32;
+    auto pr = IoBufferPool::create(/*chunk=*/64 * KiB, chunks, /*lock_memory=*/false,
+                                   /*try_hugetlb=*/true, /*hugetlb_bytes=*/2 * MiB);
+    CHECK(pr.has_value());
+    if (!pr) return;
+    CHECK_EQ(pr->chunk_bytes(), Size(64 * KiB));
+    for (unsigned i = 0; i < chunks; ++i) CHECK(pr->acquire().has_value());
+    CHECK(!pr->acquire().has_value());
 }

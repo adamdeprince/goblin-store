@@ -16,7 +16,10 @@ Built on **io_uring + O_DIRECT**, NUMA-bound thread-per-core shared-nothing loop
 copy-on-write publish** (readers never see a torn value), a buddy RAM-head allocator, and bounded,
 mlock-able RAM arenas. NUMA placement is explicit with `--numa NODE` or inferred from listener NICs;
 explicit placement can add `--sub-memory SIZE` on every foreign node with local-first allocation.
-Working memcache + HTTP/HTTPS server; **115 unit tests pass under Release, ASan, and TSan**. Linux-only by
+Per-key atomic access scores (`--increment`, aged once/minute by `--decay`) continuously exchange hot
+complete foreign buddy blocks with colder local blocks; decay has priority over promotion, and the
+dynamic key index stays on local memory.
+Working memcache + HTTP/HTTPS server; **146 unit-test cases run under Release, ASan, and TSan**. Linux-only by
 design (no macOS io_uring/O_DIRECT analog; FreeBSD is a planned port). Trunk branch is `initial`.
 
 ## Documentation
@@ -24,7 +27,7 @@ design (no macOS io_uring/O_DIRECT analog; FreeBSD is a planned port). Trunk bra
 - [Benchmarks](BENCHMARKS.md): full rig + methodology + results — memory-sized (7.4× less RAM, same latency), disk-sized (+68% throughput, ~25% cheaper than extstore), and the honest small-object verdict, with a cost model.
 
 ## Architecture (ADRs)
-- [ADR index](docs/adr/README.md): the 18 architecture decision records.
+- [ADR index](docs/adr/README.md): the 19 architecture decision records.
 - [ADR-0001: Thread-per-core, network-sharded concurrency](docs/adr/0001-thread-per-core-concurrency.md)
 - [ADR-0002: Per-core io_uring rings, shared drive fds, striped parallel reads](docs/adr/0002-iouring-rings-shared-drives.md)
 - [ADR-0003: Cache semantics — RAM head as a write-through cache of an SSD-resident prefix](docs/adr/0003-cache-semantics-head-as-cache.md) — revised: objects ≤ `ram_head` are now RAM-only (no SSD copy); see README/BENCHMARKS.
@@ -43,7 +46,8 @@ design (no macOS io_uring/O_DIRECT analog; FreeBSD is a planned port). Trunk bra
 - [ADR-0016: Bounded, locked memory across NUMA regions](docs/adr/0016-bounded-locked-memory.md)
 - [ADR-0017: Buffer taxonomy — fixed head pool vs small streaming I/O pool; zero-copy head](docs/adr/0017-buffer-taxonomy.md)
 - [ADR-0018: Concurrency — thread-per-core network, shared locked storage](docs/adr/0018-concurrency-model.md)
+- [ADR-0019: Decayed access scores and NUMA block promotion](docs/adr/0019-access-score-numa-promotion.md)
 
 ## Optional
 - [Source repository](https://github.com/adamdeprince/goblin-store): the C++23 tree under `src/goblin/{common,core,crypto,storage,net,protocol,http,tls,tools}`.
-- [llms-full.txt](llms-full.txt): the README, benchmarks, and all 18 ADRs inlined into a single file.
+- [llms-full.txt](llms-full.txt): the README, benchmarks, and all 19 ADRs inlined into a single file.

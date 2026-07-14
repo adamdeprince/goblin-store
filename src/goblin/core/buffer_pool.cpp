@@ -1,12 +1,15 @@
 #include "goblin/core/buffer_pool.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <string>
 #include <sys/mman.h>
+#include <thread>
 #include <utility>
 
 #if defined(__linux__)
@@ -16,6 +19,98 @@
 #endif
 
 namespace goblin::core {
+
+namespace {
+
+#if defined(__linux__)
+
+Status bind_mapping(void* base, Size bytes, unsigned node, unsigned flags = 0) {
+    constexpr Size bits_per_word = sizeof(unsigned long) * 8;
+    const Size words = static_cast<Size>(node) / bits_per_word + 1;
+    std::vector<unsigned long> mask(static_cast<std::size_t>(words), 0);
+    mask[node / bits_per_word] |= 1UL << (node % bits_per_word);
+    const unsigned long maxnode = static_cast<unsigned long>(node) + 1UL;
+    if (::syscall(SYS_mbind, base, static_cast<unsigned long>(bytes),
+                  MPOL_BIND | MPOL_F_STATIC_NODES, mask.data(), maxnode, flags) != 0)
+        return err(Errc::out_of_memory,
+                   "mbind NUMA node " + std::to_string(node) + ": " + std::strerror(errno));
+    return {};
+}
+
+bool hugetlb_mapping_is_resident(void* base, Size bytes, Size hugepage_bytes) {
+    for (Size offset = 0; offset < bytes; offset += hugepage_bytes) {
+        unsigned char resident = 0;
+        if (::mincore(static_cast<std::byte*>(base) + offset, 1, &resident) != 0 ||
+            (resident & 1u) == 0)
+            return false;
+    }
+    return true;
+}
+
+void* try_hugetlb_mapping(Size bytes, Size hugepage_bytes, std::optional<unsigned> node) {
+    if (bytes == 0 || hugepage_bytes < kDeviceBlock || !is_power_of_two(hugepage_bytes) ||
+        bytes % hugepage_bytes != 0)
+        return MAP_FAILED;
+
+    void* mapping = MAP_FAILED;
+    const auto map = [&]() noexcept {
+        try {
+            if (node) {
+                constexpr Size bits_per_word = sizeof(unsigned long) * 8;
+                const Size words = static_cast<Size>(*node) / bits_per_word + 1;
+                std::vector<unsigned long> mask(static_cast<std::size_t>(words), 0);
+                mask[*node / bits_per_word] |= 1UL << (*node % bits_per_word);
+                const unsigned long maxnode = static_cast<unsigned long>(*node) + 1UL;
+                if (::syscall(SYS_set_mempolicy, MPOL_BIND | MPOL_F_STATIC_NODES, mask.data(),
+                              maxnode) != 0)
+                    return;
+            }
+            const unsigned huge_shift = std::countr_zero(hugepage_bytes);
+            const int huge_flags = static_cast<int>(huge_shift << MAP_HUGE_SHIFT);
+            mapping = ::mmap(nullptr, static_cast<std::size_t>(bytes), PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE | huge_flags,
+                             -1, 0);
+        } catch (...) {
+            mapping = MAP_FAILED;
+        }
+    };
+
+    if (node) {
+        // set_mempolicy is per-thread. A short-lived mapper thread can select the target node for
+        // MAP_POPULATE without disturbing the serving thread's inherited local-memory policy.
+        try {
+            std::thread mapper(map);
+            mapper.join();
+        } catch (...) {
+            return MAP_FAILED;
+        }
+    } else {
+        map();
+    }
+    if (mapping == MAP_FAILED) return MAP_FAILED;
+
+    // MAP_POPULATE deliberately hides population failures. mincore keeps an undersized per-node
+    // hugetlb pool from turning into a later SIGBUS; MPOL_MF_STRICT also verifies NUMA placement.
+    bool usable = false;
+    try {
+        usable = hugetlb_mapping_is_resident(mapping, bytes, hugepage_bytes) &&
+                 (!node || static_cast<bool>(bind_mapping(mapping, bytes, *node, MPOL_MF_STRICT)));
+    } catch (...) {
+        // The mapping is not published into a FreeRegion yet, so clean it up locally before the
+        // ordinary-memory fallback handles an allocation failure in validation metadata.
+        ::munmap(mapping, static_cast<std::size_t>(bytes));
+        return MAP_FAILED;
+    }
+    if (!usable) {
+        ::munmap(mapping, static_cast<std::size_t>(bytes));
+        return MAP_FAILED;
+    }
+    return mapping;
+}
+
+#endif
+
+} // namespace
 
 // ---------------- BuddyAllocator ----------------
 
@@ -92,12 +187,13 @@ void ArenaAllocator::deallocate(Offset /*off*/, Size bytes) {
 
 // ---------------- BlockPool ----------------
 
-BlockPool::BlockPool(std::byte* base, Size block_bytes, Size num_blocks, bool locked, bool mapped,
-                     Size mapped_bytes, std::vector<FreeRegion> regions)
-    : base_(base), block_bytes_(block_bytes), num_blocks_(num_blocks), free_blocks_(num_blocks),
-      locked_(locked), mapped_(mapped), mapped_bytes_(mapped_bytes), regions_(std::move(regions)) {}
+BlockPool::BlockPool(Size block_bytes, Size num_blocks, bool locked,
+                     std::vector<FreeRegion> regions, std::vector<std::byte*> block_ptrs)
+    : block_bytes_(block_bytes), num_blocks_(num_blocks), free_blocks_(num_blocks), locked_(locked),
+      regions_(std::move(regions)), block_ptrs_(std::move(block_ptrs)) {}
 
-Result<BlockPool> BlockPool::create(Size block_bytes, Size num_blocks, bool lock_memory) {
+Result<BlockPool> BlockPool::create(Size block_bytes, Size num_blocks, bool lock_memory,
+                                    bool try_hugetlb, Size hugetlb_bytes) {
     if (!is_power_of_two(block_bytes) || block_bytes < kDeviceBlock)
         return err(Errc::invalid_argument, "block_bytes must be a power of two >= 4 KiB");
     if (num_blocks == 0) return err(Errc::invalid_argument, "num_blocks must be >= 1");
@@ -106,28 +202,30 @@ Result<BlockPool> BlockPool::create(Size block_bytes, Size num_blocks, bool lock
     if (block_bytes > std::numeric_limits<Size>::max() / num_blocks)
         return err(Errc::invalid_argument, "block-pool size overflows Size");
     const BlockPoolRegion region{block_bytes * num_blocks, std::nullopt};
-    return create_regions(block_bytes, std::span<const BlockPoolRegion>(&region, 1), lock_memory);
+    return create_regions(block_bytes, std::span<const BlockPoolRegion>(&region, 1), lock_memory,
+                          try_hugetlb, hugetlb_bytes);
 }
 
 Result<BlockPool> BlockPool::create_regions(Size block_bytes,
                                              std::span<const BlockPoolRegion> requested_regions,
-                                             bool lock_memory) {
+                                             bool lock_memory, bool try_hugetlb,
+                                             Size hugetlb_bytes) {
     if (!is_power_of_two(block_bytes) || block_bytes < kDeviceBlock)
         return err(Errc::invalid_argument, "block_bytes must be a power of two >= 4 KiB");
     if (requested_regions.empty())
         return err(Errc::invalid_argument, "block pool needs at least one memory region");
+    if (hugetlb_bytes == 0) hugetlb_bytes = block_bytes;
 
-    Size total = 0;
     Size num_blocks = 0;
-    bool numa_bound = false;
     std::vector<FreeRegion> free_regions;
     free_regions.reserve(requested_regions.size());
     for (const auto& requested : requested_regions) {
         if (requested.bytes == 0 || requested.bytes % block_bytes != 0)
             return err(Errc::invalid_argument,
                        "each block-pool region must be a nonzero multiple of block_bytes");
-        if (requested.bytes > std::numeric_limits<Size>::max() - total)
-            return err(Errc::invalid_argument, "block-pool size overflows Size");
+        if (requested.bytes > std::numeric_limits<std::size_t>::max())
+            return err(Errc::invalid_argument,
+                       "a block-pool region exceeds this process's address-size limit");
         const Size count = requested.bytes / block_bytes;
         if (count > std::numeric_limits<unsigned>::max() - num_blocks)
             return err(Errc::invalid_argument, "num_blocks exceeds the block-index limit");
@@ -137,112 +235,131 @@ Result<BlockPool> BlockPool::create_regions(Size block_bytes,
         num_blocks += count;
         region.end_block = static_cast<unsigned>(num_blocks);
         region.numa_node = requested.numa_node;
+        region.bytes = requested.bytes;
         region.free.reserve(static_cast<std::size_t>(count));
         for (unsigned i = region.end_block; i-- > region.first_block;) region.free.push_back(i);
         free_regions.push_back(std::move(region));
-        total += requested.bytes;
-        numa_bound = numa_bound || requested.numa_node.has_value();
     }
-    if (total > std::numeric_limits<std::size_t>::max())
-        return err(Errc::invalid_argument, "block pool exceeds the addressable size");
 
-    void* p = nullptr;
-    bool mapped = false;
-    if (numa_bound) {
-#if defined(__linux__)
-        const long page_size = ::sysconf(_SC_PAGESIZE);
-        if (page_size <= 0)
-            return err(Errc::io_error, "sysconf(_SC_PAGESIZE) failed");
-        const Size page = static_cast<Size>(page_size);
-        for (const auto& requested : requested_regions)
-            if (requested.bytes % page != 0)
-                return err(Errc::invalid_argument,
-                           "each NUMA memory region must be a multiple of the system page size");
-
-        p = ::mmap(nullptr, static_cast<std::size_t>(total), PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (p == MAP_FAILED)
-            return err(Errc::out_of_memory,
-                       std::string("mmap NUMA head arena: ") + std::strerror(errno));
-        mapped = true;
-
-        auto* cursor = static_cast<std::byte*>(p);
-        constexpr Size bits_per_word = sizeof(unsigned long) * 8;
-        for (const auto& requested : requested_regions) {
-            if (requested.numa_node) {
-                const unsigned node = *requested.numa_node;
-                const Size words = static_cast<Size>(node) / bits_per_word + 1;
-                std::vector<unsigned long> mask(static_cast<std::size_t>(words), 0);
-                mask[node / bits_per_word] |= 1UL << (node % bits_per_word);
-                const unsigned long maxnode = static_cast<unsigned long>(node) + 1UL;
-                if (::syscall(SYS_mbind, cursor, static_cast<unsigned long>(requested.bytes),
-                              MPOL_BIND | MPOL_F_STATIC_NODES, mask.data(), maxnode, 0UL) != 0) {
-                    const std::string detail = "mbind NUMA node " + std::to_string(node) + ": " +
-                                               std::strerror(errno);
-                    ::munmap(p, static_cast<std::size_t>(total));
-                    return err(Errc::out_of_memory, detail);
-                }
-            }
-            cursor += requested.bytes;
-        }
-#else
-        return err(Errc::unsupported, "NUMA memory binding is supported only on Linux");
+#if !defined(__linux__)
+    (void)try_hugetlb;
+    (void)hugetlb_bytes;
+    for (const auto& requested : requested_regions)
+        if (requested.numa_node)
+            return err(Errc::unsupported, "NUMA memory binding is supported only on Linux");
 #endif
-    } else {
-        p = std::aligned_alloc(kDeviceBlock, static_cast<std::size_t>(total));
-        if (!p) return err(Errc::out_of_memory, "aligned_alloc failed");
-    }
 
-    bool locked = false;
-    if (lock_memory) {
-        if (::mlock(p, static_cast<std::size_t>(total)) != 0) {
-            const std::string detail =
-                std::string("mlock head arena: ") + std::strerror(errno) +
-                " (need sufficient per-node RAM and RLIMIT_MEMLOCK/CAP_IPC_LOCK)";
-            if (mapped)
-                ::munmap(p, static_cast<std::size_t>(total));
-            else
-                std::free(p);
+    // Allocate all metadata before taking ownership of kernel mappings. This keeps an allocation
+    // failure while building the address table from leaking already-created hugetlb/anonymous VMAs.
+    std::vector<std::byte*> block_ptrs(static_cast<std::size_t>(num_blocks));
+
+    struct MappingGuard {
+        std::vector<FreeRegion>* regions;
+
+        ~MappingGuard() {
+            if (!regions) return;
+            for (auto& region : *regions) {
+                if (!region.base) continue;
+                if (region.mlocked)
+                    ::munlock(region.base, static_cast<std::size_t>(region.bytes));
+                if (region.mapped)
+                    ::munmap(region.base, static_cast<std::size_t>(region.bytes));
+                else
+                    std::free(region.base);
+                region.base = nullptr;
+            }
+        }
+        void dismiss() noexcept { regions = nullptr; }
+    } mapping_guard{&free_regions};
+
+    for (auto& region : free_regions) {
+        void* p = nullptr;
+#if defined(__linux__)
+        if (try_hugetlb)
+            p = try_hugetlb_mapping(region.bytes, hugetlb_bytes, region.numa_node);
+        if (p != MAP_FAILED && p != nullptr) {
+            region.base = static_cast<std::byte*>(p);
+            region.mapped = true;
+            region.hugetlb = true;
+            continue; // explicit hugetlb pages are resident and cannot be swapped
+        }
+
+        if (region.numa_node) {
+            p = ::mmap(nullptr, static_cast<std::size_t>(region.bytes), PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) {
+                return err(Errc::out_of_memory,
+                           std::string("mmap NUMA head arena: ") + std::strerror(errno));
+            }
+            region.base = static_cast<std::byte*>(p);
+            region.mapped = true;
+            if (auto bound = bind_mapping(p, region.bytes, *region.numa_node); !bound) {
+                Error detail = std::move(bound.error());
+                return std::unexpected(std::move(detail));
+            }
+        } else
+#endif
+        {
+            p = std::aligned_alloc(kDeviceBlock, static_cast<std::size_t>(region.bytes));
+            if (!p) {
+                return err(Errc::out_of_memory, "aligned_alloc failed");
+            }
+            region.base = static_cast<std::byte*>(p);
+        }
+
+        if (lock_memory && ::mlock(region.base, static_cast<std::size_t>(region.bytes)) != 0) {
+            const std::string detail = std::string("mlock head arena: ") + std::strerror(errno) +
+                                       " (need sufficient per-node RAM and "
+                                       "RLIMIT_MEMLOCK/CAP_IPC_LOCK)";
             return err(Errc::out_of_memory, detail);
         }
-        locked = true;
+        region.mlocked = lock_memory;
     }
-    return BlockPool(static_cast<std::byte*>(p), block_bytes, num_blocks, locked, mapped, total,
-                     std::move(free_regions));
+
+    for (const auto& region : free_regions)
+        for (unsigned block = region.first_block; block < region.end_block; ++block)
+            block_ptrs[block] =
+                region.base + static_cast<Size>(block - region.first_block) * block_bytes;
+    mapping_guard.dismiss();
+    return BlockPool(block_bytes, num_blocks, lock_memory, std::move(free_regions),
+                     std::move(block_ptrs));
 }
 
 void BlockPool::destroy() noexcept {
-    if (base_) {
-        if (locked_) ::munlock(base_, static_cast<std::size_t>(mapped_bytes_));
-        if (mapped_)
-            ::munmap(base_, static_cast<std::size_t>(mapped_bytes_));
+    for (auto& region : regions_) {
+        if (!region.base) continue;
+        if (region.mlocked) ::munlock(region.base, static_cast<std::size_t>(region.bytes));
+        if (region.mapped)
+            ::munmap(region.base, static_cast<std::size_t>(region.bytes));
         else
-            std::free(base_);
-        base_ = nullptr;
+            std::free(region.base);
+        region.base = nullptr;
     }
+    block_ptrs_.clear();
 }
 
 BlockPool::~BlockPool() { destroy(); }
 
 BlockPool::BlockPool(BlockPool&& o) noexcept
-    : base_(o.base_), block_bytes_(o.block_bytes_), num_blocks_(o.num_blocks_),
-      free_blocks_(o.free_blocks_), locked_(o.locked_), mapped_(o.mapped_),
-      mapped_bytes_(o.mapped_bytes_), regions_(std::move(o.regions_)) {
-    o.base_ = nullptr;
+    : block_bytes_(o.block_bytes_), num_blocks_(o.num_blocks_), free_blocks_(o.free_blocks_),
+      locked_(o.locked_), regions_(std::move(o.regions_)), block_ptrs_(std::move(o.block_ptrs_)) {
+    o.regions_.clear();
+    o.block_ptrs_.clear();
+    o.num_blocks_ = o.free_blocks_ = 0;
 }
 
 BlockPool& BlockPool::operator=(BlockPool&& o) noexcept {
     if (this != &o) {
         destroy();
-        base_ = o.base_;
         block_bytes_ = o.block_bytes_;
         num_blocks_ = o.num_blocks_;
         free_blocks_ = o.free_blocks_;
         locked_ = o.locked_;
-        mapped_ = o.mapped_;
-        mapped_bytes_ = o.mapped_bytes_;
         regions_ = std::move(o.regions_);
-        o.base_ = nullptr;
+        block_ptrs_ = std::move(o.block_ptrs_);
+        o.regions_.clear();
+        o.block_ptrs_.clear();
+        o.num_blocks_ = o.free_blocks_ = 0;
     }
     return *this;
 }
@@ -271,7 +388,7 @@ void BlockPool::release(unsigned index) {
 }
 
 std::byte* BlockPool::block_data(unsigned index) const noexcept {
-    return base_ + static_cast<Size>(index) * block_bytes_;
+    return index < block_ptrs_.size() ? block_ptrs_[index] : nullptr;
 }
 
 unsigned BlockPool::region_first_block(std::size_t region) const noexcept {
@@ -286,26 +403,53 @@ std::optional<unsigned> BlockPool::region_numa_node(std::size_t region) const no
     return region < regions_.size() ? regions_[region].numa_node : std::nullopt;
 }
 
+std::optional<std::size_t> BlockPool::block_region(unsigned block) const noexcept {
+    for (std::size_t region = 0; region < regions_.size(); ++region)
+        if (block >= regions_[region].first_block && block < regions_[region].end_block)
+            return region;
+    return std::nullopt;
+}
+
+std::optional<unsigned> BlockPool::block_numa_node(unsigned block) const noexcept {
+    const auto region = block_region(block);
+    return region ? regions_[*region].numa_node : std::nullopt;
+}
+
+bool BlockPool::region_uses_hugetlb(std::size_t region) const noexcept {
+    return region < regions_.size() && regions_[region].hugetlb;
+}
+
+std::optional<unsigned> BlockPool::block_index(const std::byte* address) const noexcept {
+    const auto needle = reinterpret_cast<std::uintptr_t>(address);
+    for (const auto& region : regions_) {
+        const auto begin = reinterpret_cast<std::uintptr_t>(region.base);
+        const auto end = begin + static_cast<std::uintptr_t>(region.bytes);
+        if (needle < begin || needle >= end) continue;
+        return region.first_block + static_cast<unsigned>((needle - begin) / block_bytes_);
+    }
+    return std::nullopt;
+}
+
 // ---------------- BufferPool ----------------
 
 Result<BufferPool> BufferPool::create(Size total_bytes, Size block_bytes, Size min_alloc,
-                                      bool lock_memory) {
+                                      bool lock_memory, bool try_hugetlb) {
     const BlockPoolRegion region{total_bytes, std::nullopt};
     return create_regions(std::span<const BlockPoolRegion>(&region, 1), block_bytes, min_alloc,
-                          lock_memory);
+                          lock_memory, try_hugetlb);
 }
 
 Result<BufferPool> BufferPool::create_regions(std::span<const BlockPoolRegion> regions,
                                               Size block_bytes, Size min_alloc,
-                                              bool lock_memory) {
+                                              bool lock_memory, bool try_hugetlb) {
     if (!is_power_of_two(min_alloc) || min_alloc < kDeviceBlock)
         return err(Errc::invalid_argument, "min_alloc must be a power of two >= 4 KiB");
     if (block_bytes < min_alloc)
         return err(Errc::invalid_argument, "block_bytes must be >= min_alloc");
 
-    auto bp = BlockPool::create_regions(block_bytes, regions, lock_memory);
+    auto bp = BlockPool::create_regions(block_bytes, regions, lock_memory, try_hugetlb);
     if (!bp) return std::unexpected(bp.error());
-    return BufferPool(std::move(*bp), min_alloc);
+    return BufferPool(std::move(*bp));
 }
 
 std::optional<BufferPool::Region> BufferPool::allocate(std::uint32_t bytes, Size min_alloc) {
@@ -378,10 +522,41 @@ std::byte* BufferPool::addr(unsigned block, std::uint32_t offset) const noexcept
     return blocks_.block_data(block) + offset;
 }
 
+bool BufferPool::block_is_local(unsigned block) const noexcept {
+    return blocks_.region_count() > 0 && block >= blocks_.region_first_block(0) &&
+           block < blocks_.region_end_block(0);
+}
+
+std::optional<Size> BufferPool::buddy_allocation_bytes(unsigned block, Size bytes) const noexcept {
+    if (block >= arenas_.size()) return std::nullopt;
+    const auto* buddy = std::get_if<BuddyAllocator>(&arenas_[block]);
+    if (!buddy) return std::nullopt;
+    const Size footprint = buddy->allocation_bytes(bytes);
+    if (footprint == 0) return std::nullopt;
+    return footprint;
+}
+
+bool BufferPool::full_buddy_block(unsigned block, Size indexed_bytes) const noexcept {
+    if (block >= arenas_.size()) return false;
+    const auto* buddy = std::get_if<BuddyAllocator>(&arenas_[block]);
+    return buddy && buddy->used() == buddy->capacity() && indexed_bytes == buddy->capacity();
+}
+
+bool BufferPool::swap_blocks(unsigned first, unsigned second) {
+    if (first == second || first >= arenas_.size() || second >= arenas_.size()) return false;
+    if (!std::holds_alternative<BuddyAllocator>(arenas_[first]) ||
+        !std::holds_alternative<BuddyAllocator>(arenas_[second]))
+        return false;
+    std::swap_ranges(addr(first, 0), addr(first, 0) + blocks_.block_bytes(), addr(second, 0));
+    std::swap(arenas_[first], arenas_[second]);
+    return true;
+}
+
 // ---------------- IoBufferPool ----------------
 
-Result<IoBufferPool> IoBufferPool::create(Size chunk_bytes, unsigned count, bool lock_memory) {
-    auto bp = BlockPool::create(chunk_bytes, count, lock_memory);
+Result<IoBufferPool> IoBufferPool::create(Size chunk_bytes, unsigned count, bool lock_memory,
+                                          bool try_hugetlb, Size hugetlb_bytes) {
+    auto bp = BlockPool::create(chunk_bytes, count, lock_memory, try_hugetlb, hugetlb_bytes);
     if (!bp) return std::unexpected(bp.error());
     return IoBufferPool(std::move(*bp));
 }
@@ -393,8 +568,10 @@ std::optional<MutBytes> IoBufferPool::acquire() {
 }
 
 void IoBufferPool::release(MutBytes chunk) {
-    const auto off = static_cast<std::size_t>(chunk.data() - blocks_.data());
-    blocks_.release(static_cast<unsigned>(off / blocks_.block_bytes()));
+    const auto block = blocks_.block_index(chunk.data());
+    if (block && chunk.data() == blocks_.block_data(*block) &&
+        chunk.size() == static_cast<std::size_t>(blocks_.block_bytes()))
+        blocks_.release(*block);
 }
 
 } // namespace goblin::core

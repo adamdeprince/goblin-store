@@ -689,3 +689,96 @@ TEST("tier_manager: O_DIRECT round-trips an odd-sized object across all tiers") 
     std::free(p);
     fs::remove_all(base);
 }
+
+TEST("tier_manager: hotter full foreign block replaces colder local block") {
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-numa-score-" + std::to_string(::getpid()))).string();
+    PoolConfig ssd, hdd;
+    ssd.stripe_unit = 64 * KiB;
+    ssd.dirs.push_back(base + "/ssd");
+    fs::create_directories(ssd.dirs.front());
+
+    TierSizes tiers;
+    tiers.ram_head = 64 * KiB;
+    tiers.ssd_prefix = 1 * MiB;
+    MemoryConfig mem;
+    mem.total_bytes = 64 * KiB;
+    mem.block_bytes = 64 * KiB;
+    mem.lock_memory = false;
+    // Two unbound logical regions exercise local/foreign ordering portably; production supplies the
+    // physical node IDs and BlockPool installs mbind policies for the same ranges.
+    mem.numa_regions = {{std::nullopt, 64 * KiB}, {std::nullopt, 64 * KiB}};
+    EvictionConfig ev;
+    AccessScoreConfig score;
+    score.increment = 2.0;
+    score.decay = 0.5;
+    Index index;
+    auto tm = TierManager::open(tiers, mem, ev, ssd, hdd, index, 256 * KiB, 8,
+                                /*direct_io=*/false, score);
+    CHECK(tm.has_value());
+    if (!tm) {
+        fs::remove_all(base);
+        return;
+    }
+
+    constexpr Size kSize = 68 * KiB; // disk-backed object with one whole 64 KiB buddy head
+    std::vector<std::byte> cold(kSize, std::byte{0x19});
+    std::vector<std::byte> hot(kSize, std::byte{0x5A});
+    const auto cold_key = hash_key("/cold-local");
+    const auto hot_key = hash_key("/hot-remote");
+    CHECK(tm->store(cold_key, ByteView(cold.data(), cold.size()), 0).has_value());
+    CHECK(tm->store(hot_key, ByteView(hot.data(), hot.size()), 0).has_value());
+    CHECK_EQ(index.lookup(cold_key)->head.block, 0u);
+    CHECK_EQ(index.lookup(hot_key)->head.block, 1u);
+
+    // An active zero-copy reader pins the remote block, so the first pass must leave it in place.
+    const auto pin = tm->pin_head(hot_key); // one successful read: remote score becomes 2
+    CHECK(pin.has_value());
+    CHECK(!tm->promote_hot_remote_block());
+    if (pin) tm->unpin_head(*pin);
+
+    CHECK(tm->promote_hot_remote_block());
+    const auto cold_meta = index.lookup(cold_key);
+    const auto hot_meta = index.lookup(hot_key);
+    CHECK(cold_meta && hot_meta);
+    if (cold_meta && hot_meta) {
+        CHECK_EQ(cold_meta->head.block, 1u);
+        CHECK_EQ(hot_meta->head.block, 0u);
+        CHECK_EQ(*index.score(hot_key), 2.0); // score follows the key, not the physical block
+    }
+    const auto cold_head = tm->head_view(cold_key);
+    const auto hot_head = tm->head_view(hot_key);
+    CHECK(cold_head && hot_head);
+    if (cold_head && hot_head) {
+        CHECK(std::all_of(cold_head->begin(), cold_head->end(),
+                          [](std::byte b) { return b == std::byte{0x19}; }));
+        CHECK(std::all_of(hot_head->begin(), hot_head->end(),
+                          [](std::byte b) { return b == std::byte{0x5A}; }));
+    }
+    CHECK(!tm->promote_hot_remote_block()); // local minimum is now hotter than remote maximum
+    tm->decay_access_scores();
+    CHECK_EQ(*index.score(hot_key), 2.0);  // pin + head_view, then x0.5
+    CHECK_EQ(*index.score(cold_key), 1.0); // head_view, then x0.5
+
+    // Exercise the priority gate under TSan: a tight promoter must repeatedly yield while the
+    // rescore thread takes exclusive maintenance turns, with neither overlap nor deadlock.
+    std::atomic<bool> promoter_ready{false};
+    std::atomic<bool> start_maintenance{false};
+    std::atomic<bool> rescoring_done{false};
+    std::atomic<unsigned> promotion_calls{0};
+    std::thread promoter([&] {
+        promoter_ready.store(true, std::memory_order_release);
+        while (!start_maintenance.load(std::memory_order_acquire)) std::this_thread::yield();
+        do {
+            tm->promote_hot_remote_block();
+            promotion_calls.fetch_add(1, std::memory_order_relaxed);
+        } while (!rescoring_done.load(std::memory_order_acquire));
+    });
+    while (!promoter_ready.load(std::memory_order_acquire)) std::this_thread::yield();
+    start_maintenance.store(true, std::memory_order_release);
+    for (unsigned i = 0; i < 50; ++i) tm->decay_access_scores();
+    rescoring_done.store(true, std::memory_order_release);
+    promoter.join();
+    CHECK(promotion_calls.load(std::memory_order_relaxed) > 0);
+    fs::remove_all(base);
+}

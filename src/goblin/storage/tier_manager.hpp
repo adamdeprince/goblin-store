@@ -78,7 +78,8 @@ public:
     static Result<TierManager> open(const TierSizes&, const MemoryConfig&, const EvictionConfig&,
                                     const PoolConfig& ssd, const PoolConfig& hdd, Index& index,
                                     Size io_chunk = 256 * KiB, unsigned write_buffers = 8,
-                                    bool direct_io = false);
+                                    bool direct_io = false,
+                                    AccessScoreConfig access_score = {});
     bool three_layer() const noexcept { return hdd_.has_value(); }
 
     // Streaming write (ADR-0016/0017): open files + reserve the RAM head once, append chunks with
@@ -124,12 +125,16 @@ public:
     Status store(const Digest&, ByteView data, std::uint32_t flags, std::uint32_t expiry = 0); // begin+write+commit
     std::size_t reap_expired(); // drop objects past their TTL; returns count (O(1) when no TTLs are set)
     bool touch_ttl(const Digest&, std::uint32_t expiry); // meta T: overwrite the TTL; false if absent
-    Result<std::size_t> read(core::Reactor&, const Digest&, Offset offset, MutBytes out);
+    Result<std::size_t> read(core::Reactor&, const Digest&, Offset offset, MutBytes out,
+                             bool record_access = true);
     bool remove(const Digest&); // erase from index + free the cached head
     // Resident RAM head bytes for a zero-copy send, or nullopt if not cached (ADR-0017).
-    std::optional<ByteView> head_view(const Digest&) const;
-    void touch(const Digest&);          // record a cache hit (eviction bookkeeping, ADR-0007)
+    std::optional<ByteView> head_view(const Digest&);
+    void touch(const Digest&);          // record one logical read: eviction touch + score increment
     std::size_t head_resident() const;  // # heads currently cached in RAM (stats/tests)
+
+    void decay_access_scores();         // multiply every key score by --decay
+    bool promote_hot_remote_block();    // one local/foreign full-block exchange, or false if sorted
 
     // Head pinning (ADR-0017/0018): keep a resident head's RAM alive while a reader sends it
     // zero-copy. Evicting/overwriting a pinned head defers the RAM free until the last unpin.
@@ -184,19 +189,29 @@ public:
         HeadPin pin;                  // pin.valid == false when the head isn't resident
         std::optional<ReadStream> rs; // present iff size > head_len (a disk tail to stream)
     };
-    std::optional<Snapshot> open_snapshot(const Digest&); // nullopt on miss / open failure
+    // record_access=false is used only when an internally backpressured GET re-takes its snapshot;
+    // one logical request must not gain score repeatedly while it waits for an I/O buffer.
+    std::optional<Snapshot> open_snapshot(const Digest&, bool record_access = true);
 
 private:
+    struct ScoreMaintenanceGate {
+        std::mutex operation;
+        std::atomic<bool> rescore_pending{false};
+    };
+
     TierManager(TierSizes t, core::BufferPool ram, std::unique_ptr<EvictionPolicy> head_policy,
                 std::unique_ptr<EvictionPolicy> object_policy, std::uint64_t max_objects, Pool ssd,
-                std::optional<Pool> hdd, Index& ix, Size small_min_alloc)
-        : tiers_(t), small_min_alloc_(small_min_alloc), ram_(std::move(ram)), policy_(std::move(head_policy)),
+                std::optional<Pool> hdd, Index& ix, Size small_min_alloc,
+                AccessScoreConfig access_score)
+        : tiers_(t), access_score_(access_score), small_min_alloc_(small_min_alloc),
+          ram_(std::move(ram)), policy_(std::move(head_policy)),
           object_policy_(std::move(object_policy)), max_objects_(max_objects), ssd_(std::move(ssd)),
           hdd_(std::move(hdd)), index_(&ix),
           store_seq_(std::make_unique<std::atomic<std::uint64_t>>(0)),
           etag_seq_(std::make_unique<std::atomic<std::uint64_t>>(0)),
           any_ttl_(std::make_unique<std::atomic<bool>>(false)),
-          mu_(std::make_unique<std::shared_mutex>()) {}
+          mu_(std::make_unique<std::shared_mutex>()),
+          score_maintenance_(std::make_unique<ScoreMaintenanceGate>()) {}
     void drop_object(const Digest&); // free head + unlink files + erase from index & policies
     void enforce_object_bound();     // evict whole objects while over the count limit
     void free_head_region(unsigned block, std::uint32_t offset, std::uint32_t len); // free or orphan
@@ -206,6 +221,7 @@ private:
     }
 
     TierSizes tiers_;
+    AccessScoreConfig access_score_;
     Size small_min_alloc_;                           // buddy min-order for RAM-only heads (ADR-0008-rev)
     core::BufferPool ram_;                           // RAM-head cache (ADR-0003/0008)
     std::unique_ptr<core::IoBufferPool> write_pool_; // bounded aligned CoW write staging (ADR-0011)
@@ -219,6 +235,8 @@ private:
     std::unique_ptr<std::atomic<std::uint64_t>> etag_seq_;  // monotonic store generation -> ETag
     std::unique_ptr<std::atomic<bool>> any_ttl_; // a TTL has been set -> reaper scans (else O(1) skip)
     std::unique_ptr<std::shared_mutex> mu_; // rwlock: shared for reads, exclusive for writes (ADR-0018)
+    // Decay announces itself before taking operation, so the tight promotion loop cannot overtake it.
+    std::unique_ptr<ScoreMaintenanceGate> score_maintenance_;
     struct RegionPin {
         std::uint32_t len = 0;
         unsigned refcount = 0;

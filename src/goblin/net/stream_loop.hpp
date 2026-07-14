@@ -124,7 +124,8 @@ protected:
     virtual void on_destroy(Conn*) {}                      // conn retiring -> free any per-conn TLS state
 
     // ---- shared machinery the subclass drives ----
-    bool begin_get(Conn*, const std::string& key); // open the GET; false if parked on read-pool exhaustion
+    bool begin_get(Conn*, const std::string& key,
+                   bool record_access = true); // false if parked on read-pool exhaustion
     virtual void start_recv(Conn*);                 // post a recv (HTTPS overrides: poll-driven SSL_read)
     void start_send(Conn*);                         // (re)send the pending `out`
     void close_conn(Conn*);

@@ -3,8 +3,8 @@
 //   * BuddyAllocator — subdivides ONE power-of-two arena into power-of-two sub-blocks. It is
 //     offset-based and memory-free, so it can sit over any real block and be unit-tested with
 //     no allocation at all.
-//   * BlockPool — owns one aligned, optionally mlock'd virtual range of equal blocks. The range may
-//     be split into local-first NUMA regions, each with its own Linux memory policy.
+//   * BlockPool — owns aligned, optionally mlock'd mappings of equal blocks. Allocation regions are
+//     ordered local-first and each has its own Linux memory policy and hugetlb fallback decision.
 #pragma once
 
 #include "goblin/common/error.hpp"
@@ -29,6 +29,9 @@ public:
     Size capacity() const noexcept { return arena_size_; }
     Size used() const noexcept { return used_; }
     Size min_block() const noexcept { return min_block_; }
+    Size allocation_bytes(Size bytes) const noexcept {
+        return bytes == 0 || bytes > arena_size_ ? 0 : block_size(order_for(bytes));
+    }
 
 private:
     unsigned order_for(Size bytes) const noexcept;
@@ -71,8 +74,9 @@ private:
     Size live_ = 0;     // sum of live slot sizes (rounded); block is reclaimable when this hits 0
 };
 
-// One contiguous part of a BlockPool. Regions are ordered by allocation preference. A NUMA node
-// applies MPOL_BIND to that virtual range; nullopt is useful for the ordinary allocator and tests.
+// One physical part of a BlockPool. Regions are ordered by allocation preference. A NUMA node
+// selects that node's hugetlb pool first and otherwise applies MPOL_BIND to a normal mapping;
+// nullopt is useful for the ordinary allocator and tests.
 struct BlockPoolRegion {
     Size bytes = 0;
     std::optional<unsigned> numa_node;
@@ -80,10 +84,14 @@ struct BlockPoolRegion {
 
 class BlockPool {
 public:
-    static Result<BlockPool> create(Size block_bytes, Size num_blocks, bool lock_memory);
+    // hugetlb_bytes == 0 selects block_bytes. A separate value lets streaming pools keep their
+    // smaller chunk allocation geometry inside a platform-sized hugetlb mapping.
+    static Result<BlockPool> create(Size block_bytes, Size num_blocks, bool lock_memory,
+                                    bool try_hugetlb = true, Size hugetlb_bytes = 0);
     static Result<BlockPool> create_regions(Size block_bytes,
                                             std::span<const BlockPoolRegion> regions,
-                                            bool lock_memory);
+                                            bool lock_memory, bool try_hugetlb = true,
+                                            Size hugetlb_bytes = 0);
     ~BlockPool();
     BlockPool(BlockPool&&) noexcept;
     BlockPool& operator=(BlockPool&&) noexcept;
@@ -98,12 +106,15 @@ public:
     Size block_bytes() const noexcept { return block_bytes_; }
     Size num_blocks() const noexcept { return num_blocks_; }
     Size free_blocks() const noexcept { return free_blocks_; }
-    std::byte* data() const noexcept { return base_; }
     bool locked() const noexcept { return locked_; }
     std::size_t region_count() const noexcept { return regions_.size(); }
     unsigned region_first_block(std::size_t region) const noexcept;
     unsigned region_end_block(std::size_t region) const noexcept;
     std::optional<unsigned> region_numa_node(std::size_t region) const noexcept;
+    std::optional<std::size_t> block_region(unsigned block) const noexcept;
+    std::optional<unsigned> block_numa_node(unsigned block) const noexcept;
+    bool region_uses_hugetlb(std::size_t region) const noexcept;
+    std::optional<unsigned> block_index(const std::byte* address) const noexcept;
 
 private:
     struct FreeRegion {
@@ -111,20 +122,23 @@ private:
         unsigned end_block = 0; // exclusive
         std::optional<unsigned> numa_node;
         std::vector<unsigned> free;
+        std::byte* base = nullptr;
+        Size bytes = 0;
+        bool mapped = false;
+        bool mlocked = false;
+        bool hugetlb = false;
     };
 
-    BlockPool(std::byte* base, Size block_bytes, Size num_blocks, bool locked, bool mapped,
-              Size mapped_bytes, std::vector<FreeRegion> regions);
+    BlockPool(Size block_bytes, Size num_blocks, bool locked, std::vector<FreeRegion> regions,
+              std::vector<std::byte*> block_ptrs);
     void destroy() noexcept;
 
-    std::byte* base_ = nullptr;
     Size block_bytes_ = 0;
     Size num_blocks_ = 0;
     Size free_blocks_ = 0;
     bool locked_ = false;
-    bool mapped_ = false;
-    Size mapped_bytes_ = 0;
     std::vector<FreeRegion> regions_;
+    std::vector<std::byte*> block_ptrs_;
 };
 
 // Allocator facade over the block pool (ADR-0008): hands out sub-block buffers via buddy
@@ -133,9 +147,10 @@ private:
 class BufferPool {
 public:
     static Result<BufferPool> create(Size total_bytes, Size block_bytes, Size min_alloc,
-                                     bool lock_memory);
+                                     bool lock_memory, bool try_hugetlb = true);
     static Result<BufferPool> create_regions(std::span<const BlockPoolRegion> regions,
-                                             Size block_bytes, Size min_alloc, bool lock_memory);
+                                             Size block_bytes, Size min_alloc, bool lock_memory,
+                                             bool try_hugetlb = true);
 
     struct Region {
         unsigned block = 0;       // BlockPool block index
@@ -152,6 +167,24 @@ public:
 
     Size block_bytes() const noexcept { return blocks_.block_bytes(); }
     Size free_blocks() const noexcept { return blocks_.free_blocks(); }
+    std::size_t region_count() const noexcept { return blocks_.region_count(); }
+    bool block_is_local(unsigned block) const noexcept;
+    std::optional<std::size_t> block_region(unsigned block) const noexcept {
+        return blocks_.block_region(block);
+    }
+    std::optional<unsigned> block_numa_node(unsigned block) const noexcept {
+        return blocks_.block_numa_node(block);
+    }
+    bool region_uses_hugetlb(std::size_t region) const noexcept {
+        return blocks_.region_uses_hugetlb(region);
+    }
+
+    // NUMA promotion uses only completely occupied buddy blocks. indexed_bytes lets TierManager
+    // prove that every allocation belongs to a published index entry (no in-flight StoreHandle or
+    // orphaned pinned head). Arena blocks are deliberately ineligible for now.
+    std::optional<Size> buddy_allocation_bytes(unsigned block, Size bytes) const noexcept;
+    bool full_buddy_block(unsigned block, Size indexed_bytes) const noexcept;
+    bool swap_blocks(unsigned first, unsigned second);
 
     // Compaction support (ADR-0008 Phase 2): the small-class bump arena backing a block (nullptr if the
     // block is large/buddy or unused), and the total reclaimable-by-compaction dead bytes across small
@@ -167,10 +200,9 @@ public:
     }
 
 private:
-    BufferPool(BlockPool blocks, Size min_alloc)
-        : blocks_(std::move(blocks)), min_alloc_(min_alloc), arenas_(blocks_.num_blocks()) {}
+    explicit BufferPool(BlockPool blocks)
+        : blocks_(std::move(blocks)), arenas_(blocks_.num_blocks()) {}
     BlockPool blocks_;
-    Size min_alloc_;
     // One sub-allocator per block index, chosen on first use: large (>= kDeviceBlock) heads use buddy
     // (power-of-two, O_DIRECT-aligned); small heads use a byte-granular bump arena (compactable, ADR-0008).
     std::vector<std::variant<std::monostate, BuddyAllocator, ArenaAllocator>> arenas_;
@@ -181,7 +213,8 @@ private:
 // BlockPool whose "block" is one I/O chunk.
 class IoBufferPool {
 public:
-    static Result<IoBufferPool> create(Size chunk_bytes, unsigned count, bool lock_memory);
+    static Result<IoBufferPool> create(Size chunk_bytes, unsigned count, bool lock_memory,
+                                       bool try_hugetlb = true, Size hugetlb_bytes = 0);
 
     std::optional<MutBytes> acquire(); // one chunk, or nullopt if all are in use
     void release(MutBytes chunk);

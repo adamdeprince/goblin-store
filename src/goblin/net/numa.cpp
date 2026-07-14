@@ -16,7 +16,10 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sched.h>
+#include <linux/mempolicy.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace goblin::net {
@@ -167,6 +170,19 @@ Result<std::vector<unsigned>> bind_current_thread(std::span<const unsigned> node
     return effective;
 }
 
+Status bind_current_thread_memory(unsigned node) {
+    constexpr std::size_t bits_per_word = sizeof(unsigned long) * 8;
+    const std::size_t words = static_cast<std::size_t>(node) / bits_per_word + 1;
+    std::vector<unsigned long> mask(words, 0);
+    mask[node / bits_per_word] |= 1UL << (node % bits_per_word);
+    const unsigned long maxnode = static_cast<unsigned long>(node) + 1UL;
+    if (::syscall(SYS_set_mempolicy, MPOL_BIND | MPOL_F_STATIC_NODES, mask.data(), maxnode) != 0)
+        return err(Errc::io_error,
+                   "set_mempolicy NUMA node " + std::to_string(node) + ": " +
+                       std::strerror(errno));
+    return {};
+}
+
 #endif
 
 } // namespace
@@ -261,6 +277,8 @@ Result<NumaBinding> configure_numa(std::optional<unsigned> requested) {
     if (!cpus) return std::unexpected(cpus.error());
     auto effective = bind_current_thread(*cpus);
     if (!effective) return std::unexpected(effective.error());
+    if (auto memory = bind_current_thread_memory(*node); !memory)
+        return std::unexpected(memory.error());
     NumaBinding binding;
     binding.node = *node;
     binding.cpus = std::move(*effective);

@@ -41,8 +41,10 @@ Result<unsigned> select_numa_node(std::optional<unsigned> requested,
                                   std::span<const NicAddress> interfaces,
                                   std::span<const unsigned> online_nodes);
 
-// Discover/select a node and bind the calling thread to its effective CPUs. Threads subsequently
-// created by that thread inherit the affinity mask, covering workers and maintenance threads.
+// Discover/select a node, bind the calling thread to its effective CPUs, and install a strict local
+// default memory policy. Threads subsequently created by it inherit both policies, keeping index,
+// protocol, I/O, and maintenance allocations on the selected node. Explicit head ranges may still
+// override the default with mbind() for --sub-memory.
 Result<NumaBinding> configure_numa(std::optional<unsigned> requested);
 
 // Build a local-first memory layout: --memory on local_node, followed by --sub-memory on every

@@ -148,8 +148,8 @@ void StreamLoop::on_recv(Conn* c, int res) {
 // parks in get_wait with the snapshot released (re-taken on retry; ADR-0011 backpressure -- queue,
 // never shed). On a hit, frame_get_hit() queues the header and state becomes get_header; on a miss,
 // frame_get_miss() queues the miss reply and state returns to idle.
-bool StreamLoop::begin_get(Conn* c, const std::string& key) {
-    auto snap = tm_.open_snapshot(crypto::hash_key(key));
+bool StreamLoop::begin_get(Conn* c, const std::string& key, bool record_access) {
+    auto snap = tm_.open_snapshot(crypto::hash_key(key), record_access);
     if (!snap) {
         stats_.get_misses.fetch_add(1, rlx);
         frame_get_miss(c);
@@ -223,7 +223,8 @@ void StreamLoop::drain_get_waiters() {
             continue;
         }
         get_waiters_.pop_front();
-        if (!begin_get(c, c->get_key)) return;         // re-parked -> pool still empty, retry next tick
+        if (!begin_get(c, c->get_key, /*record_access=*/false))
+            return; // re-parked -> pool still empty, retry next tick
         if (c->state == St::get_header) start_send(c); // hit -> stream the value (header first)
         else process(c);                                // miss while parked (removed) -> flush + resume
     }

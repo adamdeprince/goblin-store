@@ -50,6 +50,13 @@ bool recv_more(int fd, std::string& buf) {
     return true;
 }
 
+void sleep_interruptibly(const std::atomic<bool>& shutdown, unsigned milliseconds) {
+    for (unsigned slept = 0;
+         slept < milliseconds && !shutdown.load(std::memory_order_relaxed); slept += 100)
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(std::min(100u, milliseconds - slept)));
+}
+
 // Stream an object's value in fixed I/O-pool chunks, head-first (ADR-0006/0016). read() copies the
 // head out under the storage read-lock (ADR-0018); the zero-copy head returns once heads can be
 // pinned against concurrent eviction.
@@ -68,7 +75,8 @@ bool stream_value(int fd, storage::TierManager& tm, core::Reactor& reactor,
     Size pos = 0;
     while (pos < meta.size) {
         const Size want = std::min<Size>(chunk->size(), meta.size - pos);
-        const auto n = tm.read(reactor, digest, pos, chunk->subspan(0, want));
+        const auto n = tm.read(reactor, digest, pos, chunk->subspan(0, want),
+                               /*record_access=*/false);
         if (!n || *n != want) { ok = false; break; }
         if (!send_all(fd, chunk->subspan(0, want))) { ok = false; break; }
         pos += want;
@@ -235,7 +243,8 @@ void worker_loop(int lfd, const ServerConfig& cfg, storage::TierManager& tm, sto
     auto reactor = core::Reactor::create();
     if (!reactor) { std::println(stderr, "worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
-        core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory);
+        core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory,
+                                   cfg.memory.use_hugepages, cfg.memory.block_bytes);
     if (!iobufs) { std::println(stderr, "worker {}: {}", id, iobufs.error().detail); return; }
 
     while (!shutdown.load(std::memory_order_relaxed)) {
@@ -268,7 +277,8 @@ void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     auto reactor = core::Reactor::create();
     if (!reactor) { std::println(stderr, "worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
-        core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory);
+        core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory,
+                                   cfg.memory.use_hugepages, cfg.memory.block_bytes);
     if (!iobufs) { std::println(stderr, "worker {}: {}", id, iobufs.error().detail); return; }
     auto lfd = make_listener(cfg.memcache_port, /*reuseport=*/true);
     if (!lfd) { std::println(stderr, "worker {}: {}", id, lfd.error().detail); return; }
@@ -286,7 +296,8 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
     auto reactor = core::Reactor::create();
     if (!reactor) { std::println(stderr, "http worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
-        core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory);
+        core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory,
+                                   cfg.memory.use_hugepages, cfg.memory.block_bytes);
     if (!iobufs) { std::println(stderr, "http worker {}: {}", id, iobufs.error().detail); return; }
     auto lfd = make_listener(cfg.http_port, /*reuseport=*/true);
     if (!lfd) { std::println(stderr, "http worker {}: {}", id, lfd.error().detail); return; }
@@ -312,7 +323,8 @@ void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     auto reactor = core::Reactor::create();
     if (!reactor) { std::println(stderr, "https worker {}: {}", id, reactor.error().detail); return; }
     auto iobufs =
-        core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory);
+        core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory,
+                                   cfg.memory.use_hugepages, cfg.memory.block_bytes);
     if (!iobufs) { std::println(stderr, "https worker {}: {}", id, iobufs.error().detail); return; }
     auto lfd = make_listener(cfg.https_port, /*reuseport=*/true);
     if (!lfd) { std::println(stderr, "https worker {}: {}", id, lfd.error().detail); return; }
@@ -393,12 +405,29 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
     // process lifetime alongside the workers; a no-op until some object is stored with a TTL.
     if (cfg.ttl_reap_ms > 0)
         workers.emplace_back([&cfg, &tm, &shutdown] {
-            while (!shutdown.load(std::memory_order_relaxed)) { // sleep the interval in slices to exit promptly
-                for (unsigned slept = 0;
-                     slept < cfg.ttl_reap_ms && !shutdown.load(std::memory_order_relaxed); slept += 100)
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(std::min(100u, cfg.ttl_reap_ms - slept)));
+            while (!shutdown.load(std::memory_order_relaxed)) {
+                // Sleep in short slices so shutdown does not wait for the maintenance interval.
+                sleep_interruptibly(shutdown, cfg.ttl_reap_ms);
                 if (!shutdown.load(std::memory_order_relaxed)) tm.reap_expired();
+            }
+        });
+
+    // Access-score aging is independent of NUMA: every live key loses the same fraction once/minute.
+    // TierManager gives this thread priority over promotion once it announces a pending rescore.
+    workers.emplace_back([&tm, &shutdown] {
+        while (!shutdown.load(std::memory_order_relaxed)) {
+            sleep_interruptibly(shutdown, 60'000);
+            if (!shutdown.load(std::memory_order_relaxed)) tm.decay_access_scores();
+        }
+    });
+
+    // Region zero is local. Drain current score inversions as quickly as block copies permit, except
+    // while a rescore is pending/running; once sorted (or yielding to rescore), poll in one second.
+    if (cfg.memory.numa_regions.size() > 1)
+        workers.emplace_back([&tm, &shutdown] {
+            while (!shutdown.load(std::memory_order_relaxed)) {
+                if (tm.promote_hot_remote_block()) continue;
+                sleep_interruptibly(shutdown, 1'000);
             }
         });
 

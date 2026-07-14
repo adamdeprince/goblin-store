@@ -7,7 +7,7 @@ Two distinct kinds of RAM buffer were being conflated. They have different lifet
 and treating them the same is what makes the current GET allocate (and copy) a whole object.
 
 ## Decision
-- **Payload head buffers — FIXED.** Object heads live in the fixed, `mlock`'d head-cache pool
+- **Payload head buffers — FIXED.** Object heads live in the fixed, unswappable head-cache pool
   ([ADR-0008](0008-ram-allocator.md)), sized by config, bounded by S3-FIFO eviction
   ([ADR-0012](0012-multi-resource-eviction.md)). Long-lived (cached across requests).
 - **I/O buffers — small, separate, fixed-size, reused.** A small slab of fixed chunk buffers for
@@ -25,8 +25,9 @@ and treating them the same is what makes the current GET allocate (and copy) a w
   independent of object size.
 - `--memory` sizes the local head pool; `--sub-memory` optionally adds head blocks on every foreign
   NUMA node. Small I/O pools are separately bounded by `--io-chunk × --io-buffers` per worker (plus
-  one write-staging pool). All are `mlock`'d unless `--no-mlock` is selected
-  ([ADR-0016](0016-bounded-locked-memory.md)).
+  one write-staging pool). On Linux all first attempt `--block`-sized explicit hugetlb backing;
+  ordinary fallback memory is `mlock`'d unless `--no-mlock` is selected
+  ([ADR-0016](0016-bounded-locked-memory.md)). Chunk geometry is unchanged by the backing choice.
 
 ## Consequences
 - ➕ RAM per request is O(chunks), not O(object size); head served with no userspace payload copy; the two pools have clean, independent lifetimes.

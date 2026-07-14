@@ -7,6 +7,7 @@
 #include "goblin/common/types.hpp"
 #include "goblin/crypto/sha256.hpp" // Digest
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -36,6 +37,12 @@ struct ObjectMeta {
     std::uint64_t etag = 0;   // store generation -> HTTP ETag validator; changes on every (re)store
     HeadLoc head;             // RAM-head cache locator
     // eviction bookkeeping (SIEVE visited bit, etc.) lands with the eviction module (ADR-0012)
+};
+
+struct ScoredHead {
+    Digest digest;
+    HeadLoc head;
+    double score = 0.0;
 };
 
 struct DigestHash {
@@ -69,6 +76,12 @@ public:
     bool set_head(const Digest& d, HeadLoc loc);        // update head residency; false if absent
     bool update_expiry(const Digest& d, std::uint32_t expiry); // overwrite the TTL (meta T); false if absent
 
+    // Access scores are independent relaxed atomics inside each entry. Shared shard locks protect
+    // entry lifetime while readers and the minute-decay thread update the same score concurrently.
+    bool increment_score(const Digest& d, double increment);
+    std::optional<double> score(const Digest& d) const;
+    void decay_scores(double decay);
+
     std::size_t size() const; // live object count across shards
     void clear();             // blank slate (startup, ADR-0013)
 
@@ -78,11 +91,21 @@ public:
     // (digest, head) for every RAM-resident object. The compaction pass buckets these by block to
     // slide live heads down and reclaim dead arena space (ADR-0008 Phase 2).
     std::vector<std::pair<Digest, HeadLoc>> resident_heads() const;
+    std::vector<ScoredHead> scored_resident_heads() const;
+
+    // Rewrite every resident locator in two backing blocks. TierManager serializes this with data
+    // movement; locking every shard here makes the metadata rewrite one index-wide operation.
+    std::size_t swap_head_blocks(unsigned first, unsigned second);
 
 private:
+    struct Entry {
+        explicit Entry(const ObjectMeta& value) : meta(value), score(0.0) {}
+        ObjectMeta meta;
+        std::atomic<double> score;
+    };
     struct Shard {
         mutable std::shared_mutex mu;
-        std::unordered_map<Digest, ObjectMeta, DigestHash> map;
+        std::unordered_map<Digest, Entry, DigestHash> map;
     };
     Shard& shard_for(const Digest& d) noexcept;
     const Shard& shard_for(const Digest& d) const noexcept;

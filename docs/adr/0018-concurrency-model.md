@@ -15,10 +15,16 @@ in-flight request. Throughput is the headline benchmark vs memcached extstore.
     listeners. Interfaces on different nodes, an unknown interface locality on a multi-node host,
     or no discoverable listening interface make startup fail with every interface name, address,
     node, and usable `--numa NODE` command. The main thread is bound before the fixed head and
-    write-staging arenas are allocated; all worker and TTL-reaper threads inherit its affinity.
+    write-staging arenas are allocated; all worker, TTL-reaper, score-decay, and NUMA-promotion
+    threads inherit its affinity. A strict inherited default memory policy also keeps the dynamic
+    key index and thread-local allocations on the selected node.
     With explicit `--numa`, `--memory` is strictly bound to that local node and `--sub-memory` may
     add an equal-sized subordinate region on every other online node. Automatic NUMA selection may
-    not use `--sub-memory`. Head allocation exhausts the local region before visiting foreign ones.
+    not use `--sub-memory`. Head allocation exhausts the local region before visiting foreign ones;
+    decayed access scores then exchange hotter full foreign buddy blocks with colder local blocks
+    ([ADR-0019](0019-access-score-numa-promotion.md)). Score decay has priority over promotion: no new
+    exchange begins once the minute rescore is waiting, and the traversal runs promotion-free after
+    any already-active exchange completes.
   - **Blocking interim: one shared listen socket.** All workers `accept()` from a single listener so
     the kernel hands each new connection to a *free* worker. Per-core `SO_REUSEPORT` listeners are
     wrong here: SO_REUSEPORT pins a connection to a fixed listener by 4-tuple hash, so when two

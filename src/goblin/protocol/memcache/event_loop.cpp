@@ -283,7 +283,12 @@ void EventLoop::process(Conn* c) {
             const auto m = index_.lookup(digest); // mg without v -> metadata only (HD / EN)
             const bool present = m && !storage::is_expired(*m, now);
             if (!present) { if (!quiet) c->out += kMetaMiss; }
-            else { c->out += "HD"; c->out += meta_rflags_str(rflags, *m, mkey, mopaque, now); c->out += "\r\n"; }
+            else {
+                tm_.touch(digest); // metadata-only mg is still a successful key read
+                c->out += "HD";
+                c->out += meta_rflags_str(rflags, *m, mkey, mopaque, now);
+                c->out += "\r\n";
+            }
             continue;
         }
 

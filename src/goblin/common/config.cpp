@@ -1,5 +1,7 @@
 #include "goblin/common/config.hpp"
 
+#include <cmath>
+
 namespace goblin {
 
 Status validate(const ServerConfig& c) {
@@ -52,6 +54,12 @@ Status validate(const ServerConfig& c) {
     if (c.eviction.low_watermark <= 0.0 || c.eviction.high_watermark > 1.0 ||
         c.eviction.low_watermark >= c.eviction.high_watermark)
         return err(Errc::invalid_argument, "require 0 < low_watermark < high_watermark <= 1.0");
+
+    if (!std::isfinite(c.access_score.increment) || c.access_score.increment <= 0.0)
+        return err(Errc::invalid_argument, "--increment must be a finite positive number");
+    if (!std::isfinite(c.access_score.decay) || c.access_score.decay <= 0.0 ||
+        c.access_score.decay >= 1.0)
+        return err(Errc::invalid_argument, "--decay must be finite and strictly between 0 and 1");
 
     if (!c.enable_memcache && !c.enable_http && !c.enable_https)
         return err(Errc::invalid_argument,

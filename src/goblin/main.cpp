@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <charconv>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <limits>
@@ -54,6 +55,14 @@ std::optional<T> parse_int(std::string_view s) {
     return v;
 }
 
+std::optional<double> parse_float(std::string_view s) {
+    double v = 0.0;
+    const char* end = s.data() + s.size();
+    const auto [p, ec] = std::from_chars(s.data(), end, v, std::chars_format::general);
+    if (ec != std::errc{} || p != end || !std::isfinite(v)) return std::nullopt;
+    return v;
+}
+
 std::string format_size(Size bytes) {
     if (bytes % GiB == 0) return std::to_string(bytes / GiB) + " GiB";
     if (bytes % MiB == 0) return std::to_string(bytes / MiB) + " MiB";
@@ -67,7 +76,7 @@ void print_help() {
         "usage: goblin-store [options]\n"
         "  --memory SIZE       local NUMA head RAM, mlock'd          [default 1G]\n"
         "  --sub-memory SIZE   RAM on each non-local NUMA node       [requires --numa]\n"
-        "  --block SIZE        RAM block size, power of two          [default 1M]\n"
+        "  --block SIZE        RAM block size, power of two          [default {}]\n"
         "  --small-min-alloc SIZE  RAM min-order for <=ram-head heads [default 16]\n"
         "  --ssd-dir DIR       SSD pool directory (repeatable, >=1 required)\n"
         "  --hdd-dir DIR       HDD cold-pool directory (repeatable; enables 3-layer)\n"
@@ -80,6 +89,8 @@ void print_help() {
         "  --http-port N       HTTP port                             [default 8080]\n"
         "  --cores N           workers/protocol, 0=node CPU count    [default 0]\n"
         "  --numa NODE         bind all threads to this NUMA node    [default listener NIC]\n"
+        "  --increment FLOAT   score added per successful key read   [default 1.0]\n"
+        "  --decay FLOAT       per-minute score multiplier, 0 < d < 1 [default 0.5]\n"
         "  --source DIR        preload a directory tree at startup (repeatable)\n"
         "  --http-vhost        HTTP key = Host + URI (default: key = URI path)\n"
         "  --key-on-query      include the query string in the key (default: strip)\n"
@@ -96,7 +107,7 @@ void print_help() {
         "  --tls-cert FILE     PEM cert chain; enables HTTPS. Repeat per domain — SNI selects\n"
         "  --tls-key FILE      PEM private key, paired with the preceding --tls-cert\n"
         "  --https-port N      TLS listener port                     [default 8443]\n"
-        "  --help");
+        "  --help", format_size(kDefaultMemoryBlock));
 }
 } // namespace
 
@@ -175,6 +186,12 @@ int main(int argc, char** argv) {
             auto n = parse_int<unsigned>(*v); if (!n) { bad("NUMA node", *v); return 2; }
             cfg.numa_node = *n;
         }
+        else if (a == "--increment" || a == "--decay") {
+            auto v = take(a); if (!v) return 2;
+            auto n = parse_float(*v); if (!n) { bad(a.substr(2), *v); return 2; }
+            if (a == "--increment") cfg.access_score.increment = *n;
+            else cfg.access_score.decay = *n;
+        }
         else if (a == "--net") {
             auto v = take(a); if (!v) return 2;
             if (*v == "blocking") cfg.net = NetMode::blocking;
@@ -231,7 +248,7 @@ int main(int argc, char** argv) {
         std::vector<unsigned> node_ids;
         node_ids.reserve(static_cast<std::size_t>(foreign_nodes));
         for (std::size_t i = 1; i < cfg.memory.numa_regions.size(); ++i)
-            node_ids.push_back(cfg.memory.numa_regions[i].node);
+            node_ids.push_back(*cfg.memory.numa_regions[i].node);
         std::println("│ RAM foreign : {}/node on NUMA nodes {} ({} total)",
                      format_size(cfg.memory.sub_bytes), net::format_cpu_list(node_ids),
                      format_size(cfg.memory.sub_bytes * foreign_nodes));
@@ -257,6 +274,8 @@ int main(int argc, char** argv) {
     std::println("│ numa        : node {} ({}), CPUs {}", numa->node,
                  numa->automatic ? "automatic" : "explicit --numa",
                  net::format_cpu_list(numa->cpus));
+    std::println("│ score       : +{} per read, x{} each minute", cfg.access_score.increment,
+                 cfg.access_score.decay);
     if (numa->automatic) {
         for (const auto& nic : numa->interfaces) {
             std::println("│ listener NIC: {} {} -> {}", nic.name, nic.address,
@@ -286,7 +305,8 @@ int main(int argc, char** argv) {
     storage::Index index;
     auto tm = storage::TierManager::open(cfg.tiers, cfg.memory, cfg.eviction, cfg.ssd, cfg.hdd, index,
                                          cfg.io_chunk_bytes, cfg.io_buffers,
-                                         cfg.cache_bypass == CacheBypass::o_direct);
+                                         cfg.cache_bypass == CacheBypass::o_direct,
+                                         cfg.access_score);
     if (!tm) {
         std::println(stderr, "startup: {}", tm.error().detail);
         return 1;
