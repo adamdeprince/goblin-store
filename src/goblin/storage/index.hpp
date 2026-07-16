@@ -35,14 +35,12 @@ struct ObjectMeta {
     std::uint32_t flags = 0;  // opaque memcache flags
     std::uint32_t expiry = 0; // unix seconds; 0 = never (TTL swept separately, ADR-0007)
     std::uint64_t etag = 0;   // store generation -> HTTP ETag validator; changes on every (re)store
+    // Immutable disk-file incarnation. Zero means the object is RAM-only. Disk-backed shards use
+    // <digest>.g<file_generation>; publishing is one in-memory Index swap, never a sequence of
+    // cross-drive renames that can stop halfway.
+    std::uint64_t file_generation = 0;
     HeadLoc head;             // RAM-head cache locator
     // eviction bookkeeping (SIEVE visited bit, etc.) lands with the eviction module (ADR-0012)
-};
-
-struct ScoredHead {
-    Digest digest;
-    HeadLoc head;
-    double score = 0.0;
 };
 
 struct DigestHash {
@@ -68,18 +66,29 @@ public:
     std::optional<ObjectMeta> lookup(const Digest& d) const;
     bool contains(const Digest& d) const;
 
-    void set(const Digest& d, const ObjectMeta& m);     // memcache SET (unconditional)
+    // Low-level metadata mutations. They preserve the current score representation and therefore
+    // must not be used by TierManager to cross the fixed-head/non-fixed ownership boundary.
+    void set(const Digest& d, const ObjectMeta& m);     // memcache SET; preserves an existing score
+    // Insert or replace metadata while explicitly selecting index-local (numeric) or external
+    // (nullopt) score ownership. Numeric NaN is invalid because NaN is the ownership marker.
+    void set_with_score(const Digest& d, const ObjectMeta& m,
+                        std::optional<double> local_score);
     bool add(const Digest& d, const ObjectMeta& m);     // memcache ADD (only if absent)
     bool replace(const Digest& d, const ObjectMeta& m); // memcache REPLACE (only if present)
     bool erase(const Digest& d);                        // memcache DELETE
 
-    bool set_head(const Digest& d, HeadLoc loc);        // update head residency; false if absent
+    bool set_head(const Digest& d, HeadLoc loc);        // metadata only; false if absent
     bool update_expiry(const Digest& d, std::uint32_t expiry); // overwrite the TTL (meta T); false if absent
 
-    // Access scores are independent relaxed atomics inside each entry. Shared shard locks protect
-    // entry lifetime while readers and the minute-decay thread update the same score concurrently.
+    // Fractional and headless-object scores live in the index. A canonical NaN marks a score whose
+    // ownership has moved to the dense NUMA head array; score() then returns nullopt and index-side
+    // increment and decay leave it alone. Shared shard locks protect entry lifetime while the
+    // relaxed atomic operations serialize score updates and ownership transitions.
     bool increment_score(const Digest& d, double increment);
     std::optional<double> score(const Digest& d) const;
+    bool score_external(const Digest& d) const;
+    std::optional<double> extract_score(const Digest& d);
+    bool restore_score(const Digest& d, double value);
     void decay_scores(double decay);
 
     std::size_t size() const; // live object count across shards
@@ -91,7 +100,6 @@ public:
     // (digest, head) for every RAM-resident object. The compaction pass buckets these by block to
     // slide live heads down and reclaim dead arena space (ADR-0008 Phase 2).
     std::vector<std::pair<Digest, HeadLoc>> resident_heads() const;
-    std::vector<ScoredHead> scored_resident_heads() const;
 
     // Rewrite every resident locator in two backing blocks. TierManager serializes this with data
     // movement; locking every shard here makes the metadata rewrite one index-wide operation.

@@ -17,6 +17,7 @@ namespace goblin::http {
 // Preload every regular file under each `dirs` root into `tm`. Per-file failures are logged and
 // skipped; returns the number of files successfully stored.
 std::size_t preload_sources(const std::vector<std::string>& dirs, const KeyOptions& opt,
-                            storage::TierManager& tm);
+                            storage::TierManager& tm,
+                            WriteMode write_mode = WriteMode::block);
 
 } // namespace goblin::http

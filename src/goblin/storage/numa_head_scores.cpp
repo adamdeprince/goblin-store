@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -16,13 +17,6 @@
 #include <system_error>
 #include <thread>
 #include <utility>
-
-#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
-#include <immintrin.h>
-#define GOBLIN_NUMA_SCORE_AVX_DISPATCH 1
-#else
-#define GOBLIN_NUMA_SCORE_AVX_DISPATCH 0
-#endif
 
 namespace goblin::storage {
 
@@ -60,151 +54,24 @@ bool align_checked(std::size_t value, std::size_t alignment, std::size_t& result
     return true;
 }
 
-void aggregate_complete_blocks_scalar(const double* scores, std::size_t block_count,
+void aggregate_complete_blocks_scalar(const std::atomic<double>* scores, std::size_t block_count,
                                       std::size_t slots_per_block, double* totals,
                                       double* eligible) noexcept {
     for (std::size_t block = 0; block < block_count; ++block) {
         double total = 0.0;
         bool complete = true;
-        const double* block_scores = scores + block * slots_per_block;
+        const std::atomic<double>* block_scores = scores + block * slots_per_block;
         for (std::size_t slot = 0; slot < slots_per_block; ++slot) {
-            if (std::isnan(block_scores[slot])) {
+            const double score = block_scores[slot].load(std::memory_order_relaxed);
+            if (std::isnan(score)) {
                 complete = false;
                 continue;
             }
-            total += block_scores[slot];
+            total += score;
         }
         totals[block] = total;
         eligible[block] = complete ? 1.0 : 0.0;
     }
-}
-
-#if GOBLIN_NUMA_SCORE_AVX_DISPATCH
-
-__attribute__((target("avx")))
-void aggregate_complete_blocks_avx(const double* scores, std::size_t block_count,
-                                   std::size_t slots_per_block, double* totals,
-                                   double* eligible) noexcept {
-    for (std::size_t block = 0; block < block_count; ++block) {
-        const double* block_scores = scores + block * slots_per_block;
-        __m256d vector_total = _mm256_setzero_pd();
-        bool complete = true;
-        std::size_t slot = 0;
-        for (; slot + 4 <= slots_per_block; slot += 4) {
-            const __m256d values = _mm256_loadu_pd(block_scores + slot);
-            const __m256d numbers = _mm256_cmp_pd(values, values, _CMP_ORD_Q);
-            complete = complete && _mm256_movemask_pd(numbers) == 0xF;
-            // Empty slots are NaN. Zero them before summing so one incomplete block cannot poison
-            // its scratch total; eligibility still prevents that total from becoming a candidate.
-            vector_total =
-                _mm256_add_pd(vector_total, _mm256_blendv_pd(_mm256_setzero_pd(), values, numbers));
-        }
-
-        const __m128d low = _mm256_castpd256_pd128(vector_total);
-        const __m128d high = _mm256_extractf128_pd(vector_total, 1);
-        const __m128d pair = _mm_add_pd(low, high);
-        const __m128d horizontal = _mm_hadd_pd(pair, pair);
-        double total = _mm_cvtsd_f64(horizontal);
-        for (; slot < slots_per_block; ++slot) {
-            if (std::isnan(block_scores[slot])) {
-                complete = false;
-                continue;
-            }
-            total += block_scores[slot];
-        }
-        totals[block] = total;
-        eligible[block] = complete ? 1.0 : 0.0;
-    }
-}
-
-__attribute__((target("avx")))
-ScoreExtrema scan_score_extrema_avx(std::span<const double> scores,
-                                    std::span<const double> eligible) noexcept {
-    const std::size_t n = std::min(scores.size(), eligible.size());
-    const __m256d one = _mm256_set1_pd(1.0);
-    const __m256d positive_infinity =
-        _mm256_set1_pd(std::numeric_limits<double>::infinity());
-    const __m256d negative_infinity =
-        _mm256_set1_pd(-std::numeric_limits<double>::infinity());
-    __m256d minima = positive_infinity;
-    __m256d maxima = negative_infinity;
-    // AVX1 has packed-double compares/blends but no useful packed 64-bit integer min/max. Array
-    // indexes below 2^53 are exact doubles. HeadLoc's 32-bit block/offset limits plus the >=4 KiB
-    // head invariant cap this table below 2^52 slots, so carry indexes in parallel double vectors.
-    __m256d minimum_indexes = positive_infinity;
-    __m256d maximum_indexes = positive_infinity;
-
-    std::size_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        const __m256d values = _mm256_loadu_pd(scores.data() + i);
-        const __m256d enabled = _mm256_loadu_pd(eligible.data() + i);
-        const __m256d indexes = _mm256_set_pd(static_cast<double>(i + 3),
-                                               static_cast<double>(i + 2),
-                                               static_cast<double>(i + 1),
-                                               static_cast<double>(i));
-        const __m256d score_is_number = _mm256_cmp_pd(values, values, _CMP_ORD_Q);
-        const __m256d is_eligible = _mm256_cmp_pd(enabled, one, _CMP_EQ_OQ);
-        const __m256d valid = _mm256_and_pd(score_is_number, is_eligible);
-
-        const __m256d smaller = _mm256_cmp_pd(values, minima, _CMP_LT_OQ);
-        const __m256d equal_min = _mm256_cmp_pd(values, minima, _CMP_EQ_OQ);
-        const __m256d earlier_min = _mm256_cmp_pd(indexes, minimum_indexes, _CMP_LT_OQ);
-        const __m256d replace_min = _mm256_and_pd(
-            valid, _mm256_or_pd(smaller, _mm256_and_pd(equal_min, earlier_min)));
-        minima = _mm256_blendv_pd(minima, values, replace_min);
-        minimum_indexes = _mm256_blendv_pd(minimum_indexes, indexes, replace_min);
-
-        const __m256d larger = _mm256_cmp_pd(values, maxima, _CMP_GT_OQ);
-        const __m256d equal_max = _mm256_cmp_pd(values, maxima, _CMP_EQ_OQ);
-        const __m256d earlier_max = _mm256_cmp_pd(indexes, maximum_indexes, _CMP_LT_OQ);
-        const __m256d replace_max = _mm256_and_pd(
-            valid, _mm256_or_pd(larger, _mm256_and_pd(equal_max, earlier_max)));
-        maxima = _mm256_blendv_pd(maxima, values, replace_max);
-        maximum_indexes = _mm256_blendv_pd(maximum_indexes, indexes, replace_max);
-    }
-
-    alignas(32) double minimum_lanes[4];
-    alignas(32) double maximum_lanes[4];
-    alignas(32) double minimum_index_lanes[4];
-    alignas(32) double maximum_index_lanes[4];
-    _mm256_store_pd(minimum_lanes, minima);
-    _mm256_store_pd(maximum_lanes, maxima);
-    _mm256_store_pd(minimum_index_lanes, minimum_indexes);
-    _mm256_store_pd(maximum_index_lanes, maximum_indexes);
-
-    ScoreExtrema out;
-    for (unsigned lane = 0; lane < 4; ++lane) {
-        if (!std::isinf(minimum_index_lanes[lane]))
-            consider_min(out.min,
-                         ScoreCandidate{static_cast<std::size_t>(minimum_index_lanes[lane]),
-                                        minimum_lanes[lane]});
-        if (!std::isinf(maximum_index_lanes[lane]))
-            consider_max(out.max,
-                         ScoreCandidate{static_cast<std::size_t>(maximum_index_lanes[lane]),
-                                        maximum_lanes[lane]});
-    }
-
-    for (; i < n; ++i) {
-        const double value = scores[i];
-        if (eligible[i] != 1.0 || std::isnan(value)) continue;
-        consider_min(out.min, ScoreCandidate{i, value});
-        consider_max(out.max, ScoreCandidate{i, value});
-    }
-    return out;
-}
-
-#endif
-
-void aggregate_complete_blocks(const double* scores, std::size_t block_count,
-                               std::size_t slots_per_block, double* totals,
-                               double* eligible) noexcept {
-#if GOBLIN_NUMA_SCORE_AVX_DISPATCH
-    if (avx_score_scan_available()) {
-        aggregate_complete_blocks_avx(scores, block_count, slots_per_block, totals, eligible);
-        return;
-    }
-#endif
-    aggregate_complete_blocks_scalar(scores, block_count, slots_per_block, totals, eligible);
 }
 
 } // namespace
@@ -222,35 +89,16 @@ ScoreExtrema scan_score_extrema_scalar(std::span<const double> scores,
     return out;
 }
 
-bool avx_score_scan_available() noexcept {
-#if GOBLIN_NUMA_SCORE_AVX_DISPATCH
-    static const bool available = [] {
-        __builtin_cpu_init();
-        return __builtin_cpu_supports("avx");
-    }();
-    return available;
-#else
-    return false;
-#endif
-}
-
-ScoreExtrema scan_score_extrema(std::span<const double> scores,
-                                std::span<const double> eligible) noexcept {
-#if GOBLIN_NUMA_SCORE_AVX_DISPATCH
-    if (avx_score_scan_available()) return scan_score_extrema_avx(scores, eligible);
-#endif
-    return scan_score_extrema_scalar(scores, eligible);
-}
-
 struct NumaHeadScoreTable::Impl {
     struct RegionState {
         NumaScoreRegionConfig config;
         std::unique_ptr<core::BlockPool> backing;
-        double* scores = nullptr;      // one per fixed-head slot; NaN means empty
+        std::atomic<double>* scores = nullptr; // one per fixed-head slot; NaN means empty
         double* block_totals = nullptr; // promotion scratch, one per allocation block
         double* eligible = nullptr;     // promotion scratch, exactly zero or one
         std::size_t slot_count = 0;
         std::size_t worker_index = 0;
+        bool scores_constructed = false;
     };
 
     struct alignas(64) WorkerState {
@@ -286,7 +134,12 @@ struct NumaHeadScoreTable::Impl {
     std::optional<Error> startup_error;
     std::optional<Error> runtime_error;
 
-    ~Impl() { shutdown(); }
+    ~Impl() {
+        shutdown();
+        for (auto& region : regions)
+            if (region.scores_constructed)
+                std::destroy_n(region.scores, region.slot_count);
+    }
 
     void shutdown() noexcept {
         {
@@ -309,14 +162,14 @@ struct NumaHeadScoreTable::Impl {
         RegionState* region = nullptr;
         std::size_t local_block = 0;
         std::size_t slot_in_block = 0;
-        double* value = nullptr;
+        std::atomic<double>* value = nullptr;
     };
 
     struct ConstSlotRef {
         const RegionState* region = nullptr;
         std::size_t local_block = 0;
         std::size_t slot_in_block = 0;
-        const double* value = nullptr;
+        const std::atomic<double>* value = nullptr;
     };
 
     std::optional<SlotRef> find_slot(HeadLoc loc) noexcept {
@@ -373,8 +226,9 @@ struct NumaHeadScoreTable::Impl {
         ScoreExtrema summary;
         for (const std::size_t region_index : worker.region_indexes) {
             RegionState& region = regions[region_index];
-            aggregate_complete_blocks(region.scores, region.config.block_count, slots_per_block,
-                                      region.block_totals, region.eligible);
+            aggregate_complete_blocks_scalar(region.scores, region.config.block_count,
+                                             slots_per_block, region.block_totals,
+                                             region.eligible);
 
             // Pins are an epoch input. Each node reads this compact list once, then changes only its
             // node-local eligibility scratch; the dense score and block arrays never cross nodes.
@@ -384,11 +238,9 @@ struct NumaHeadScoreTable::Impl {
                 if (pinned_block >= begin && pinned_block < end)
                     region.eligible[static_cast<std::size_t>(pinned_block - begin)] = 0.0;
 
-            ScoreExtrema local =
-                scan_score_extrema(std::span<const double>(region.block_totals,
-                                                           region.config.block_count),
-                                   std::span<const double>(region.eligible,
-                                                           region.config.block_count));
+            ScoreExtrema local = scan_score_extrema_scalar(
+                std::span<const double>(region.block_totals, region.config.block_count),
+                std::span<const double>(region.eligible, region.config.block_count));
             if (local.min) {
                 local.min->index += region.config.first_block;
                 consider_min(summary.min, *local.min);
@@ -404,8 +256,15 @@ struct NumaHeadScoreTable::Impl {
     void decay_worker(const WorkerState& worker, double factor) noexcept {
         for (const std::size_t region_index : worker.region_indexes) {
             RegionState& region = regions[region_index];
-            for (std::size_t slot = 0; slot < region.slot_count; ++slot)
-                if (!std::isnan(region.scores[slot])) region.scores[slot] *= factor;
+            for (std::size_t slot = 0; slot < region.slot_count; ++slot) {
+                auto& score = region.scores[slot];
+                double current = score.load(std::memory_order_relaxed);
+                while (!std::isnan(current) &&
+                       !score.compare_exchange_weak(current, current * factor,
+                                                    std::memory_order_relaxed,
+                                                    std::memory_order_relaxed)) {
+                }
+            }
         }
     }
 
@@ -420,7 +279,9 @@ struct NumaHeadScoreTable::Impl {
             // placement guarantee; local first touch also covers null-node portable test regions.
             for (const std::size_t region_index : worker.region_indexes) {
                 RegionState& region = regions[region_index];
-                std::fill_n(region.scores, region.slot_count, kEmptyScore);
+                for (std::size_t slot = 0; slot < region.slot_count; ++slot)
+                    std::construct_at(region.scores + slot, kEmptyScore);
+                region.scores_constructed = true;
                 std::fill_n(region.block_totals, region.config.block_count, 0.0);
                 std::fill_n(region.eligible, region.config.block_count, 0.0);
             }
@@ -549,7 +410,6 @@ Result<NumaHeadScoreTable> NumaHeadScoreTable::create(
     if (block_bytes > std::numeric_limits<std::uint32_t>::max() ||
         head_bytes > std::numeric_limits<std::uint32_t>::max())
         return err(Errc::invalid_argument, "NUMA head score geometry exceeds HeadLoc width");
-
     try {
         auto impl = std::make_unique<Impl>();
         impl->block_bytes = block_bytes;
@@ -578,7 +438,7 @@ Result<NumaHeadScoreTable> NumaHeadScoreTable::create(
             std::size_t score_bytes = 0;
             std::size_t block_bytes_needed = 0;
             if (!checked_mul(config.block_count, impl->slots_per_block, slot_count) ||
-                !checked_mul(slot_count, sizeof(double), score_bytes) ||
+                !checked_mul(slot_count, sizeof(std::atomic<double>), score_bytes) ||
                 !checked_mul(config.block_count, sizeof(double), block_bytes_needed))
                 return err(Errc::out_of_memory, "NUMA score array size overflows address space");
 
@@ -586,7 +446,9 @@ Result<NumaHeadScoreTable> NumaHeadScoreTable::create(
             std::size_t eligibility_offset = 0;
             std::size_t used = 0;
             std::size_t mapping_bytes = 0;
-            if (!align_checked(score_bytes, 64, totals_offset) ||
+            if (!align_checked(score_bytes,
+                               std::max<std::size_t>(64, alignof(std::atomic<double>)),
+                               totals_offset) ||
                 !checked_add(totals_offset, block_bytes_needed, used) ||
                 !align_checked(used, 64, eligibility_offset) ||
                 !checked_add(eligibility_offset, block_bytes_needed, used) ||
@@ -605,7 +467,7 @@ Result<NumaHeadScoreTable> NumaHeadScoreTable::create(
 
             Impl::RegionState region;
             region.config = config;
-            region.scores = reinterpret_cast<double*>(base);
+            region.scores = reinterpret_cast<std::atomic<double>*>(base);
             region.block_totals = reinterpret_cast<double*>(base + totals_offset);
             region.eligible = reinterpret_cast<double*>(base + eligibility_offset);
             region.slot_count = slot_count;
@@ -678,15 +540,27 @@ Status NumaHeadScoreTable::publish(HeadLoc loc, double value) {
         return err(Errc::invalid_argument, "fixed-head score must be nonnegative and not NaN");
     const auto slot = impl_->find_slot(loc);
     if (!slot) return std::unexpected(Impl::invalid_location(loc));
-    *slot->value = value;
+    double current = slot->value->load(std::memory_order_relaxed);
+    if (!std::isnan(current))
+        return err(Errc::invalid_argument, "fixed-head score slot is already occupied");
+    if (!slot->value->compare_exchange_strong(current, value, std::memory_order_relaxed,
+                                              std::memory_order_relaxed))
+        return err(Errc::invalid_argument, "fixed-head score slot changed during publication");
     return {};
 }
 
-Status NumaHeadScoreTable::erase(HeadLoc loc) {
+Result<double> NumaHeadScoreTable::extract(HeadLoc loc) {
     if (!impl_) return err(Errc::invalid_argument, "moved-from NUMA head score table");
     const auto slot = impl_->find_slot(loc);
     if (!slot) return std::unexpected(Impl::invalid_location(loc));
-    *slot->value = kEmptyScore;
+    const double value = slot->value->exchange(kEmptyScore, std::memory_order_relaxed);
+    if (std::isnan(value)) return err(Errc::not_found, "fixed-head score slot is empty");
+    return value;
+}
+
+Status NumaHeadScoreTable::erase(HeadLoc loc) {
+    auto value = extract(loc);
+    if (!value) return std::unexpected(value.error());
     return {};
 }
 
@@ -696,9 +570,14 @@ Status NumaHeadScoreTable::increment(HeadLoc loc, double amount) {
         return err(Errc::invalid_argument, "fixed-head score increment must be finite and positive");
     const auto slot = impl_->find_slot(loc);
     if (!slot) return std::unexpected(Impl::invalid_location(loc));
-    if (std::isnan(*slot->value)) return err(Errc::not_found, "fixed-head score slot is empty");
-    *slot->value += amount;
-    return {};
+    double current = slot->value->load(std::memory_order_relaxed);
+    while (!std::isnan(current)) {
+        if (slot->value->compare_exchange_weak(current, current + amount,
+                                               std::memory_order_relaxed,
+                                               std::memory_order_relaxed))
+            return {};
+    }
+    return err(Errc::not_found, "fixed-head score slot is empty");
 }
 
 Status NumaHeadScoreTable::decay(double factor) {
@@ -731,18 +610,26 @@ Status NumaHeadScoreTable::swap_blocks(unsigned first, unsigned second) {
     const auto second_ref = impl_->find_block(second);
     if (!first_ref || !second_ref)
         return err(Errc::invalid_argument, "NUMA score block swap is outside configured regions");
-    double* first_scores = first_ref->region->scores + first_ref->local_block * impl_->slots_per_block;
-    double* second_scores =
+    std::atomic<double>* first_scores =
+        first_ref->region->scores + first_ref->local_block * impl_->slots_per_block;
+    std::atomic<double>* second_scores =
         second_ref->region->scores + second_ref->local_block * impl_->slots_per_block;
-    std::swap_ranges(first_scores, first_scores + impl_->slots_per_block, second_scores);
+    for (std::size_t slot = 0; slot < impl_->slots_per_block; ++slot) {
+        const double first_value = first_scores[slot].load(std::memory_order_relaxed);
+        const double second_value = second_scores[slot].load(std::memory_order_relaxed);
+        first_scores[slot].store(second_value, std::memory_order_relaxed);
+        second_scores[slot].store(first_value, std::memory_order_relaxed);
+    }
     return {};
 }
 
 std::optional<double> NumaHeadScoreTable::score(HeadLoc loc) const noexcept {
     if (!impl_) return std::nullopt;
     const auto slot = std::as_const(*impl_).find_slot(loc);
-    if (!slot || std::isnan(*slot->value)) return std::nullopt;
-    return *slot->value;
+    if (!slot) return std::nullopt;
+    const double value = slot->value->load(std::memory_order_relaxed);
+    if (std::isnan(value)) return std::nullopt;
+    return value;
 }
 
 std::size_t NumaHeadScoreTable::worker_count() const noexcept {

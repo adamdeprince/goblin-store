@@ -1,5 +1,6 @@
 #include "goblin/http/key_derivation.hpp"
 
+#include <array>
 #include <cctype>
 #include <string>
 #include <vector>
@@ -13,9 +14,36 @@ int hexval(char c) {
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
 }
+
+// True when `path` is already a canonical absolute path: leading '/', no percent-encoding, no
+// empty segments (`//`), and no `.` / `..` segments. The common CDN-style request hits this path
+// and can skip percent_decode + stack walk entirely.
+bool is_simple_canonical_path(std::string_view path) {
+    if (path.empty() || path.front() != '/') return false;
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        const char c = path[i];
+        if (c == '%') return false;
+        if (c != '/') continue;
+        // Inspect the segment that starts after this slash.
+        const std::size_t seg = i + 1;
+        if (seg >= path.size()) return true; // trailing '/' is fine for the simple check caller
+        if (path[seg] == '/') return false;  // empty segment (`//`)
+        if (path[seg] != '.') continue;
+        // `/./` or trailing `/.`
+        const std::size_t after_dot = seg + 1;
+        if (after_dot >= path.size() || path[after_dot] == '/') return false;
+        // `/../` or trailing `/..`
+        if (path[after_dot] == '.' && (after_dot + 1 >= path.size() || path[after_dot + 1] == '/'))
+            return false;
+    }
+    return true;
+}
 } // namespace
 
 std::string percent_decode(std::string_view s) {
+    // Fast path: nothing to decode — still returns a string (callers own the result), but skips
+    // the scan-and-push loop when the input is already literal.
+    if (s.find('%') == std::string_view::npos) return std::string(s);
     std::string out;
     out.reserve(s.size());
     for (std::size_t i = 0; i < s.size(); ++i) {
@@ -34,26 +62,61 @@ std::string percent_decode(std::string_view s) {
 }
 
 std::string canonical_path(std::string_view path, bool decode) {
-    const std::string decoded = decode ? percent_decode(path) : std::string(path);
-    const std::string_view sv(decoded);
-    std::vector<std::string_view> stack;
+    // Only allocate a decoded buffer when percent-encoding is present.
+    std::string decoded_storage;
+    std::string_view sv = path;
+    if (decode) {
+        if (path.find('%') != std::string_view::npos) {
+            decoded_storage = percent_decode(path);
+            sv = decoded_storage;
+        }
+    }
+
+    // Stack of path segments on the stack for typical depths; spill to the heap only if needed.
+    std::array<std::string_view, 64> stack_buf{};
+    std::vector<std::string_view> stack_heap;
+    std::size_t depth = 0;
+    auto push = [&](std::string_view seg) {
+        if (depth < stack_buf.size() && stack_heap.empty()) {
+            stack_buf[depth++] = seg;
+            return;
+        }
+        if (stack_heap.empty()) {
+            stack_heap.assign(stack_buf.begin(), stack_buf.begin() + static_cast<std::ptrdiff_t>(depth));
+        }
+        stack_heap.push_back(seg);
+        depth = stack_heap.size();
+    };
+    auto pop = [&]() {
+        if (!stack_heap.empty()) {
+            stack_heap.pop_back();
+            depth = stack_heap.size();
+        } else if (depth) {
+            --depth;
+        }
+    };
+    auto at = [&](std::size_t i) -> std::string_view {
+        return stack_heap.empty() ? stack_buf[i] : stack_heap[i];
+    };
+
     std::size_t start = 0;
     while (true) {
         const std::size_t slash = sv.find('/', start);
         const std::string_view seg =
             (slash == std::string_view::npos) ? sv.substr(start) : sv.substr(start, slash - start);
         if (seg == "..") {
-            if (!stack.empty()) stack.pop_back(); // cannot escape root
+            if (depth) pop(); // cannot escape root
         } else if (!seg.empty() && seg != ".") {
-            stack.push_back(seg); // empty segments collapse duplicate '/'
+            push(seg); // empty segments collapse duplicate '/'
         }
         if (slash == std::string_view::npos) break;
         start = slash + 1;
     }
     std::string out = "/";
-    for (std::size_t k = 0; k < stack.size(); ++k) {
+    for (std::size_t k = 0; k < depth; ++k) {
         if (k) out.push_back('/');
-        out.append(stack[k].data(), stack[k].size());
+        const std::string_view s = at(k);
+        out.append(s.data(), s.size());
     }
     return out;
 }
@@ -81,8 +144,32 @@ std::optional<std::string> derive_key(std::string_view host, std::string_view ur
 
     // Directory index: a path ending in '/' (or an empty target) names a directory -> serve the
     // configured index file. Appended before canonicalization so dot-segments still resolve.
+    const bool want_index =
+        !opt.index_name.empty() && (path_part.empty() || path_part.back() == '/');
+
+    // Hot path: already-canonical absolute path, no dir-index rewrite. Skip decode + segment walk.
+    if (!want_index && is_simple_canonical_path(path_part)) {
+        std::string key;
+        if (opt.mode == KeyMode::vhost) {
+            const std::string h = normalize_host(host);
+            if (h.empty()) return std::nullopt;
+            key.reserve(h.size() + path_part.size() +
+                        (opt.keep_query ? query_part.size() : 0));
+            key = h;
+            key.append(path_part.data(), path_part.size());
+        } else if (opt.strip_leading_slash) {
+            // path_part is "/..." (or "/"); drop the leading '/'.
+            key.assign(path_part.data() + 1, path_part.size() - 1);
+        } else {
+            key.assign(path_part.data(), path_part.size());
+        }
+        if (opt.keep_query && !query_part.empty())
+            key.append(query_part.data(), query_part.size());
+        return key;
+    }
+
     std::string key;
-    if (!opt.index_name.empty() && (path_part.empty() || path_part.back() == '/')) {
+    if (want_index) {
         std::string dir(path_part);
         dir += opt.index_name; // '/' -> '/index.html', '/blog/' -> '/blog/index.html'
         key = canonical_path(dir, /*decode=*/true);

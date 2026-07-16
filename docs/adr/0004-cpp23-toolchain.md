@@ -14,8 +14,9 @@ Observed dev box (2026-06-09): **GCC 16.1** (system `g++`), `g++-15` present, **
 - **Headers only for now — C++ modules OFF.** Module/toolchain maturity isn't worth the build
   risk yet.
 - **Dependencies:** **OpenSSL — required** (`libssl-dev`; TLS for the runtime-optional HTTPS
-  listener, [ADR-0005](0005-protocol-surface.md)); the key-digest SHA-256 is **vendored, not from
-  OpenSSL** ([ADR-0014](0014-keyless-digest-identity.md)). **liburing — required for the io_uring
+  listener, [ADR-0005](0005-protocol-surface.md), and the long-input SHA-256 fallback where selected;
+  short-key scalar and hardware SHA implementations are vendored,
+  [ADR-0014](0014-keyless-digest-identity.md)). **liburing — required for the io_uring
   backend** (`liburing-dev`; detected via `pkg-config`, gated by `GOBLIN_HAVE_URING`; the
   pure-logic layers build without it, but the server can't serve). HTTP/2,3 later: nghttp2 /
   ngtcp2 + nghttp3.

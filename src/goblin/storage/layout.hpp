@@ -10,7 +10,7 @@ namespace goblin::storage {
 enum class Tier { ram, ssd, hdd };
 
 // Byte spans of an object across the tiers.
-//   RAM caches  [0, ram_head_bytes)   (also physically resident on SSD — ADR-0003)
+//   RAM caches  [0, ram_head_bytes)   (also in SSD for disk-backed objects; sole copy when RAM-only)
 //   SSD pool    [0, ssd_bytes)
 //   HDD pool    [ssd_bytes, size)     (hdd_bytes == 0 in 2-layer mode)
 struct ObjectLayout {

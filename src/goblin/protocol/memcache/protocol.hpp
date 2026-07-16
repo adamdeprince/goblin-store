@@ -78,6 +78,11 @@ inline constexpr std::string_view kMetaExists = "EX\r\n";    // cas mismatch
 inline constexpr std::string_view kMetaNotFound = "NF\r\n";  // absent (md / cas on missing)
 
 // "VALUE <key> <flags> <bytes>\r\n" — followed on the wire by <data>\r\n.
+// Prefer the append_* forms on the hot path (no temporary std::string).
+void append_value_header(std::string& out, std::string_view key, std::uint32_t flags,
+                         std::uint64_t bytes);
+void append_value_header_cas(std::string& out, std::string_view key, std::uint32_t flags,
+                             std::uint64_t bytes, std::uint64_t cas);
 std::string value_header(std::string_view key, std::uint32_t flags, std::uint64_t bytes);
 // "VALUE <key> <flags> <bytes> <cas>\r\n" — the gets/cas form, carrying the CAS unique.
 std::string value_header_cas(std::string_view key, std::uint32_t flags, std::uint64_t bytes,

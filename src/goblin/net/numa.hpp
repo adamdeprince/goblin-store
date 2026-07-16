@@ -1,6 +1,6 @@
 // Linux NUMA placement for the thread-per-core runtime. With an explicit --numa NODE we validate
-// and bind to that node. Without it, the wildcard IPv4 listeners inherit the NUMA node of every
-// UP, non-loopback Ethernet address; spanning more than one node is an operator-visible error.
+// and bind to that node. Without it, wildcard IPv4 listeners cover every UP Ethernet address and
+// native RDMA listeners add their exact InfiniBand/RoCE netdev; spanning nodes is an error.
 #pragma once
 
 #include "goblin/common/error.hpp"
@@ -16,7 +16,7 @@ namespace goblin::net {
 
 struct NicAddress {
     std::string name;                 // Linux interface name (for example, enp65s0f0)
-    std::string address;              // numeric IPv4 address reached by an INADDR_ANY listener
+    std::string address;              // numeric IPv4/IPv6 address reached by a configured listener
     std::optional<unsigned> numa_node; // /sys/class/net/<name>/device/numa_node; null = unknown
 };
 
@@ -54,7 +54,10 @@ Result<unsigned> select_farthest_numa_node(unsigned serving_node,
 // default memory policy. Ordinary threads subsequently created by it inherit both policies,
 // keeping index, protocol, and I/O allocations on the selected node. Per-node score scanners
 // explicitly override both policies; explicit head ranges may override memory with mbind().
-Result<NumaBinding> configure_numa(std::optional<unsigned> requested, bool perverse = false);
+Result<NumaBinding> configure_numa(
+    std::optional<unsigned> requested, bool perverse = false,
+    std::span<const std::string> exact_listener_addresses = {},
+    bool wildcard_ethernet_listener = true);
 
 // Intersect a node's Linux cpulist with the affinity mask captured before configure_numa() narrowed
 // the main thread. Scanner workers inherit that narrow mask, so bind_numa_worker() deliberately
@@ -63,11 +66,14 @@ Result<std::vector<unsigned>> numa_node_cpus(unsigned node,
                                              std::span<const unsigned> allowed_cpus);
 Status bind_numa_worker(unsigned node, std::span<const unsigned> cpus);
 
-// Build a local-first memory layout: --memory on local_node, followed by --sub-memory on every
-// other online node. A nonzero foreign_bytes budget needs at least one foreign node.
+// Build a local-first memory layout: local_bytes on local_node, followed by foreign_bytes on every
+// other online node. Option names customize diagnostics for the fixed-head and small-object pools.
 Result<std::vector<NumaMemoryBudget>> plan_numa_memory(unsigned local_node,
                                                        std::span<const unsigned> online_nodes,
-                                                       Size local_bytes, Size foreign_bytes);
+                                                       Size local_bytes, Size foreign_bytes,
+                                                       std::string_view local_option = "--memory",
+                                                       std::string_view foreign_option =
+                                                           "--sub-memory");
 
 std::string format_cpu_list(std::span<const unsigned> cpus);
 

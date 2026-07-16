@@ -2,7 +2,8 @@
 //
 // A fixed head has a deterministic slot: block * (block_bytes / head_bytes) +
 // offset / head_bytes.  Keeping those doubles in node-bound arrays lets one worker on each NUMA
-// node rank its own blocks without streaming the score table over the socket interconnect.
+// node rank its own blocks without streaming the score table over the socket interconnect. Slots
+// are atomics so request increments and node-local maintenance have defined concurrent semantics.
 #pragma once
 
 #include "goblin/common/error.hpp"
@@ -29,12 +30,9 @@ struct ScoreExtrema {
 
 // `eligible` contains zero or one for each score. NaN scores are always ignored. Both scanners use
 // the lowest array index to break equal-score ties. If the spans differ, only their common prefix is
-// examined. The automatic entry point uses AVX1 when the compiler, CPU, and OS support it.
+// examined.
 ScoreExtrema scan_score_extrema_scalar(std::span<const double> scores,
                                        std::span<const double> eligible) noexcept;
-ScoreExtrema scan_score_extrema(std::span<const double> scores,
-                                std::span<const double> eligible) noexcept;
-bool avx_score_scan_available() noexcept;
 
 struct NumaScoreRegionConfig {
     unsigned first_block = 0;
@@ -61,11 +59,13 @@ public:
     NumaHeadScoreTable(const NumaHeadScoreTable&) = delete;
     NumaHeadScoreTable& operator=(const NumaHeadScoreTable&) = delete;
 
-    // The caller serializes every operation with TierManager's exclusive lock/maintenance gate.
     // Only fixed heads (`loc.len == head_bytes`) belong in this table. NaN is reserved as the empty
-    // slot marker; positive infinity remains a valid (saturated) score.
+    // slot marker; positive infinity remains a valid (saturated) score. Publication/extraction and
+    // block swaps still require TierManager's lifecycle lock so a physical slot cannot be reused
+    // while an old owner is visible. Increment, score, and decay use relaxed atomic operations.
     Status publish(HeadLoc loc, double score);
-    Status erase(HeadLoc loc);
+    Result<double> extract(HeadLoc loc);
+    Status erase(HeadLoc loc); // extract and discard
     Status increment(HeadLoc loc, double amount);
     Status decay(double factor); // dispatched so every score is read/written by its node-local worker
 

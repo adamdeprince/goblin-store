@@ -2,22 +2,37 @@
 
 #include <array>
 #include <charconv>
-#include <format>
+#include <cstring>
 
 namespace goblin::memcache {
 namespace {
 
 Verb verb_of(std::string_view t) {
-    if (t == "get") return Verb::get;
-    if (t == "gets") return Verb::gets;
-    if (t == "set") return Verb::set;
-    if (t == "add") return Verb::add;
-    if (t == "replace") return Verb::replace;
-    if (t == "cas") return Verb::cas;
-    if (t == "delete") return Verb::del;
-    if (t == "version") return Verb::version;
-    if (t == "quit") return Verb::quit;
-    if (t == "stats") return Verb::stats;
+    // Length + first-char filter before full compare (small-object parse path).
+    switch (t.size()) {
+        case 3:
+            if (t[0] == 'g' && t == "get") return Verb::get;
+            if (t[0] == 's' && t == "set") return Verb::set;
+            if (t[0] == 'a' && t == "add") return Verb::add;
+            if (t[0] == 'c' && t == "cas") return Verb::cas;
+            break;
+        case 4:
+            if (t[0] == 'g' && t == "gets") return Verb::gets;
+            if (t[0] == 'q' && t == "quit") return Verb::quit;
+            break;
+        case 5:
+            if (t[0] == 's' && t == "stats") return Verb::stats;
+            break;
+        case 6:
+            if (t[0] == 'd' && t == "delete") return Verb::del;
+            break;
+        case 7:
+            if (t[0] == 'r' && t == "replace") return Verb::replace;
+            if (t[0] == 'v' && t == "version") return Verb::version;
+            break;
+        default:
+            break;
+    }
     return Verb::unknown;
 }
 
@@ -26,6 +41,18 @@ bool to_int(std::string_view s, T& out) {
     const auto* end = s.data() + s.size();
     const auto [p, ec] = std::from_chars(s.data(), end, out);
     return ec == std::errc{} && p == end;
+}
+
+void append_u64(std::string& out, std::uint64_t v) {
+    char buf[24];
+    const auto [p, ec] = std::to_chars(buf, buf + sizeof buf, v);
+    out.append(buf, static_cast<std::size_t>(p - buf));
+}
+
+void append_u32(std::string& out, std::uint32_t v) {
+    char buf[12];
+    const auto [p, ec] = std::to_chars(buf, buf + sizeof buf, v);
+    out.append(buf, static_cast<std::size_t>(p - buf));
 }
 
 } // namespace
@@ -135,13 +162,43 @@ std::uint32_t exptime_to_expiry(std::uint32_t exptime, std::uint32_t now) {
     return now + exptime;                       // relative to now
 }
 
+void append_value_header(std::string& out, std::string_view key, std::uint32_t flags,
+                         std::uint64_t bytes) {
+    out.reserve(out.size() + 8 + key.size() + 24);
+    out += "VALUE ";
+    out += key;
+    out += ' ';
+    append_u32(out, flags);
+    out += ' ';
+    append_u64(out, bytes);
+    out += "\r\n";
+}
+
+void append_value_header_cas(std::string& out, std::string_view key, std::uint32_t flags,
+                             std::uint64_t bytes, std::uint64_t cas) {
+    out.reserve(out.size() + 8 + key.size() + 40);
+    out += "VALUE ";
+    out += key;
+    out += ' ';
+    append_u32(out, flags);
+    out += ' ';
+    append_u64(out, bytes);
+    out += ' ';
+    append_u64(out, cas);
+    out += "\r\n";
+}
+
 std::string value_header(std::string_view key, std::uint32_t flags, std::uint64_t bytes) {
-    return std::format("VALUE {} {} {}\r\n", key, flags, bytes);
+    std::string s;
+    append_value_header(s, key, flags, bytes);
+    return s;
 }
 
 std::string value_header_cas(std::string_view key, std::uint32_t flags, std::uint64_t bytes,
                              std::uint64_t cas) {
-    return std::format("VALUE {} {} {} {}\r\n", key, flags, bytes, cas);
+    std::string s;
+    append_value_header_cas(s, key, flags, bytes, cas);
+    return s;
 }
 
 } // namespace goblin::memcache

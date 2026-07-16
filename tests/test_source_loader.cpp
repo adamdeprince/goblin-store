@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 namespace fs = std::filesystem;
 using namespace goblin;
 using namespace goblin::core;

@@ -16,7 +16,6 @@
 #include <deque>
 #include <optional>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace goblin::storage {
 
@@ -35,19 +34,28 @@ public:
 
 private:
     enum class Q : std::uint8_t { small, main };
+    struct QueueNode {
+        Digest digest;
+        std::uint64_t ticket;
+    };
     struct Entry {
         Q q;
         bool visited;
+        std::uint64_t ticket;
     };
-    std::optional<Digest> pop_front_resident(std::deque<Digest>& q, Q which);
-    void ghost_push(const Digest&);
+    std::optional<Digest> pop_front_resident(std::deque<QueueNode>& q, Q which);
+    void ghost_push(const Digest&, std::uint64_t ticket);
+    std::uint64_t next_ticket() noexcept { return ++next_ticket_; }
 
-    std::deque<Digest> small_, main_, ghost_;
+    std::deque<QueueNode> small_, main_, ghost_;
     std::unordered_map<Digest, Entry, DigestHash> meta_; // resident items only
-    std::unordered_set<Digest, DigestHash> ghost_set_;   // membership for ghost_
+    // A ghost deque node removes membership only if its ticket is still current. Without the ticket,
+    // trimming an old occurrence could erase a newer ghost incarnation of the same digest.
+    std::unordered_map<Digest, std::uint64_t, DigestHash> ghost_tickets_;
     std::size_t cap_;
     std::size_t small_n_ = 0; // resident count in the small queue
     std::size_t main_n_ = 0;  // resident count in the main queue
+    std::uint64_t next_ticket_ = 0; // fresh identity for each true admission (wrap is unreachable)
 };
 
 } // namespace goblin::storage

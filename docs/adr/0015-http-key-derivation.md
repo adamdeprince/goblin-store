@@ -25,7 +25,8 @@ component *is* the host.
   Startup order: wipe pools ([ADR-0013](0013-ephemeral-wipe-on-start.md)) → ingest each file under
   its derived key through the normal write path (tiering/striping/atomic-publish,
   [ADR-0006](0006-positional-tiering-pipeline.md)/[ADR-0010](0010-write-admission-modes.md)).
-  Honors the write mode — run BLOCK if "content didn't fit" should error rather than evict.
+  It passes the configured HTTP write mode to each admission (default BLOCK), so content that does
+  not fit reports an error instead of reclaiming disk objects for that preload.
 - **Canonicalization (recommended defaults):**
   - URI path: percent-decode, collapse duplicate `/`, resolve `.`/`..` segments.
   - **Query string stripped by default** (the directory model has no queries, so this is what

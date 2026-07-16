@@ -2,6 +2,9 @@
 
 #include "goblin/storage/drive_pool.hpp"
 
+#include <algorithm>
+#include <array>
+
 using namespace goblin;
 using namespace goblin::storage;
 
@@ -71,4 +74,68 @@ TEST("drive_pool: files_used caps at N") {
     CHECK_EQ(pool.files_used(64 * KiB), 1u);
     CHECK_EQ(pool.files_used(3 * 64 * KiB), 3u);
     CHECK_EQ(pool.files_used(100 * 64 * KiB), 4u); // capped at N
+}
+
+TEST("drive_pool: file extents cover stripe and row boundaries exactly") {
+    constexpr Size S = 64 * KiB;
+    const DrivePool pool(/*N=*/4, S);
+
+    const auto check = [&](Size bytes, const std::array<Size, 4>& expected) {
+        Size sum = 0;
+        for (unsigned drive = 0; drive < expected.size(); ++drive) {
+            const Size extent = pool.file_extent(/*key_hash=*/0, bytes, drive);
+            CHECK_EQ(extent, expected[drive]);
+            sum += extent;
+        }
+        CHECK_EQ(sum, bytes);
+    };
+
+    check(0, {0, 0, 0, 0});
+    check(1, {1, 0, 0, 0});
+    check(S - 1, {S - 1, 0, 0, 0});
+    check(S, {S, 0, 0, 0});
+    check(S + 1, {S, 1, 0, 0});
+    check(4 * S - 1, {S, S, S, S - 1});
+    check(4 * S, {S, S, S, S});
+    check(4 * S + 1, {S + 1, S, S, S});
+    check(8 * S + 17, {2 * S + 17, 2 * S, 2 * S, 2 * S});
+    CHECK_EQ(pool.file_extent(0, S, /*invalid drive=*/4), Size(0));
+}
+
+TEST("drive_pool: file extents rotate with the key and equal the planned shard ends") {
+    constexpr unsigned N = 4;
+    constexpr Size S = 64 * KiB;
+    const DrivePool pool(N, S);
+    constexpr std::array<Size, 12> sizes = {
+        0, 1, S - 1, S, S + 1, 3 * S + 7, 4 * S - 1, 4 * S,
+        4 * S + 1, 7 * S + 33, 8 * S, 11 * S + 123,
+    };
+
+    for (std::uint64_t key_hash = 0; key_hash < 2 * N; ++key_hash) {
+        for (const Size bytes : sizes) {
+            std::array<Size, N> planned{};
+            Offset off = 0;
+            while (off < bytes) {
+                const Size len = std::min<Size>(S - (off % S), bytes - off);
+                const unsigned drive = pool.drive_of(key_hash, off);
+                planned[drive] =
+                    std::max<Size>(planned[drive], pool.file_offset_of(off) + len);
+                off += len;
+            }
+
+            Size sum = 0;
+            for (unsigned drive = 0; drive < N; ++drive) {
+                const Size extent = pool.file_extent(key_hash, bytes, drive);
+                CHECK_EQ(extent, planned[drive]);
+                sum += extent;
+            }
+            CHECK_EQ(sum, bytes);
+        }
+    }
+
+    // The first full stripe and its tail begin on drive 2 and drive 3 respectively.
+    CHECK_EQ(pool.file_extent(/*key_hash=*/2, S + 17, 0), Size(0));
+    CHECK_EQ(pool.file_extent(/*key_hash=*/2, S + 17, 1), Size(0));
+    CHECK_EQ(pool.file_extent(/*key_hash=*/2, S + 17, 2), S);
+    CHECK_EQ(pool.file_extent(/*key_hash=*/2, S + 17, 3), Size(17));
 }

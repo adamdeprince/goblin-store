@@ -4,31 +4,96 @@
 #include "goblin/storage/striped_io.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdio> // renameat
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <new>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
 
 namespace goblin::storage {
 
+namespace {
+
+[[noreturn]] void fatal_score_state(const char* context, const Error& error) {
+    const std::string_view code = to_string(error.code);
+    std::fprintf(stderr, "fatal: %s (%.*s)%s%s\n", context, static_cast<int>(code.size()),
+                 code.data(), error.detail.empty() ? "" : ": ", error.detail.c_str());
+    std::fflush(stderr);
+    std::abort();
+}
+
+void restore_policy_or_die(EvictionPolicy& policy, const Digest& digest) {
+    try {
+        policy.insert(digest);
+    } catch (const std::bad_alloc&) {
+        std::fprintf(stderr, "fatal: cannot restore eviction-policy membership\n");
+        std::fflush(stderr);
+        std::abort();
+    }
+}
+
+template <class F>
+class ScopeExit {
+public:
+    explicit ScopeExit(F cleanup) : cleanup_(std::move(cleanup)) {}
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ~ScopeExit() {
+        if (active_) cleanup_();
+    }
+    void dismiss() noexcept { active_ = false; }
+
+private:
+    F cleanup_;
+    bool active_ = true;
+};
+
+} // namespace
+
 // ---------------- ObjectFiles ----------------
 
-ObjectFiles::~ObjectFiles() {
-    for (const int fd : fds_)
-        if (fd >= 0) ::close(fd);
+ObjectFiles::ObjectFiles(std::span<const int> src) noexcept {
+    n_ = static_cast<unsigned>(std::min<std::size_t>(src.size(), kMaxPoolDrives));
+    for (unsigned i = 0; i < n_; ++i) fds_[i] = src[i];
+    for (unsigned i = n_; i < kMaxPoolDrives; ++i) fds_[i] = -1;
 }
-ObjectFiles::ObjectFiles(ObjectFiles&& o) noexcept : fds_(std::move(o.fds_)) {}
+ObjectFiles::~ObjectFiles() {
+    for (unsigned i = 0; i < n_; ++i)
+        if (fds_[i] >= 0) ::close(fds_[i]);
+}
+ObjectFiles::ObjectFiles(ObjectFiles&& o) noexcept : fds_(o.fds_), n_(o.n_) {
+    for (unsigned i = 0; i < o.n_; ++i) o.fds_[i] = -1;
+    o.n_ = 0;
+}
 ObjectFiles& ObjectFiles::operator=(ObjectFiles&& o) noexcept {
     if (this != &o) {
-        for (const int fd : fds_)
-            if (fd >= 0) ::close(fd);
-        fds_ = std::move(o.fds_);
+        for (unsigned i = 0; i < n_; ++i)
+            if (fds_[i] >= 0) ::close(fds_[i]);
+        fds_ = o.fds_;
+        n_ = o.n_;
+        for (unsigned i = 0; i < o.n_; ++i) o.fds_[i] = -1;
+        o.n_ = 0;
     }
     return *this;
+}
+
+// Format "<64-hex><suffix>\0" into buf. Returns false if suffix is too long for the buffer.
+static bool format_object_name(const Digest& digest, std::string_view suffix, char* buf,
+                               std::size_t buf_len) noexcept {
+    constexpr std::size_t kHex = Digest::kHexLen;
+    if (buf_len < kHex + suffix.size() + 1) return false;
+    digest.write_hex(buf);
+    if (!suffix.empty()) std::memcpy(buf + kHex, suffix.data(), suffix.size());
+    buf[kHex + suffix.size()] = '\0';
+    return true;
 }
 
 // ---------------- Pool ----------------
@@ -37,13 +102,17 @@ Pool::~Pool() {
     for (const int fd : dirfds_)
         if (fd >= 0) ::close(fd);
 }
-Pool::Pool(Pool&& o) noexcept : drives_(o.drives_), dirfds_(std::move(o.dirfds_)) {}
+Pool::Pool(Pool&& o) noexcept
+    : drives_(o.drives_), dirfds_(std::move(o.dirfds_)), devices_(std::move(o.devices_)),
+      direct_io_(o.direct_io_) {}
 Pool& Pool::operator=(Pool&& o) noexcept {
     if (this != &o) {
         for (const int fd : dirfds_)
             if (fd >= 0) ::close(fd);
         drives_ = o.drives_;
         dirfds_ = std::move(o.dirfds_);
+        devices_ = std::move(o.devices_);
+        direct_io_ = o.direct_io_;
     }
     return *this;
 }
@@ -51,73 +120,144 @@ Pool& Pool::operator=(Pool&& o) noexcept {
 Result<Pool> Pool::open(const std::vector<std::string>& dirs, Size stripe_unit, bool direct_io) {
     if (dirs.empty()) return err(Errc::invalid_argument, "empty pool");
     std::vector<int> dirfds;
+    std::vector<std::uint64_t> devices;
     dirfds.reserve(dirs.size());
+    devices.reserve(dirs.size());
     for (const auto& d : dirs) {
         const int fd = ::open(d.c_str(), O_RDONLY | O_DIRECTORY);
         if (fd < 0) {
             for (const int f : dirfds) ::close(f);
             return err(Errc::io_error, "open pool dir: " + d);
         }
+        struct stat st {};
+        if (::fstat(fd, &st) != 0) {
+            ::close(fd);
+            for (const int f : dirfds) ::close(f);
+            return err(Errc::io_error, "fstat pool dir: " + d);
+        }
         dirfds.push_back(fd);
+        devices.push_back(static_cast<std::uint64_t>(st.st_dev));
     }
     return Pool(DrivePool(static_cast<unsigned>(dirs.size()), stripe_unit), std::move(dirfds),
-                direct_io);
+                std::move(devices), direct_io);
 }
 
 Result<ObjectFiles> Pool::open_object(const Digest& digest, Size tier_bytes, bool create,
-                                      std::string_view name_suffix) const {
+                                      std::uint64_t generation,
+                                      std::uint64_t* failed_device) const {
     const unsigned n = drives_.num_drives();
-    std::vector<int> fds(n, -1);
-    if (tier_bytes == 0) return ObjectFiles(std::move(fds));
+    if (n > kMaxPoolDrives) return err(Errc::invalid_argument, "pool has too many drives");
+    std::array<int, kMaxPoolDrives> fds{};
+    std::array<bool, kMaxPoolDrives> created{};
+    for (unsigned i = 0; i < n; ++i) fds[i] = -1;
+    if (tier_bytes == 0) return ObjectFiles(std::span<const int>(fds.data(), n));
 
-    const std::string name = digest.hex() + std::string(name_suffix);
+    if (generation == 0)
+        return err(Errc::invalid_argument, "disk object has zero file generation");
+
+    // Stack path name: <64-hex>.g<generation>\0. Immutable names turn publication into an atomic
+    // Index metadata swap; O_EXCL makes a generation collision fail rather than reopen old bytes.
+    char name[Digest::kHexLen + 32];
+    char suffix[32];
+    suffix[0] = '.';
+    suffix[1] = 'g';
+    const auto [suffix_end, suffix_ec] =
+        std::to_chars(suffix + 2, suffix + sizeof suffix, generation);
+    if (suffix_ec != std::errc{} ||
+        !format_object_name(
+            digest,
+            std::string_view(suffix, static_cast<std::size_t>(suffix_end - suffix)), name,
+            sizeof name))
+        return err(Errc::invalid_argument, "object name too long");
     const Size stripe = drives_.stripe_unit();
     const Size nchunks = (tier_bytes + stripe - 1) / stripe;
     const unsigned used = static_cast<unsigned>(nchunks < n ? nchunks : n);
-    int flags = create ? (O_RDWR | O_CREAT) : O_RDONLY;
+    int flags = create ? (O_RDWR | O_CREAT | O_EXCL) : O_RDONLY;
     if (direct_io_) flags |= O_DIRECT; // bypass the page cache: own the backing store (ADR-0011)
 
     for (unsigned c = 0; c < used; ++c) {
         const unsigned d = drives_.drive_of(digest.bucket(), static_cast<Offset>(c) * stripe);
         if (fds[d] >= 0) continue;
-        const int fd = ::openat(dirfds_[d], name.c_str(), flags, 0644);
+        const int fd = ::openat(dirfds_[d], name, flags, 0644);
         if (fd < 0) {
-            for (const int f : fds)
-                if (f >= 0) ::close(f);
+            const int open_errno = errno;
+            for (unsigned i = 0; i < n; ++i)
+                if (fds[i] >= 0) ::close(fds[i]);
+            if (create) {
+                // Never unlink the pathname that failed O_EXCL: it may be a pre-existing generation
+                // from a sequence collision. Roll back only files this invocation actually created.
+                for (unsigned drive = 0; drive < n; ++drive)
+                    if (created[drive]) ::unlinkat(dirfds_[drive], name, 0);
+            }
+            if (failed_device) *failed_device = device_of_drive(d);
+            if (open_errno == ENOSPC || open_errno == EDQUOT)
+                return err(Errc::out_of_space, "openat exhausted filesystem metadata capacity");
             return err(Errc::io_error, create ? "openat (create) object file"
                                               : "openat object file (not found?)");
         }
         fds[d] = fd;
+        created[d] = create;
     }
-    return ObjectFiles(std::move(fds));
+    return ObjectFiles(std::span<const int>(fds.data(), n));
 }
 
-Status Pool::publish(const Digest& digest, Size tier_bytes, std::string_view name_suffix) const {
+Status Pool::reserve_object(const Digest& digest, Size tier_bytes,
+                            const ObjectFiles& files, std::uint64_t* failed_device) const {
     if (tier_bytes == 0) return {};
-    const std::string live = digest.hex();
-    const std::string tmp = live + std::string(name_suffix);
-    const Size stripe = drives_.stripe_unit();
-    const Size nchunks = (tier_bytes + stripe - 1) / stripe;
-    const unsigned n = drives_.num_drives();
-    const unsigned used = static_cast<unsigned>(nchunks < n ? nchunks : n);
-    for (unsigned c = 0; c < used; ++c) {
-        const unsigned d = drives_.drive_of(digest.bucket(), static_cast<Offset>(c) * stripe);
-        if (::renameat(dirfds_[d], tmp.c_str(), dirfds_[d], live.c_str()) != 0)
-            return err(Errc::io_error, "renameat (publish) object file");
+#if defined(__linux__)
+    const auto fds = files.fds();
+    for (unsigned drive = 0; drive < fds.size(); ++drive) {
+        if (fds[drive] < 0) continue;
+        const Size extent = drives_.file_extent(digest.bucket(), tier_bytes, drive);
+        if (extent == 0) continue;
+        if (extent > static_cast<Size>(std::numeric_limits<off_t>::max()))
+            return err(Errc::too_large, "object shard exceeds off_t");
+        int rc;
+        do {
+            rc = ::fallocate(fds[drive], FALLOC_FL_KEEP_SIZE, 0, static_cast<off_t>(extent));
+        } while (rc != 0 && errno == EINTR);
+        if (rc == 0) continue;
+        const int e = errno;
+        if (e == ENOSPC || e == EDQUOT) {
+            if (failed_device) *failed_device = device_of_drive(drive);
+            return err(Errc::out_of_space, "fallocate could not reserve object shard");
+        }
+        // Some otherwise valid backing filesystems do not implement fallocate. EINVAL is included
+        // because older/network filesystems commonly use it for an unsupported KEEP_SIZE mode.
+        // The streaming pwrite path still checks ENOSPC and safely replays its private aligned block.
+        if (e == EOPNOTSUPP || e == ENOSYS || e == EINVAL) continue;
+        return err(Errc::io_error, "fallocate failed while reserving object shard");
     }
+#else
+    (void)digest;
+    (void)files;
+    (void)failed_device;
+#endif
     return {};
 }
 
-void Pool::unlink_object(const Digest& digest, Size tier_bytes, std::string_view name_suffix) const {
+void Pool::unlink_object(const Digest& digest, Size tier_bytes, std::uint64_t generation) const {
     if (tier_bytes == 0) return;
-    const std::string name = digest.hex() + std::string(name_suffix);
+    if (generation == 0) return;
+    char name[Digest::kHexLen + 32];
+    char suffix[32];
+    suffix[0] = '.';
+    suffix[1] = 'g';
+    const auto [suffix_end, suffix_ec] =
+        std::to_chars(suffix + 2, suffix + sizeof suffix, generation);
+    if (suffix_ec != std::errc{} ||
+        !format_object_name(
+            digest,
+            std::string_view(suffix, static_cast<std::size_t>(suffix_end - suffix)), name,
+            sizeof name))
+        return;
     const Size stripe = drives_.stripe_unit();
     const Size nchunks = (tier_bytes + stripe - 1) / stripe;
     const unsigned n = drives_.num_drives();
     const unsigned used = static_cast<unsigned>(nchunks < n ? nchunks : n);
     for (unsigned c = 0; c < used; ++c) {
         const unsigned d = drives_.drive_of(digest.bucket(), static_cast<Offset>(c) * stripe);
-        ::unlinkat(dirfds_[d], name.c_str(), 0); // best-effort; ENOENT is fine
+        ::unlinkat(dirfds_[d], name, 0); // best-effort; ENOENT is fine
     }
 }
 
@@ -129,14 +269,45 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
                                       unsigned write_buffers, bool direct_io,
                                       AccessScoreConfig access_score) {
     auto make_ram = [&]() -> Result<core::BufferPool> {
-        if (mem.numa_regions.empty())
+        if (!mem.split_pools() && mem.numa_regions.empty())
             return core::BufferPool::create(mem.total_bytes, mem.block_bytes, kDeviceBlock,
                                             mem.lock_memory, mem.use_hugepages,
                                             mem.hugetlb_page_bytes);
         std::vector<core::BlockPoolRegion> regions;
-        regions.reserve(mem.numa_regions.size());
-        for (const auto& region : mem.numa_regions)
-            regions.push_back({region.bytes, region.node});
+        const auto append_regions = [&](std::span<const NumaMemoryRegionConfig> configured,
+                                        Size local_bytes,
+                                        core::BufferPoolClass allocation_class) {
+            if (configured.empty()) {
+                regions.push_back({local_bytes, std::nullopt, allocation_class});
+                return;
+            }
+            for (const auto& region : configured)
+                regions.push_back({region.bytes, region.node, allocation_class});
+        };
+        if (!mem.split_pools()) {
+            regions.reserve(mem.numa_regions.size());
+            for (const auto& region : mem.numa_regions)
+                regions.push_back({region.bytes, region.node});
+        } else {
+            const std::size_t head_regions = mem.numa_regions.empty() ? 1 : mem.numa_regions.size();
+            const std::size_t small_regions =
+                mem.small_numa_regions.empty() ? 1 : mem.small_numa_regions.size();
+            regions.reserve(head_regions + small_regions);
+            append_regions(mem.numa_regions, mem.total_bytes,
+                           core::BufferPoolClass::fixed_head);
+            if (mem.small_numa_regions.empty() && !mem.numa_regions.empty()) {
+                for (std::size_t i = 0; i < mem.numa_regions.size(); ++i) {
+                    const Size bytes = i == 0 ? *mem.small_total_bytes
+                                              : mem.small_sub_bytes.value_or(0);
+                    if (bytes > 0)
+                        regions.push_back({bytes, mem.numa_regions[i].node,
+                                           core::BufferPoolClass::small_object});
+                }
+            } else {
+                append_regions(mem.small_numa_regions, *mem.small_total_bytes,
+                               core::BufferPoolClass::small_object);
+            }
+        }
         return core::BufferPool::create_regions(regions, mem.block_bytes, kDeviceBlock,
                                                 mem.lock_memory, mem.use_hugepages,
                                                 mem.hugetlb_page_bytes);
@@ -148,8 +319,11 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
     // corresponding head blocks. Region-local scanner threads therefore never pull the O(N) score
     // array through the interconnect just to choose one block.
     std::vector<NumaScoreRegionConfig> score_regions;
-    score_regions.reserve(ram->region_count());
-    for (std::size_t region = 0; region < ram->region_count(); ++region) {
+    const std::size_t fixed_region_count =
+        mem.split_pools() ? (mem.numa_regions.empty() ? 1 : mem.numa_regions.size())
+                          : ram->region_count();
+    score_regions.reserve(fixed_region_count);
+    for (std::size_t region = 0; region < fixed_region_count; ++region) {
         NumaScoreRegionConfig score_region;
         score_region.first_block = ram->region_first_block(region);
         score_region.block_count =
@@ -164,6 +338,12 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
     const std::size_t cap_hint =
         t.ram_head ? static_cast<std::size_t>(mem.arena_bytes() / t.ram_head) : 1;
     auto head_policy = make_eviction_policy(ev.policy, cap_hint);
+    const std::size_t small_cap_hint =
+        mem.split_pools()
+            ? std::max<std::size_t>(
+                  1, static_cast<std::size_t>(mem.small_arena_bytes() / mem.small_min_alloc))
+            : 1;
+    auto small_policy = make_eviction_policy(ev.policy, small_cap_hint);
     const std::size_t obj_cap =
         ev.max_ssd_objects ? static_cast<std::size_t>(ev.max_ssd_objects) : cap_hint;
     auto object_policy = make_eviction_policy(ev.policy, obj_cap);
@@ -179,20 +359,71 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
     auto wp = core::IoBufferPool::create(io_chunk, write_buffers, mem.lock_memory,
                                          mem.use_hugepages, mem.hugetlb_page_bytes);
     if (!wp) return std::unexpected(wp.error());
-    TierManager tm(t, std::move(*ram), std::move(head_policy), std::move(object_policy),
-                   ev.max_ssd_objects, std::move(*sp), std::move(hp), index, mem.small_min_alloc,
-                   access_score,
+    TierManager tm(t, std::move(*ram), std::move(head_policy), std::move(small_policy),
+                   std::move(object_policy), ev.max_ssd_objects, std::move(*sp), std::move(hp),
+                   index, mem.small_min_alloc, mem.split_pools(), access_score,
                    std::make_unique<NumaHeadScoreTable>(std::move(*head_scores)));
+    try {
+        const auto add_capacity_domain = [&](std::uint64_t device) {
+            if (!tm.capacity_policies_.contains(device))
+                tm.capacity_policies_.emplace(device, make_eviction_policy(ev.policy, obj_cap));
+        };
+        for (const auto device : tm.ssd_.devices()) add_capacity_domain(device);
+        if (tm.hdd_)
+            for (const auto device : tm.hdd_->devices()) add_capacity_domain(device);
+    } catch (const std::bad_alloc&) {
+        return err(Errc::out_of_memory, "allocate per-filesystem eviction policy");
+    }
     tm.write_pool_ = std::make_unique<core::IoBufferPool>(std::move(*wp));
     return tm;
 }
 
+Status TierManager::reserve_store_space(const Digest& digest, const ObjectLayout& layout,
+                                        const ObjectFiles& ssd_files,
+                                        const std::optional<ObjectFiles>& hdd_files,
+                                        WriteMode write_mode) {
+    const Size ssd_extent =
+        layout.hdd_bytes > 0 ? layout.ssd_bytes : align_up(layout.ssd_bytes, kDeviceBlock);
+    const Size hdd_extent = align_up(layout.hdd_bytes, kDeviceBlock);
+    std::uint64_t failed_device = 0;
+    const auto attempt = [&]() -> Status {
+        failed_device = 0;
+        if (ssd_extent > 0) {
+            if (auto st =
+                    ssd_.reserve_object(digest, ssd_extent, ssd_files, &failed_device);
+                !st)
+                return st;
+        }
+        if (hdd_extent > 0 && hdd_ && hdd_files) {
+            if (auto st =
+                    hdd_->reserve_object(digest, hdd_extent, *hdd_files, &failed_device);
+                !st)
+                return st;
+        }
+        return {};
+    };
+
+    auto first = attempt();
+    if (first || first.error().code != Errc::out_of_space) return first;
+    if (write_mode == WriteMode::block) return first;
+
+    // Only the slow/full path serializes. Retry before evicting: a previous coordinator or an
+    // unrelated filesystem user may already have released capacity while this writer waited.
+    std::unique_lock<std::mutex> reclaim_lk(*disk_reclaim_mu_);
+    for (;;) {
+        auto retry = attempt();
+        if (retry || retry.error().code != Errc::out_of_space) return retry;
+        if (failed_device == 0 || !reclaim_one_disk_object(failed_device)) return retry;
+    }
+}
+
 Status TierManager::store(const Digest& digest, ByteView data, std::uint32_t flags,
-                          std::uint32_t expiry) {
-    auto h = begin_store(digest, data.size());
+                          std::uint32_t expiry, WriteMode write_mode) {
+    auto h = begin_store(digest, data.size(), write_mode);
     if (!h) return std::unexpected(h.error());
     if (auto st = h->write(data); !st) return st;
-    return h->commit(flags, expiry);
+    if (auto st = h->commit(flags, expiry); !st) return std::unexpected(st.error());
+    return {};
 }
 
 // meta `T` touch: overwrite an object's absolute expiry in place (0 = never). false if absent.
@@ -213,105 +444,231 @@ std::size_t TierManager::reap_expired() {
     return n;
 }
 
-Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, Size size) {
+Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, Size size,
+                                                          WriteMode write_mode) try {
+    if (size > kMaxObjectSize)
+        return err(Errc::too_large, "object exceeds the configured 1 GiB maximum");
     const ObjectLayout layout = compute_layout(size, tiers_, three_layer());
+    const bool ram_only = layout.ssd_bytes == 0 && layout.hdd_bytes == 0;
 
-    // Copy-on-write (ADR-0018): write into fresh scratch files so the old version stays fully live
-    // (files + head) for concurrent readers until commit publishes the new one. Opening the scratch
-    // files touches no shared state, so it needs no lock.
-    const std::string suffix = ".tmp." + std::to_string(store_seq_->fetch_add(1));
-    // RAM-only objects (size <= ram_head, so ssd_bytes==0) carry no disk extents -> open no files at
-    // all (ADR-0003-rev): the head IS the whole object. Saves the redundant SSD copy + the per-object
-    // file that throttled small-object ingest.
+    // Copy-on-write (ADR-0018): write into a fresh immutable disk generation so the old version
+    // stays fully live for concurrent readers until one in-memory Index swap publishes the new one.
+    // Zero is reserved for RAM-only objects and for uninitialised metadata.
+    const std::uint64_t file_generation =
+        store_seq_->fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!ram_only && file_generation == 0)
+        return err(Errc::out_of_space, "disk file generation space exhausted");
+    auto scratch_cleanup = ScopeExit([&] {
+        if (layout.ssd_bytes > 0)
+            ssd_.unlink_object(digest, layout.ssd_bytes, file_generation);
+        if (hdd_ && layout.hdd_bytes > 0)
+            hdd_->unlink_object(digest, layout.hdd_bytes, file_generation);
+    });
+    // File creation is deliberately delayed until after store protection is installed. If openat
+    // itself hits inode/metadata ENOSPC, capacity reclaim must not select the incarnation that this
+    // copy-on-write store is replacing.
     std::optional<ObjectFiles> ssd_files;
-    if (layout.ssd_bytes > 0) {
-        auto f = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/true, suffix);
-        if (!f) return std::unexpected(f.error());
-        ssd_files.emplace(std::move(*f));
-    }
     std::optional<ObjectFiles> hdd_files;
-    if (layout.hdd_bytes > 0) {
-        auto h = hdd_->open_object(digest, layout.hdd_bytes, /*create=*/true, suffix);
-        if (!h) return std::unexpected(h.error());
-        hdd_files.emplace(std::move(*h));
-    }
 
     // Reserve the new RAM head, evicting cold heads (ADR-0007/0012) to make room. The old version's
     // head stays put; commit frees it once the new version is published.
     std::unique_lock<std::shared_mutex> lk(*mu_); // mutates allocator + pool + policy (exclusive)
 
-    // Acquire a bounded, page-aligned staging buffer for the disk writes (ADR-0011): one per
-    // in-flight store, so write-staging RAM stays bounded. Exhaustion returns would_block (not a
-    // hard failure): the caller backpressures the connection and retries once a buffer frees, so the
-    // bound becomes a concurrency limit (tune via io_buffers/io_chunk), never an unbudgeted RAM grow.
-    // (SET is write-once; the extra copy through this buffer is a deliberate trade.)
-    auto stage = write_pool_->acquire();
-    if (!stage) {
-        lk.unlock();
-        if (layout.ssd_bytes > 0) ssd_.unlink_object(digest, layout.ssd_bytes, suffix);
-        if (hdd_ && layout.hdd_bytes > 0) hdd_->unlink_object(digest, layout.hdd_bytes, suffix);
-        return err(Errc::would_block, "write staging buffers exhausted");
+    // Disk-backed stores acquire a bounded, page-aligned staging buffer (ADR-0011). RAM-only objects
+    // memcpy straight into the head and never touch the stage pool — skipping the acquire keeps
+    // small-object SET concurrency off the write-buffer bound (which is sized for large tails).
+    std::optional<MutBytes> stage;
+    if (!ram_only) {
+        auto s = write_pool_->acquire();
+        if (!s) {
+            lk.unlock();
+            return err(Errc::would_block, "write staging buffers exhausted");
+        }
+        stage = *s;
     }
 
+    bool store_protection = false;
     std::optional<core::BufferPool::Region> head;
+    bool pending_small_head = false;
+    auto admission_cleanup = ScopeExit([&] {
+        if (!lk.owns_lock()) lk.lock(); // unlocked open/reserve/reclaim may throw under pressure
+        if (head) {
+            if (pending_small_head) {
+                release_pending_small_head_locked(*head);
+                pending_small_head = false;
+            }
+            ram_.deallocate(head->block, head->offset, head->len);
+            head.reset();
+        }
+        if (store_protection) {
+            release_store_protection_locked(digest);
+            store_protection = false;
+        }
+        if (stage) write_pool_->release(*stage);
+    });
+    if (auto protected_store = acquire_store_protection_locked(digest); !protected_store)
+        return std::unexpected(protected_store.error());
+    store_protection = true;
+
     const Size head_len = std::min<Size>(size, tiers_.ram_head);
     // Fractional RAM-only objects use the compact arena. An object exactly one ram_head uses the
     // same fixed buddy slot as a larger object's head: these slots pack exactly into --block and a
     // completely occupied block is eligible for NUMA promotion (ADR-0008-rev).
     const Size head_min = (size < tiers_.ram_head) ? small_min_alloc_ : kDeviceBlock;
+    auto& admission_policy = resident_policy(size);
     if (head_len > 0) {
-        auto region = ram_.allocate(static_cast<std::uint32_t>(head_len), head_min);
+        auto region = ram_.allocate(static_cast<std::uint32_t>(head_len), head_min,
+                                    allocation_class(size));
         // Small class: reclaim dead arena space by sliding compaction before evicting anything live.
         // Sliding is in-place, so it frees room even at 100% RAM; eviction (below) remains the backstop.
         if (!region && head_min < kDeviceBlock && ram_.small_dead_total() >= head_len) {
             compact_small();
-            region = ram_.allocate(static_cast<std::uint32_t>(head_len), head_min);
+            region = ram_.allocate(static_cast<std::uint32_t>(head_len), head_min,
+                                   allocation_class(size));
         }
         while (!region) {
-            const auto victim = policy_->evict();
+            const auto victim = admission_policy.evict();
             if (!victim) break;
             if (const auto vm = index_->lookup(*victim); vm && vm->head.resident()) {
-                free_head_region(vm->head.block, vm->head.offset, vm->head.len);
                 if (vm->size <= tiers_.ram_head) {
                     // RAM-only victim: its head is the only copy, so evicting the head evicts the
                     // object (no disk files to unlink; evict() already popped it from the head policy).
+                    if (auto discarded = discard_owned_score_locked(*victim, *vm); !discarded) {
+                        restore_policy_or_die(admission_policy, *victim);
+                        return std::unexpected(discarded.error());
+                    }
+                    free_head_region(vm->head.block, vm->head.offset, vm->head.len);
                     object_policy_->remove(*victim);
                     index_->erase(*victim);
                 } else {
+                    // A disk-backed object survives without its head, so move—not copy—its heat from
+                    // the fixed NUMA slot back into the Index before releasing the physical slot.
+                    auto score = extract_owned_score_locked(*victim, *vm);
+                    if (!score) {
+                        restore_policy_or_die(admission_policy, *victim);
+                        return std::unexpected(score.error());
+                    }
+                    if (!index_->restore_score(*victim, *score)) {
+                        // Restore the old owner before returning; metadata still names the old head.
+                        if (auto rollback = install_owned_score_locked(*victim, *vm, *score);
+                            !rollback)
+                            fatal_score_state("cannot roll back authoritative score eviction",
+                                              rollback.error());
+                        restore_policy_or_die(admission_policy, *victim);
+                        return err(Errc::io_error, "restore evicted head score to Index");
+                    }
+                    free_head_region(vm->head.block, vm->head.offset, vm->head.len);
                     index_->set_head(*victim, HeadLoc{}); // disk-backed: object stays, served from SSD
                 }
             }
-            region = ram_.allocate(static_cast<std::uint32_t>(head_len), head_min);
+            // A bump-arena eviction creates dead space rather than rewinding its frontier. As soon
+            // as one or more victims have freed enough bytes, compact before selecting another;
+            // otherwise a single admission can unnecessarily drain the entire arena block.
+            if (head_min < kDeviceBlock && ram_.small_dead_total() >= head_len)
+                compact_small();
+            region = ram_.allocate(static_cast<std::uint32_t>(head_len), head_min,
+                                   allocation_class(size));
         }
-        if (region) head = *region;
+        if (region) {
+            head = *region;
+            if (head_min < kDeviceBlock) {
+                const auto [it, inserted] =
+                    pending_small_heads_.insert(region_id(head->block, head->offset));
+                (void)it;
+                if (!inserted)
+                    fatal_score_state(
+                        "duplicate unpublished small-head reservation",
+                        Error{Errc::io_error, "small-head region is already reserved"});
+                pending_small_head = true;
+            }
+        }
     }
 
     // A RAM-only object that couldn't get a head (everything live is pinned) has nowhere to live ->
     // backpressure rather than index a head-less, body-less object. (head_len>0 excludes 0-byte values.)
     if (head_len > 0 && layout.ssd_bytes == 0 && !head) {
-        write_pool_->release(*stage);
-        lk.unlock();
         return err(Errc::would_block, "no RAM for RAM-only head");
     }
 
-    return StoreHandle(this, digest, layout,
+    // Reserve physical blocks on the actual shard files before accepting body bytes. The store
+    // protection and unpublished-head marker stay active while the storage lock is dropped; they
+    // keep the old incarnation and this reservation out of both eviction and compaction.
+    if (!ram_only) {
+        lk.unlock();
+
+        const auto open_with_reclaim = [&](Pool& pool, Size bytes) -> Result<ObjectFiles> {
+            std::uint64_t failed_device = 0;
+            const auto attempt = [&]() {
+                failed_device = 0;
+                return pool.open_object(digest, bytes, /*create=*/true, file_generation,
+                                        &failed_device);
+            };
+            auto first = attempt();
+            if (first || first.error().code != Errc::out_of_space ||
+                write_mode == WriteMode::block)
+                return first;
+            std::unique_lock<std::mutex> reclaim_lk(*disk_reclaim_mu_);
+            for (;;) {
+                auto retry = attempt();
+                if (retry || retry.error().code != Errc::out_of_space) return retry;
+                if (failed_device == 0 || !reclaim_one_disk_object(failed_device)) return retry;
+            }
+        };
+
+        if (layout.ssd_bytes > 0) {
+            auto opened = open_with_reclaim(ssd_, layout.ssd_bytes);
+            if (!opened) {
+                lk.lock();
+                return std::unexpected(opened.error());
+            }
+            ssd_files.emplace(std::move(*opened));
+        }
+        if (layout.hdd_bytes > 0 && hdd_) {
+            auto opened = open_with_reclaim(*hdd_, layout.hdd_bytes);
+            if (!opened) {
+                lk.lock();
+                return std::unexpected(opened.error());
+            }
+            hdd_files.emplace(std::move(*opened));
+        }
+        auto reserved = reserve_store_space(digest, layout, *ssd_files, hdd_files, write_mode);
+        lk.lock();
+        if (!reserved) return std::unexpected(reserved.error());
+    }
+
+    StoreHandle handle(this, digest, layout,
                        ssd_files ? std::move(*ssd_files) : ObjectFiles{}, std::move(hdd_files), head,
-                       suffix, *stage);
+                       ram_only ? 0 : file_generation, stage.value_or(MutBytes{}), write_mode,
+                       store_protection, pending_small_head);
+    admission_cleanup.dismiss();
+    scratch_cleanup.dismiss();
+    return handle;
+} catch (const std::bad_alloc&) {
+    // Do not allocate while translating an allocation failure.  In particular, a non-SSO detail
+    // string could throw a second bad_alloc after the admission guards have already unwound.
+    return std::unexpected(Error{Errc::out_of_memory});
 }
 
 TierManager::StoreHandle::StoreHandle(TierManager* tm, Digest digest, ObjectLayout layout,
                                       ObjectFiles ssd, std::optional<ObjectFiles> hdd,
                                       std::optional<core::BufferPool::Region> head,
-                                      std::string suffix, MutBytes stage)
+                                      std::uint64_t file_generation, MutBytes stage,
+                                      WriteMode write_mode, bool store_protection,
+                                      bool pending_small_head) noexcept
     : tm_(tm), digest_(digest), layout_(layout), ssd_(std::move(ssd)), hdd_(std::move(hdd)),
-      head_(head), suffix_(std::move(suffix)), stage_(stage) {}
+      head_(head), file_generation_(file_generation), stage_(stage), write_mode_(write_mode),
+      store_protection_(store_protection), pending_small_head_(pending_small_head) {}
 
 TierManager::StoreHandle::StoreHandle(StoreHandle&& o) noexcept
     : tm_(o.tm_), digest_(o.digest_), layout_(o.layout_), ssd_(std::move(o.ssd_)),
-      hdd_(std::move(o.hdd_)), head_(o.head_), suffix_(std::move(o.suffix_)), stage_(o.stage_),
-      stage_fill_(o.stage_fill_), flushed_(o.flushed_), off_(o.off_), committed_(o.committed_) {
+      hdd_(std::move(o.hdd_)), head_(o.head_), file_generation_(o.file_generation_), stage_(o.stage_),
+      stage_fill_(o.stage_fill_), flushed_(o.flushed_), off_(o.off_), committed_(o.committed_),
+      write_mode_(o.write_mode_), store_protection_(o.store_protection_),
+      pending_small_head_(o.pending_small_head_) {
     o.tm_ = nullptr;
     o.committed_ = true; // neutralize the moved-from handle's destructor
+    o.store_protection_ = false;
+    o.pending_small_head_ = false;
 }
 
 TierManager::StoreHandle& TierManager::StoreHandle::operator=(StoreHandle&& o) noexcept {
@@ -323,14 +680,19 @@ TierManager::StoreHandle& TierManager::StoreHandle::operator=(StoreHandle&& o) n
         ssd_ = std::move(o.ssd_);
         hdd_ = std::move(o.hdd_);
         head_ = o.head_;
-        suffix_ = std::move(o.suffix_);
+        file_generation_ = o.file_generation_;
         stage_ = o.stage_;
         stage_fill_ = o.stage_fill_;
         flushed_ = o.flushed_;
         off_ = o.off_;
         committed_ = o.committed_;
+        write_mode_ = o.write_mode_;
+        store_protection_ = o.store_protection_;
+        pending_small_head_ = o.pending_small_head_;
         o.tm_ = nullptr;
         o.committed_ = true;
+        o.store_protection_ = false;
+        o.pending_small_head_ = false;
     }
     return *this;
 }
@@ -340,9 +702,13 @@ TierManager::StoreHandle::~StoreHandle() { abort_uncommitted(); }
 // Roll back a handle that was never committed: free the reserved head and delete the scratch files.
 void TierManager::StoreHandle::abort_uncommitted() {
     if (committed_ || !tm_) return;
-    if (head_ || !stage_.empty()) {
+    if (head_ || !stage_.empty() || store_protection_) {
         std::unique_lock<std::shared_mutex> lk(*tm_->mu_); // ram_ + write_pool_ are shared (exclusive)
         if (head_) {
+            if (pending_small_head_) {
+                tm_->release_pending_small_head_locked(*head_);
+                pending_small_head_ = false;
+            }
             tm_->ram_.deallocate(head_->block, head_->offset, head_->len);
             head_.reset();
         }
@@ -350,15 +716,25 @@ void TierManager::StoreHandle::abort_uncommitted() {
             tm_->write_pool_->release(stage_);
             stage_ = {};
         }
+        if (store_protection_) {
+            tm_->release_store_protection_locked(digest_);
+            store_protection_ = false;
+        }
     }
     if (layout_.ssd_bytes > 0)
-        tm_->ssd_.unlink_object(digest_, layout_.ssd_bytes, suffix_); // scratch files; filesystem only
-    if (tm_->hdd_ && layout_.hdd_bytes > 0) tm_->hdd_->unlink_object(digest_, layout_.hdd_bytes, suffix_);
+        tm_->ssd_.unlink_object(digest_, layout_.ssd_bytes, file_generation_);
+    if (tm_->hdd_ && layout_.hdd_bytes > 0)
+        tm_->hdd_->unlink_object(digest_, layout_.hdd_bytes, file_generation_);
+    committed_ = true;
+    tm_ = nullptr;
 }
 
 Status TierManager::StoreHandle::write(ByteView chunk) {
+    if (committed_ || !tm_)
+        return err(Errc::invalid_argument, "write on a completed store handle");
     const Size len = chunk.size();
-    if (off_ + len > layout_.size) return err(Errc::invalid_argument, "write past end of object");
+    if (off_ > layout_.size || len > layout_.size - off_)
+        return err(Errc::invalid_argument, "write past end of object");
 
     if (head_) { // fill the resident head directly from the chunk (RAM; no alignment needed)
         const Size hend = std::min<Size>(off_ + len, head_->len);
@@ -394,29 +770,62 @@ Status TierManager::StoreHandle::flush_block(Size n) {
     const Offset o = flushed_;
     const Size ssd_extent =
         (layout_.hdd_bytes > 0) ? layout_.ssd_bytes : align_up(layout_.ssd_bytes, kDeviceBlock);
-    const Size ssd_stop = std::min<Size>(o + n, ssd_extent);
-    if (o < ssd_stop) {
-        if (auto st = striped_pwrite(tm_->ssd_.drives(), digest_.bucket(), ssd_.fds(), o,
-                                     ByteView(stage_.data(), ssd_stop - o));
-            !st)
-            return st;
-    }
-    if (o + n > layout_.ssd_bytes && hdd_) {
-        const Size begin = std::max<Size>(o, layout_.ssd_bytes);
-        const Size src = begin - o;
-        if (auto st = striped_pwrite(tm_->hdd_->drives(), digest_.bucket(), hdd_->fds(),
-                                     begin - layout_.ssd_bytes,
-                                     ByteView(stage_.data() + src, (o + n) - begin));
-            !st)
-            return st;
+    std::uint64_t failed_device = 0;
+    const auto attempt = [&]() -> Status {
+        failed_device = 0;
+        const Size ssd_stop = std::min<Size>(o + n, ssd_extent);
+        if (o < ssd_stop) {
+            unsigned failed_drive = 0;
+            if (auto st = striped_pwrite(tm_->ssd_.drives(), digest_.bucket(), ssd_.fds(), o,
+                                         ByteView(stage_.data(), ssd_stop - o), &failed_drive);
+                !st) {
+                if (st.error().code == Errc::out_of_space)
+                    failed_device = tm_->ssd_.device_of_drive(failed_drive);
+                return st;
+            }
+        }
+        if (o + n > layout_.ssd_bytes && hdd_) {
+            const Size begin = std::max<Size>(o, layout_.ssd_bytes);
+            const Size src = begin - o;
+            unsigned failed_drive = 0;
+            if (auto st = striped_pwrite(tm_->hdd_->drives(), digest_.bucket(), hdd_->fds(),
+                                         begin - layout_.ssd_bytes,
+                                         ByteView(stage_.data() + src, (o + n) - begin),
+                                         &failed_drive);
+                !st) {
+                if (st.error().code == Errc::out_of_space)
+                    failed_device = tm_->hdd_->device_of_drive(failed_drive);
+                return st;
+            }
+        }
+        return {};
+    };
+
+    auto first = attempt();
+    if (!first && first.error().code == Errc::out_of_space) {
+        if (write_mode_ == WriteMode::block) return first;
+        // Reservation-less filesystems can still fill between blocks. Only one writer evicts at a
+        // time, then the complete aligned staging block is replayed. Generation files are private,
+        // so replay is safe even if the failed pwrite had already modified an earlier segment.
+        std::unique_lock<std::mutex> reclaim_lk(*tm_->disk_reclaim_mu_);
+        for (;;) {
+            auto retry = attempt();
+            if (retry) break;
+            if (retry.error().code != Errc::out_of_space) return retry;
+            if (failed_device == 0 || !tm_->reclaim_one_disk_object(failed_device)) return retry;
+        }
+    } else if (!first) {
+        return first;
     }
     flushed_ += n;
     stage_fill_ = 0;
     return {};
 }
 
-Status TierManager::StoreHandle::commit(std::uint32_t flags, std::uint32_t expiry,
-                                        std::uint64_t cas_expected) {
+Result<std::uint64_t> TierManager::StoreHandle::commit(std::uint32_t flags, std::uint32_t expiry,
+                                                       std::uint64_t cas_expected) {
+    if (committed_ || !tm_)
+        return err(Errc::invalid_argument, "commit on a completed store handle");
     if (off_ != layout_.size)
         return err(Errc::invalid_argument, "commit before the full value was written");
 
@@ -425,51 +834,117 @@ Status TierManager::StoreHandle::commit(std::uint32_t flags, std::uint32_t expir
     if (stage_fill_ > 0) {
         const Size padded = align_up(stage_fill_, kDeviceBlock);
         if (padded > stage_fill_) std::memset(stage_.data() + stage_fill_, 0, padded - stage_fill_);
-        if (auto st = flush_block(padded); !st) return st;
+        if (auto st = flush_block(padded); !st) return std::unexpected(st.error());
     }
 
     std::unique_lock<std::shared_mutex> lk(*tm_->mu_); // publish + swap atomically (exclusive, ADR-0018)
     const auto old = tm_->index_->lookup(digest_);
     if (cas_expected != 0 && (!old || is_expired(*old, now_unix()) || old->etag != cas_expected))
         return err(Errc::cas_mismatch); // object changed/absent under us -> don't publish (scratch aborts)
-    // Publish: rename the scratch files over the live names. Readers that already opened the old
-    // files keep them (unlinked-but-open inodes) and finish a consistent old version.
-    if (layout_.ssd_bytes > 0)
-        if (auto st = tm_->ssd_.publish(digest_, layout_.ssd_bytes, suffix_); !st) return st;
-    if (tm_->hdd_ && layout_.hdd_bytes > 0) {
-        if (auto st = tm_->hdd_->publish(digest_, layout_.hdd_bytes, suffix_); !st) return st;
-    }
-    if (old && old->head.resident()) { // retire the replaced version's head now that the new is live
-        tm_->free_head_region(old->head.block, old->head.offset, old->head.len);
-        tm_->policy_->remove(digest_);
-    }
+
     ObjectMeta meta;
     meta.size = layout_.size;
     meta.flags = flags;
     meta.expiry = expiry; // absolute Unix time; 0 = never (ADR-0007)
     meta.etag = tm_->etag_seq_->fetch_add(1, std::memory_order_relaxed) + 1; // unique per (re)store
+    meta.file_generation = file_generation_;
     if (head_) meta.head = HeadLoc{head_->block, head_->offset, head_->len};
-    if (expiry != 0) tm_->any_ttl_->store(true, std::memory_order_relaxed); // arm the reaper
-    tm_->index_->set(digest_, meta);
-    if (head_) {
-        // Index::set preserves a replacement key's accumulated score. Publish that canonical
-        // value into the new physical fixed-head slot after retiring the old slot above. Fractional
-        // small-arena heads deliberately have no dense slot.
-        const double score = tm_->index_->score(digest_).value_or(0.0);
-        if (meta.head.len == tm_->tiers_.ram_head &&
-            tm_->numa_scores_healthy_->load(std::memory_order_relaxed)) {
-            if (auto status = tm_->head_scores_->publish(meta.head, score); !status) {
-                tm_->disable_numa_scores(status.error());
-            }
-        }
-        tm_->policy_->insert(digest_);
+
+    // First insert: no score to extract/rollback. Replacement moves the old score across.
+    double logical_score = 0.0;
+    if (old) {
+        auto extracted = tm_->extract_owned_score_locked(digest_, *old);
+        if (!extracted) return std::unexpected(extracted.error());
+        logical_score = *extracted;
     }
-    if (!old) tm_->object_policy_->insert(digest_); // only new objects count toward the SSD bound
-    tm_->write_pool_->release(stage_);              // return the staging buffer (under the lock)
-    stage_ = {};
+    const auto restore_old_score = [&]() -> Status {
+        if (!old) return {};
+        return tm_->install_owned_score_locked(digest_, *old, logical_score);
+    };
+    bool new_score_published = false;
+    if (tm_->fixed_score_owner(meta)) {
+        if (auto published = tm_->head_scores_->publish(meta.head, logical_score); !published) {
+            if (auto restored = restore_old_score(); !restored)
+                fatal_score_state("cannot restore old score after dense publication failure",
+                                  restored.error());
+            return std::unexpected(published.error());
+        }
+        new_score_published = true;
+    }
+    const auto rollback_scores = [&]() -> Status {
+        if (!old && !new_score_published) return {}; // first-insert fast path: nothing to roll back
+        std::optional<Error> first_error;
+        if (new_score_published) {
+            auto removed = tm_->head_scores_->extract(meta.head);
+            if (!removed) first_error = removed.error();
+        }
+        if (auto restored = restore_old_score(); !restored && !first_error)
+            first_error = restored.error();
+        if (first_error) return std::unexpected(std::move(*first_error));
+        return {};
+    };
+
+    // Prepare every potentially allocating side structure before the Index swap. Once metadata
+    // points at the new head/generation, publication must have no fallible correctness-critical
+    // steps left or an exception could make the handle destructor retire live bytes.
+    bool pin_inserted = false;
+    if (meta.head.resident()) {
+        try {
+            const auto id = region_id(meta.head.block, meta.head.offset);
+            auto [it, inserted] = tm_->pins_.try_emplace(id, meta.head.len);
+            pin_inserted = inserted;
+            if (!inserted) it->second.len = meta.head.len;
+        } catch (const std::bad_alloc&) {
+            if (auto rolled_back = rollback_scores(); !rolled_back)
+                fatal_score_state("cannot roll back score after pin registration failure",
+                                  rolled_back.error());
+            return err(Errc::out_of_memory, "allocate head pin registration");
+        }
+    }
+
+    if (expiry != 0) tm_->any_ttl_->store(true, std::memory_order_relaxed); // arm the reaper
+    try {
+        tm_->index_->set_with_score(
+            digest_, meta,
+            tm_->fixed_score_owner(meta) ? std::nullopt : std::optional<double>(logical_score));
+    } catch (const std::bad_alloc&) {
+        if (pin_inserted)
+            tm_->pins_.erase(region_id(meta.head.block, meta.head.offset));
+        if (auto rolled_back = rollback_scores(); !rolled_back)
+            fatal_score_state("cannot roll back score after Index allocation failure",
+                              rolled_back.error());
+        return err(Errc::out_of_memory, "allocate Index entry for stored object");
+    }
+    if (pending_small_head_) {
+        tm_->release_pending_small_head_locked(*head_);
+        pending_small_head_ = false;
+    }
+    // This digest stays detached from both eviction policies for the StoreHandle's full lifetime.
+    // The last concurrent handle release reattaches whichever incarnation is current. Retire only
+    // the replaced bytes here; policy bookkeeping must remain absent until that release.
+    if (old && old->head.resident())
+        tm_->free_head_region(old->head.block, old->head.offset, old->head.len);
+    // The Index swap above is the sole publication point. Old readers already hold open file
+    // descriptors, so unlinking the retired immutable generation here cannot tear their stream.
+    if (old && old->file_generation != 0) {
+        const ObjectLayout old_layout = compute_layout(old->size, tm_->tiers_, tm_->three_layer());
+        if (old_layout.ssd_bytes > 0)
+            tm_->ssd_.unlink_object(digest_, old_layout.ssd_bytes, old->file_generation);
+        if (tm_->hdd_ && old_layout.hdd_bytes > 0)
+            tm_->hdd_->unlink_object(digest_, old_layout.hdd_bytes, old->file_generation);
+    }
+    if (!stage_.empty()) {
+        tm_->write_pool_->release(stage_); // return the staging buffer (under the lock)
+        stage_ = {};
+    }
     committed_ = true;
-    tm_->enforce_object_bound();                    // evict whole objects if over the limit
-    return {};
+    if (store_protection_) {
+        tm_->release_store_protection_locked(digest_);
+        store_protection_ = false;
+    }
+    const std::uint64_t etag = meta.etag;
+    tm_ = nullptr;
+    return etag;
 }
 
 Result<std::size_t> TierManager::read(core::Reactor& reactor, const Digest& digest, Offset offset,
@@ -499,12 +974,14 @@ Result<std::size_t> TierManager::read(core::Reactor& reactor, const Digest& dige
             }
         }
         if (std::max<Size>(offset, ram_end) < std::min<Size>(offset + want, layout.ssd_bytes)) {
-            auto f = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/false);
+            auto f = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/false,
+                                      m->file_generation);
             if (!f) return std::unexpected(f.error());
             ssd_files = std::move(*f);
         }
         if (three_layer() && layout.hdd_bytes > 0 && offset + want > layout.ssd_bytes) {
-            auto f = hdd_->open_object(digest, layout.hdd_bytes, /*create=*/false);
+            auto f = hdd_->open_object(digest, layout.hdd_bytes, /*create=*/false,
+                                       m->file_generation);
             if (!f) return std::unexpected(f.error());
             hdd_files = std::move(*f);
         }
@@ -538,57 +1015,93 @@ Result<std::size_t> TierManager::read(core::Reactor& reactor, const Digest& dige
 static void add_drive_segs(TierManager::ReadStream::Plan& p, const DrivePool& dp,
                            std::uint64_t bucket, std::span<const int> fds, Offset tier_off, Size len,
                            Size out_base) {
+    std::array<ReadSegment, TierManager::ReadStream::kMaxSegs> raw{};
+    const std::size_t n = dp.plan_reads(bucket, tier_off, len, raw);
     Size running = 0;
-    for (const auto& s : dp.plan_reads(bucket, tier_off, len)) {
-        p.segs.push_back({fds[s.drive], s.file_offset, s.length, out_base + running});
+    for (std::size_t i = 0; i < n && p.nsegs < p.segs.size(); ++i) {
+        const auto& s = raw[i];
+        p.segs[p.nsegs++] = {fds[s.drive], s.file_offset, s.length, out_base + running};
         p.total += static_cast<std::size_t>(s.length);
         running += s.length;
     }
 }
 
 Result<TierManager::ReadStream> TierManager::open_read(const Digest& digest) {
-    ObjectMeta meta;
-    {
-        // Dense slot scores are ordinary SIMD-readable memory. Join the same quiescence domain as
-        // every other score update so a node scanner never races this legacy streaming path.
-        std::unique_lock<std::shared_mutex> lk(*mu_);
-        const auto found = index_->lookup(digest);
-        if (!found) return err(Errc::not_found, "object not in index");
-        meta = *found;
-        record_access_locked(digest, meta);
-    }
+    // This legacy API owns its pin inside ReadStream. Keep one exclusive lock across metadata,
+    // immutable-generation opens, and pin creation so it cannot combine two incarnations.
+    std::unique_lock<std::shared_mutex> lk(*mu_);
+    const auto found = index_->lookup(digest);
+    if (!found) return err(Errc::not_found, "object not in index");
+    const ObjectMeta meta = *found;
+    record_access_locked(digest, meta);
     const ObjectLayout layout = compute_layout(meta.size, tiers_, three_layer());
     ObjectFiles ssd; // RAM-only objects have no SSD extent -> empty files; plan() then yields head-only
     if (layout.ssd_bytes > 0) {
-        auto f = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/false);
+        auto f = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/false,
+                                  meta.file_generation);
         if (!f) return std::unexpected(f.error());
         ssd = std::move(*f);
     }
     std::optional<ObjectFiles> hdd;
     if (layout.hdd_bytes > 0 && hdd_) {
-        auto h = hdd_->open_object(digest, layout.hdd_bytes, /*create=*/false);
+        auto h = hdd_->open_object(digest, layout.hdd_bytes, /*create=*/false,
+                                   meta.file_generation);
         if (!h) return std::unexpected(h.error());
         hdd.emplace(std::move(*h));
     }
-    return ReadStream(this, digest, meta.size, layout, std::move(ssd), std::move(hdd));
+    HeadPin pin;
+    if (meta.head.resident()) pin_region(meta.head, pin, /*create=*/true);
+    return ReadStream(this, digest, meta.size, layout, std::move(ssd), std::move(hdd), meta.head,
+                      pin);
+}
+
+TierManager::ReadStream::ReadStream(ReadStream&& o) noexcept
+    : tm_(o.tm_), digest_(o.digest_), size_(o.size_), layout_(o.layout_), ssd_(std::move(o.ssd_)),
+      hdd_(std::move(o.hdd_)), head_(o.head_), owned_pin_(o.owned_pin_) {
+    o.tm_ = nullptr;
+    o.owned_pin_.valid = false;
+}
+
+TierManager::ReadStream& TierManager::ReadStream::operator=(ReadStream&& o) noexcept {
+    if (this != &o) {
+        if (tm_ && owned_pin_.valid) tm_->unpin_head(owned_pin_);
+        tm_ = o.tm_;
+        digest_ = o.digest_;
+        size_ = o.size_;
+        layout_ = o.layout_;
+        ssd_ = std::move(o.ssd_);
+        hdd_ = std::move(o.hdd_);
+        head_ = o.head_;
+        owned_pin_ = o.owned_pin_;
+        o.tm_ = nullptr;
+        o.owned_pin_.valid = false;
+    }
+    return *this;
+}
+
+TierManager::ReadStream::~ReadStream() {
+    if (tm_ && owned_pin_.valid) tm_->unpin_head(owned_pin_);
 }
 
 TierManager::ReadStream::Plan TierManager::ReadStream::plan(Offset off, MutBytes out) {
+    return plan(off, out, out.size());
+}
+
+TierManager::ReadStream::Plan TierManager::ReadStream::plan(Offset off, MutBytes out,
+                                                            Size max_logical) {
     Plan p;
     if (off >= size_) return p;
-    const Size want = std::min<Size>(out.size(), size_ - off);
+    const Size want = std::min<Size>({out.size(), size_ - off, max_logical});
 
-    // Head portion: copied out under the storage read-lock (ADR-0018).
+    // Head portion comes from the exact pinned locator captured with these immutable-generation
+    // fds. Looking the digest up again here could pair an old body with a replacement's head.
     Size ram_end = 0;
-    {
-        std::shared_lock<std::shared_mutex> lk(*tm_->mu_);
-        if (const auto m = tm_->index_->lookup(digest_); m && m->head.resident()) {
-            ram_end = m->head.len;
-            if (off < ram_end) {
-                const Size n = std::min<Size>(off + want, ram_end) - off;
-                std::memcpy(out.data(), tm_->ram_.addr(m->head.block, m->head.offset) + off, n);
-                p.total += static_cast<std::size_t>(n);
-            }
+    if (head_.resident()) {
+        ram_end = head_.len;
+        if (off < ram_end) {
+            const Size n = std::min<Size>(off + want, ram_end) - off;
+            std::memcpy(out.data(), tm_->ram_.addr(head_.block, head_.offset) + off, n);
+            p.total += static_cast<std::size_t>(n);
         }
     }
     // SSD + HDD portions -> per-drive disk segments (read async by the caller).
@@ -605,32 +1118,241 @@ TierManager::ReadStream::Plan TierManager::ReadStream::plan(Offset off, MutBytes
     return p;
 }
 
+Result<std::size_t> TierManager::ReadStream::read(core::Reactor& reactor, Offset off,
+                                                 MutBytes out) {
+    const Plan p = plan(off, out);
+    if (p.nsegs == 0) return p.total;
+
+    std::array<Size, kMaxSegs> read_lengths{};
+    Size expected_io = 0;
+    for (std::size_t i = 0; i < p.nsegs; ++i) {
+        const auto& seg = p.segs[i];
+        // O_DIRECT requires a block-multiple length. Only the object's final segment is normally
+        // short; read its padding into the unused aligned tail of the caller's full I/O buffer.
+        const Size read_len =
+            std::min<Size>(align_up(seg.len, kDeviceBlock), out.size() - seg.out_off);
+        if (read_len < seg.len)
+            return err(Errc::invalid_argument, "stream buffer lacks O_DIRECT tail room");
+        read_lengths[i] = read_len;
+        expected_io += read_len;
+    }
+
+    std::size_t submitted = 0;
+    bool submission_failed = false;
+    for (std::size_t i = 0; i < p.nsegs; ++i) {
+        const auto& seg = p.segs[i];
+        const Size read_len = read_lengths[i];
+        if (!reactor.submit_read(seg.fd, seg.file_off, out.subspan(seg.out_off, read_len), 0)) {
+            reactor.submit();
+            if (!reactor.submit_read(seg.fd, seg.file_off,
+                                     out.subspan(seg.out_off, read_len), 0)) {
+                submission_failed = true;
+                break;
+            }
+        }
+        ++submitted;
+    }
+    if (submitted > 0) reactor.submit_and_wait(static_cast<unsigned>(submitted));
+
+    std::array<core::Completion, kMaxSegs> completions{};
+    Size disk_bytes = 0;
+    std::size_t completed = 0;
+    bool read_failed = false;
+    while (completed < submitted) {
+        const unsigned got = reactor.reap(
+            std::span<core::Completion>(completions.data(), submitted - completed));
+        if (got == 0) {
+            reactor.submit_and_wait(1);
+            continue;
+        }
+        for (unsigned i = 0; i < got; ++i) {
+            if (completions[i].res < 0)
+                read_failed = true;
+            else
+                disk_bytes += static_cast<Size>(completions[i].res);
+        }
+        completed += got;
+    }
+    if (submission_failed) return err(Errc::io_error, "submission queue full");
+    if (read_failed) return err(Errc::io_error, "stream read failed");
+    if (disk_bytes != expected_io) return err(Errc::io_error, "short stream read");
+    return p.total;
+}
+
 bool TierManager::remove(const Digest& digest) {
     std::unique_lock<std::shared_mutex> lk(*mu_);
     if (!index_->contains(digest)) return false;
-    drop_object(digest);
+    if (auto dropped = drop_object(digest); !dropped) {
+        disable_numa_promotion(dropped.error());
+        return false;
+    }
     return true;
 }
 
-void TierManager::drop_object(const Digest& digest) {
+Status TierManager::acquire_store_protection_locked(const Digest& digest) {
+    try {
+        const auto [it, inserted] = store_protections_.try_emplace(digest, 0);
+        if (it->second == std::numeric_limits<unsigned>::max())
+            return err(Errc::out_of_memory, "too many concurrent stores for one key");
+        if (inserted) {
+            // Keep the current incarnation out of every victim selector for the entire lifetime of
+            // every in-flight handle for this digest. A new/absent digest simply has nothing to
+            // detach yet; its eventual commit also remains detached until the last token releases.
+            if (const auto current = index_->lookup(digest); current) {
+                object_policy_->remove(digest);
+                remove_capacity_policies_locked(digest);
+                if (current->head.resident()) resident_policy(current->size).remove(digest);
+            }
+        }
+        ++it->second;
+        return {};
+    } catch (const std::bad_alloc&) {
+        return err(Errc::out_of_memory, "allocate in-flight store protection");
+    }
+}
+
+void TierManager::release_store_protection_locked(const Digest& digest) {
+    const auto it = store_protections_.find(digest);
+    if (it == store_protections_.end() || it->second == 0) {
+        std::fprintf(stderr, "fatal: unmatched in-flight store protection release\n");
+        std::fflush(stderr);
+        std::abort();
+    }
+    if (--it->second != 0) return;
+    store_protections_.erase(it);
+
+    try {
+        // DELETE/TTL may have removed the original incarnation, and another concurrent handle may
+        // have published a newer one. Reattach whatever is current now, never a stale snapshot.
+        if (const auto current = index_->lookup(digest); current) {
+            // This policy is the whole-disk-object selector. RAM-only entries consume no
+            // filesystem capacity and must never disappear merely because a disk is full.
+            if (current->file_generation != 0) {
+                object_policy_->insert(digest);
+                insert_capacity_policies_locked(digest, *current);
+            }
+            if (current->head.resident()) resident_policy(current->size).insert(digest);
+        }
+    } catch (const std::bad_alloc&) {
+        // Policy insertion is not transactional and may already be partially visible. Continuing
+        // would make live bytes permanently unevictable or double-accounted.
+        std::fprintf(stderr, "fatal: cannot reattach a completed store to eviction policy\n");
+        std::fflush(stderr);
+        std::abort();
+    }
+    enforce_object_bound();
+}
+
+void TierManager::release_pending_small_head_locked(const core::BufferPool::Region& head) {
+    if (pending_small_heads_.erase(region_id(head.block, head.offset)) != 1) {
+        std::fprintf(stderr, "fatal: unmatched unpublished small-head reservation release\n");
+        std::fflush(stderr);
+        std::abort();
+    }
+}
+
+Status TierManager::drop_object(const Digest& digest) {
     const auto meta = index_->lookup(digest);
-    if (!meta) return;
+    if (!meta) return err(Errc::not_found, "drop object missing from Index");
+    if (auto discarded = discard_owned_score_locked(digest, *meta); !discarded)
+        return discarded;
     if (meta->head.resident()) {
         free_head_region(meta->head.block, meta->head.offset, meta->head.len);
-        policy_->remove(digest);
+        resident_policy(meta->size).remove(digest);
     }
     object_policy_->remove(digest);
+    remove_capacity_policies_locked(digest);
     const ObjectLayout layout = compute_layout(meta->size, tiers_, three_layer());
-    if (layout.ssd_bytes > 0) ssd_.unlink_object(digest, layout.ssd_bytes);
-    if (layout.hdd_bytes > 0 && hdd_) hdd_->unlink_object(digest, layout.hdd_bytes);
+    if (layout.ssd_bytes > 0)
+        ssd_.unlink_object(digest, layout.ssd_bytes, meta->file_generation);
+    if (layout.hdd_bytes > 0 && hdd_)
+        hdd_->unlink_object(digest, layout.hdd_bytes, meta->file_generation);
     index_->erase(digest);
+    return {};
+}
+
+bool TierManager::object_uses_device(const Digest& digest, const ObjectMeta& meta,
+                                     std::uint64_t device) const noexcept {
+    if (meta.file_generation == 0 || device == 0) return false;
+    const ObjectLayout layout = compute_layout(meta.size, tiers_, three_layer());
+    const Size ssd_extent =
+        layout.hdd_bytes > 0 ? layout.ssd_bytes : align_up(layout.ssd_bytes, kDeviceBlock);
+    for (unsigned drive = 0; drive < ssd_.drives().num_drives(); ++drive)
+        if (ssd_.device_of_drive(drive) == device &&
+            ssd_.drives().file_extent(digest.bucket(), ssd_extent, drive) != 0)
+            return true;
+    if (hdd_) {
+        const Size hdd_extent = align_up(layout.hdd_bytes, kDeviceBlock);
+        for (unsigned drive = 0; drive < hdd_->drives().num_drives(); ++drive)
+            if (hdd_->device_of_drive(drive) == device &&
+                hdd_->drives().file_extent(digest.bucket(), hdd_extent, drive) != 0)
+                return true;
+    }
+    return false;
+}
+
+void TierManager::insert_capacity_policies_locked(const Digest& digest, const ObjectMeta& meta) {
+    for (auto& [device, policy] : capacity_policies_)
+        if (object_uses_device(digest, meta, device)) policy->insert(digest);
+}
+
+void TierManager::remove_capacity_policies_locked(const Digest& digest) {
+    for (auto& [device, policy] : capacity_policies_) {
+        (void)device;
+        policy->remove(digest);
+    }
+}
+
+void TierManager::touch_capacity_policies_locked(const Digest& digest) {
+    for (auto& [device, policy] : capacity_policies_) {
+        (void)device;
+        policy->touch(digest);
+    }
+}
+
+bool TierManager::reclaim_one_disk_object(std::uint64_t device) {
+    std::unique_lock<std::shared_mutex> lk(*mu_);
+
+    // Expired disk objects have no remaining cache value and win over policy-selected live data.
+    if (any_ttl_->load(std::memory_order_relaxed)) {
+        const auto expired = index_->expired_keys(now_unix());
+        for (const auto& digest : expired) {
+            const auto meta = index_->lookup(digest);
+            if (!meta || meta->file_generation == 0 || store_protected_locked(digest)) continue;
+            if (!object_uses_device(digest, *meta, device)) continue;
+            if (auto dropped = drop_object(digest); dropped) return true;
+        }
+    }
+
+    const auto found_policy = capacity_policies_.find(device);
+    if (found_policy == capacity_policies_.end()) return false;
+    auto& capacity_policy = *found_policy->second;
+    while (const auto victim = capacity_policy.evict()) {
+        // Stale policy entries are harmless. Protected stores are removed on acquisition, but keep
+        // this guard because reclaim correctness must not depend on policy implementation details.
+        const auto meta = index_->lookup(*victim);
+        if (!meta) continue;
+        if (store_protected_locked(*victim)) {
+            restore_policy_or_die(capacity_policy, *victim);
+            return false;
+        }
+        if (!object_uses_device(*victim, *meta, device)) continue;
+        if (auto dropped = drop_object(*victim); dropped) return true;
+        restore_policy_or_die(capacity_policy, *victim);
+        return false;
+    }
+    return false;
 }
 
 void TierManager::enforce_object_bound() {
-    while (max_objects_ != 0 && index_->size() > max_objects_) {
+    while (max_objects_ != 0 && object_policy_->resident() > max_objects_) {
         const auto victim = object_policy_->evict();
         if (!victim) break;
-        drop_object(*victim);
+        if (auto dropped = drop_object(*victim); !dropped) {
+            restore_policy_or_die(*object_policy_, *victim);
+            disable_numa_promotion(dropped.error());
+            break;
+        }
     }
 }
 
@@ -644,24 +1366,112 @@ std::optional<ByteView> TierManager::head_view(const Digest& digest) {
 void TierManager::touch(const Digest& digest) {
     std::unique_lock<std::shared_mutex> lk(*mu_); // touch mutates the policy (visited bit)
     const auto meta = index_->lookup(digest);
-    policy_->touch(digest);
+    if (meta && meta->head.resident()) resident_policy(meta->size).touch(digest);
     object_policy_->touch(digest);
+    touch_capacity_policies_locked(digest);
     if (meta) record_access_locked(digest, *meta);
 }
 
-void TierManager::record_access_locked(const Digest& digest, const ObjectMeta& meta) {
-    if (!index_->increment_score(digest, access_score_.increment)) return;
-    if (meta.head.resident() && meta.head.len == tiers_.ram_head &&
-        numa_scores_healthy_->load(std::memory_order_relaxed)) {
-        if (auto status = head_scores_->increment(meta.head, access_score_.increment); !status) {
-            disable_numa_scores(status.error());
-        }
+void TierManager::touch_policies(const Digest& digest, bool head_resident) {
+    std::unique_lock<std::shared_mutex> lk(*mu_); // S3-FIFO's visited bit is not atomic
+    object_policy_->touch(digest);
+    touch_capacity_policies_locked(digest);
+    if (head_resident) {
+        const auto meta = index_->lookup(digest);
+        if (meta) resident_policy(meta->size).touch(digest);
     }
 }
 
-void TierManager::disable_numa_scores(const Error& error) {
-    if (!numa_scores_healthy_->exchange(false, std::memory_order_relaxed)) return;
-    std::fprintf(stderr, "NUMA score maintenance disabled: %s\n", error.detail.c_str());
+std::optional<double> TierManager::access_score(const Digest& digest) const {
+    std::shared_lock<std::shared_mutex> lk(*mu_);
+    const auto meta = index_->lookup(digest);
+    if (!meta) return std::nullopt;
+    if (fixed_score_owner(*meta)) return head_scores_->score(meta->head);
+    return index_->score(digest);
+}
+
+Result<double> TierManager::extract_owned_score_locked(const Digest& digest,
+                                                        const ObjectMeta& meta) {
+    if (fixed_score_owner(meta)) {
+        if (!index_->score_external(digest))
+            return err(Errc::io_error,
+                       "full resident head has a second score in the Index");
+        return head_scores_->extract(meta.head);
+    }
+    if (index_->score_external(digest))
+        return err(Errc::io_error,
+                   "non-fixed object has no score in the Index");
+    const auto score = index_->extract_score(digest);
+    if (!score) return err(Errc::not_found, "object score is absent from the Index");
+    return *score;
+}
+
+Status TierManager::install_owned_score_locked(const Digest& digest, const ObjectMeta& meta,
+                                                double value) {
+    if (fixed_score_owner(meta)) {
+        bool moved_index_score = false;
+        if (!index_->score_external(digest)) {
+            const auto placeholder = index_->extract_score(digest);
+            if (!placeholder)
+                return err(Errc::io_error,
+                           "cannot mark full-head Index score as externally owned");
+            if (*placeholder != value) {
+                if (!index_->restore_score(digest, *placeholder))
+                    return err(Errc::io_error,
+                               "cannot restore conflicting full-head Index score");
+                return err(Errc::io_error,
+                           "full-head score conflicts with its Index placeholder");
+            }
+            moved_index_score = true;
+        }
+        if (auto published = head_scores_->publish(meta.head, value); !published) {
+            if (moved_index_score && !index_->restore_score(digest, value))
+                return err(Errc::io_error,
+                           "cannot restore Index score after dense publication failure");
+            return published;
+        }
+        return {};
+    }
+
+    if (index_->score_external(digest)) {
+        if (!index_->restore_score(digest, value))
+            return err(Errc::io_error, "cannot restore object score to the Index");
+        return {};
+    }
+    const auto current = index_->score(digest);
+    if (!current || *current != value)
+        return err(Errc::io_error, "object already has a conflicting Index score");
+    return {};
+}
+
+Status TierManager::discard_owned_score_locked(const Digest& digest, const ObjectMeta& meta) {
+    (void)digest;
+    if (fixed_score_owner(meta)) {
+        // The Index entry is erased immediately after this cleanup. Remove any dense owner even if
+        // an earlier invariant violation also left a numeric Index value. An already-empty slot is
+        // likewise safe: deletion cannot leave stale score state behind for its next allocator user.
+        auto removed = head_scores_->extract(meta.head);
+        if (!removed && removed.error().code != Errc::not_found)
+            return std::unexpected(removed.error());
+    }
+    return {};
+}
+
+void TierManager::record_access_locked(const Digest& digest, const ObjectMeta& meta) {
+    if (fixed_score_owner(meta)) {
+        if (auto status = head_scores_->increment(meta.head, access_score_.increment); !status)
+            fatal_score_state("cannot increment authoritative dense score", status.error());
+        return;
+    }
+    if (!index_->increment_score(digest, access_score_.increment))
+        fatal_score_state(
+            "cannot increment authoritative Index score",
+            Error{Errc::io_error, "Index-owned object score is absent or externally marked"});
+}
+
+void TierManager::disable_numa_promotion(const Error& error) {
+    if (!numa_promotion_healthy_->exchange(false, std::memory_order_relaxed)) return;
+    std::fprintf(stderr, "NUMA promotion disabled: %s\n", error.detail.c_str());
 }
 
 void TierManager::decay_access_scores() {
@@ -675,27 +1485,29 @@ void TierManager::decay_access_scores() {
     } pending(gate.rescore_pending);
 
     // A current block exchange may finish, but its tight loop sees rescore_pending before starting
-    // another. The storage lock makes the ordinary SIMD arrays quiescent while node-local workers
-    // decay them; operation keeps the two maintenance jobs disjoint.
+    // another. The storage lock keeps ownership transfers and block swaps disjoint from decay;
+    // individual score operations themselves are relaxed atomics.
     std::lock_guard maintenance(gate.operation);
     std::unique_lock<std::shared_mutex> lk(*mu_);
     index_->decay_scores(access_score_.decay);
-    if (numa_scores_healthy_->load(std::memory_order_relaxed)) {
-        if (auto status = head_scores_->decay(access_score_.decay); !status) {
-            disable_numa_scores(status.error());
-        }
+    if (auto status = head_scores_->decay(access_score_.decay); !status) {
+        // Each NUMA worker owns a disjoint authoritative slice. Dispatch failure can arrive after
+        // some workers completed the epoch, so neither retrying the whole table nor continuing with
+        // a mixed epoch is correct. Stop explicitly instead of silently freezing or double-decaying
+        // an unknown subset.
+        fatal_score_state("authoritative NUMA decay failed; epoch may be partial", status.error());
     }
 }
 
 bool TierManager::promote_hot_remote_block() {
     auto& gate = *score_maintenance_;
-    if (!numa_scores_healthy_->load(std::memory_order_relaxed)) return false;
+    if (!numa_promotion_healthy_->load(std::memory_order_relaxed)) return false;
     if (gate.rescore_pending.load(std::memory_order_acquire)) return false;
 
     // Do not reserve the maintenance gate while waiting for ordinary storage readers/writers. A
     // pending decay announces itself first, so this lock order cannot starve or deadlock it.
     std::unique_lock<std::shared_mutex> lk(*mu_);
-    if (!numa_scores_healthy_->load(std::memory_order_relaxed)) return false;
+    if (!numa_promotion_healthy_->load(std::memory_order_relaxed)) return false;
     if (gate.rescore_pending.load(std::memory_order_acquire)) return false;
     std::unique_lock maintenance(gate.operation, std::try_to_lock);
     if (!maintenance.owns_lock()) return false;
@@ -705,15 +1517,16 @@ bool TierManager::promote_hot_remote_block() {
 
     if (ram_.region_count() < 2) return false;
 
-    // The node workers see only their node-bound dense doubles. This coordinator supplies the
+    // The node workers see only their node-bound atomic doubles. This coordinator supplies the
     // comparatively tiny set of pinned block numbers and receives one extrema summary per node.
     std::vector<unsigned> pinned_blocks;
     pinned_blocks.reserve(pins_.size());
     for (const auto& [id, pin] : pins_)
-        if (pin.refcount > 0) pinned_blocks.push_back(static_cast<unsigned>(id >> 32));
+        if (pin.refcount.load(std::memory_order_relaxed) > 0)
+            pinned_blocks.push_back(static_cast<unsigned>(id >> 32));
     const auto candidates = head_scores_->promotion_candidates(pinned_blocks);
     if (!candidates) {
-        disable_numa_scores(candidates.error());
+        disable_numa_promotion(candidates.error());
         return false;
     }
     const auto& cold_local = candidates->cold_preferred;
@@ -725,7 +1538,8 @@ bool TierManager::promote_hot_remote_block() {
     if (!ram_.swap_blocks(cold_block, hot_block)) return false;
     index_->swap_head_blocks(cold_block, hot_block);
     if (auto status = head_scores_->swap_blocks(cold_block, hot_block); !status)
-        disable_numa_scores(status.error());
+        fatal_score_state("cannot swap authoritative score slices after RAM block swap",
+                          status.error());
     const auto elapsed = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count());
@@ -751,7 +1565,27 @@ TierManager::NumaPromotionStats TierManager::numa_promotion_stats() const noexce
 
 std::size_t TierManager::head_resident() const {
     std::shared_lock<std::shared_mutex> lk(*mu_);
-    return policy_->resident();
+    // In-flight stores temporarily detach their digest from eviction policies. The Index remains
+    // authoritative for residency, so stats must count metadata rather than policy membership.
+    return index_->resident_heads().size();
+}
+
+bool TierManager::pin_region(const HeadLoc& loc, HeadPin& out, bool create) {
+    const auto id = region_id(loc.block, loc.offset);
+    auto it = pins_.find(id);
+    if (it == pins_.end()) {
+        if (!create) return false;
+        it = pins_.try_emplace(id, loc.len).first;
+    } else if (create) {
+        // `create` is used only while holding mu_ exclusively. Shared-lock snapshot pins must never
+        // write this plain field; concurrent readers modify only the atomic refcount.
+        it->second.len = loc.len;
+    } else if (it->second.len != loc.len) {
+        return false;
+    }
+    it->second.refcount.fetch_add(1, std::memory_order_relaxed);
+    out = HeadPin{loc.block, loc.offset, loc.len, true};
+    return true;
 }
 
 std::optional<TierManager::HeadPin> TierManager::pin_head(const Digest& digest) {
@@ -760,21 +1594,40 @@ std::optional<TierManager::HeadPin> TierManager::pin_head(const Digest& digest) 
     if (!meta) return std::nullopt;
     record_access_locked(digest, *meta);
     object_policy_->touch(digest); // the whole object was accessed
+    touch_capacity_policies_locked(digest);
     if (!meta->head.resident()) return std::nullopt;
-    policy_->touch(digest); // head-cache hit
-    auto& p = pins_[region_id(meta->head.block, meta->head.offset)];
-    p.len = meta->head.len;
-    ++p.refcount;
-    return HeadPin{meta->head.block, meta->head.offset, meta->head.len, true};
+    resident_policy(meta->size).touch(digest); // head-cache hit
+    HeadPin pin;
+    pin_region(meta->head, pin, /*create=*/true);
+    return pin;
 }
 
 void TierManager::unpin_head(const HeadPin& pin) {
     if (!pin.valid) return;
+    // Common path: just drop the refcount. Only the last unpin that finds orphaned bytes takes the
+    // exclusive lock to free RAM (and erase the pin slot).
+    const auto id = region_id(pin.block, pin.offset);
+    {
+        std::shared_lock<std::shared_mutex> lk(*mu_);
+        const auto it = pins_.find(id);
+        if (it == pins_.end()) return;
+        const unsigned prev = it->second.refcount.fetch_sub(1, std::memory_order_acq_rel);
+        if (prev > 1) return; // still held by other readers
+        if (prev == 0) {      // underflow guard (should not happen)
+            it->second.refcount.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        // prev == 1: we were the last holder. If not orphaned, leave the zero-refcount slot for
+        // future shared-lock pins (pre-registered at commit). If orphaned, free below.
+        if (!it->second.orphaned.load(std::memory_order_acquire)) return;
+    }
     std::unique_lock<std::shared_mutex> lk(*mu_);
-    const auto it = pins_.find(region_id(pin.block, pin.offset));
+    const auto it = pins_.find(id);
     if (it == pins_.end()) return;
-    if (--it->second.refcount == 0) {
-        if (it->second.orphaned) ram_.deallocate(pin.block, pin.offset, pin.len);
+    // Another pin may have raced in after we dropped to zero; only free when still zero + orphaned.
+    if (it->second.refcount.load(std::memory_order_acquire) == 0 &&
+        it->second.orphaned.load(std::memory_order_acquire)) {
+        ram_.deallocate(pin.block, pin.offset, pin.len);
         pins_.erase(it);
     }
 }
@@ -784,18 +1637,15 @@ ByteView TierManager::pinned_bytes(const HeadPin& pin) const {
 }
 
 // Free a head's RAM, or — if a reader has it pinned — orphan it so the last unpin frees it.
-// Called under the storage lock (by begin_store / drop_object).
+// Called under the exclusive storage lock (by begin_store / drop_object / commit).
 void TierManager::free_head_region(unsigned block, std::uint32_t offset, std::uint32_t len) {
-    if (len == tiers_.ram_head && numa_scores_healthy_->load(std::memory_order_relaxed)) {
-        if (auto status = head_scores_->erase(HeadLoc{block, offset, len}); !status) {
-            disable_numa_scores(status.error());
-        }
-    }
     const auto it = pins_.find(region_id(block, offset));
-    if (it != pins_.end() && it->second.refcount > 0)
-        it->second.orphaned = true;
-    else
+    if (it != pins_.end() && it->second.refcount.load(std::memory_order_acquire) > 0) {
+        it->second.orphaned.store(true, std::memory_order_release);
+    } else {
+        if (it != pins_.end()) pins_.erase(it);
         ram_.deallocate(block, offset, len);
+    }
 }
 
 // Reclaim dead space in fragmented small (arena) blocks by sliding their live heads down to squeeze
@@ -813,11 +1663,17 @@ void TierManager::compact_small() {
     for (auto& [block, slots] : by_block) {
         auto* arena = ram_.small_arena(block);
         if (!arena || arena->dead() == 0) continue; // no holes to squeeze out
-        bool pinned = false;                        // a reader is sending a head here -> leave it, retry later
-        for (const auto& s : slots) {
-            const auto it = pins_.find(region_id(block, s.offset));
-            if (it != pins_.end() && it->second.refcount > 0) { pinned = true; break; }
-        }
+        const auto in_block = [block](std::uint64_t id) {
+            return static_cast<unsigned>(id >> 32) == block;
+        };
+        if (std::any_of(pending_small_heads_.begin(), pending_small_heads_.end(), in_block))
+            continue; // unpublished StoreHandle bytes are not represented by `slots`
+        bool pinned = false; // a reader is sending a head here -> leave it, retry later
+        for (const auto& [id, pin] : pins_)
+            if (in_block(id) && pin.refcount.load(std::memory_order_relaxed) > 0) {
+                pinned = true;
+                break;
+            }
         if (pinned) continue;
         std::sort(slots.begin(), slots.end(),
                   [](const Slot& a, const Slot& b) { return a.offset < b.offset; });
@@ -827,6 +1683,14 @@ void TierManager::compact_small() {
                 std::memmove(ram_.addr(block, static_cast<std::uint32_t>(dest)),
                              ram_.addr(block, s.offset), s.len);
                 index_->set_head(s.digest, HeadLoc{block, static_cast<std::uint32_t>(dest), s.len});
+                // Relocate any zero-refcount pin pre-registration to the new offset.
+                const auto old_id = region_id(block, s.offset);
+                const auto new_id = region_id(block, static_cast<std::uint32_t>(dest));
+                if (auto pit = pins_.find(old_id); pit != pins_.end()) {
+                    RegionPin moved(std::move(pit->second));
+                    pins_.erase(pit);
+                    pins_.try_emplace(new_id, std::move(moved));
+                }
             }
             dest += arena->slot_size(s.len);
         }
@@ -835,39 +1699,61 @@ void TierManager::compact_small() {
 }
 
 std::optional<TierManager::Snapshot> TierManager::open_snapshot(const Digest& digest,
-                                                                bool record_access) {
-    std::unique_lock<std::shared_mutex> lk(*mu_); // capture meta + head-pin + fds atomically
-    const auto m = index_->lookup(digest);
-    if (!m) return std::nullopt;
-    if (is_expired(*m, now_unix())) return std::nullopt; // TTL passed -> lazy miss (reaper reclaims)
-    if (record_access) record_access_locked(digest, *m);
-    object_policy_->touch(digest); // the whole object was accessed
-    const Size head_len = m->head.resident() ? m->head.len : 0;
+                                                                bool record_access,
+                                                                std::uint32_t now) {
+    if (now == 0) now = now_unix();
 
-    Snapshot snap;
-    snap.meta = *m;
-    // Open the disk files first (under the lock), so an open failure needs no pin rollback.
-    if (m->size > head_len) {
-        const ObjectLayout layout = compute_layout(m->size, tiers_, three_layer());
-        auto ssd = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/false);
-        if (!ssd) return std::nullopt;
-        std::optional<ObjectFiles> hdd;
-        if (layout.hdd_bytes > 0 && hdd_) {
-            auto h = hdd_->open_object(digest, layout.hdd_bytes, /*create=*/false);
-            if (!h) return std::nullopt;
-            hdd.emplace(std::move(*h));
+    // Prefer a shared lock: pin refcounts are atomic, score increments are atomic, and S3-FIFO
+    // touch only sets a visited bit. Map insert for a missing pin slot still needs exclusive —
+    // that is the cold path (pre-registered at commit for newly stored heads).
+    auto fill = [&](bool create_pin) -> std::optional<Snapshot> {
+        const auto m = index_->lookup(digest);
+        if (!m) return std::nullopt;
+        if (is_expired(*m, now)) return std::nullopt; // TTL passed -> lazy miss (reaper reclaims)
+        // Score update is atomic (no exclusive needed). Eviction policy touch is deferred to
+        // begin_get via touch() after the snapshot returns — keeps openat off the policy path and
+        // shortens the lock hold to meta + pin + open only.
+        if (record_access) record_access_locked(digest, *m);
+        const Size head_len = m->head.resident() ? m->head.len : 0;
+
+        Snapshot snap;
+        snap.meta = *m;
+        // Open the disk files first (under the lock), so an open failure needs no pin rollback.
+        if (m->size > head_len) {
+            const ObjectLayout layout = compute_layout(m->size, tiers_, three_layer());
+            auto ssd = ssd_.open_object(digest, layout.ssd_bytes, /*create=*/false,
+                                        m->file_generation);
+            if (!ssd) return std::nullopt;
+            std::optional<ObjectFiles> hdd;
+            if (layout.hdd_bytes > 0 && hdd_) {
+                auto h = hdd_->open_object(digest, layout.hdd_bytes, /*create=*/false,
+                                           m->file_generation);
+                if (!h) return std::nullopt;
+                hdd.emplace(std::move(*h));
+            }
+            snap.rs.emplace(ReadStream(this, digest, m->size, layout, std::move(*ssd),
+                                       std::move(hdd), m->head, HeadPin{}));
         }
-        snap.rs.emplace(ReadStream(this, digest, m->size, layout, std::move(*ssd), std::move(hdd)));
+        if (m->head.resident()) {
+            if (!pin_region(m->head, snap.pin, create_pin)) return std::nullopt; // need exclusive create
+        }
+        return snap;
+    };
+
+    {
+        std::shared_lock<std::shared_mutex> lk(*mu_);
+        if (auto snap = fill(/*create_pin=*/false)) return snap;
+        // Miss (absent/expired) or pin slot missing. Distinguish: absent stays a miss.
+        const auto m = index_->lookup(digest);
+        if (!m || is_expired(*m, now)) return std::nullopt;
+        if (!m->head.resident()) {
+            // No head to pin — fill() should have succeeded; rebuild under shared is fine.
+            return fill(/*create_pin=*/false);
+        }
+        // Head resident but pin slot not yet registered -> exclusive path below.
     }
-    // Pin the resident head (orphan-safe across a concurrent replace).
-    if (m->head.resident()) {
-        policy_->touch(digest);
-        auto& p = pins_[region_id(m->head.block, m->head.offset)];
-        p.len = m->head.len;
-        ++p.refcount;
-        snap.pin = HeadPin{m->head.block, m->head.offset, m->head.len, true};
-    }
-    return snap;
+    std::unique_lock<std::shared_mutex> lk(*mu_);
+    return fill(/*create_pin=*/true);
 }
 
 } // namespace goblin::storage

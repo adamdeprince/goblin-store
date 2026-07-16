@@ -35,10 +35,11 @@ head size avoids wasting SSD-latency-sized RAM reservations. Fractional small ob
 arena and are not currently NUMA-promoted.
 
 With `--numa NODE`, `--memory` belongs to the serving node and `--sub-memory` is allocated on each
-other online node. Workers, maintenance threads, dynamic I/O allocations, and the key index remain on
-the serving node. Allocation uses local blocks first, then consumes foreign capacity. Successful GETs
-increase per-key scores; once per minute the scores decay. A maintenance thread exchanges a hot full
-foreign block with a cold full local block, while the rescore traversal has priority over promotion.
+other online node. Serving workers, coordinator threads, dynamic I/O allocations, and the key index
+remain on the serving node; dense-score workers bind to the node whose score pages they scan.
+Allocation uses local blocks first, then consumes foreign capacity. Successful GETs increase per-key
+scores; once per minute the scores decay. The coordinator exchanges a hot full foreign block with a
+cold full local block, while the rescore traversal has priority over promotion.
 
 For controlled testing, `--perverse` keeps the serving threads, NIC path, key index, and ordinary
 allocations on the selected node but maps the preferred region-zero head arena on the node with the

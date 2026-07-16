@@ -10,6 +10,7 @@ the cold tail, cost less per stored GB. These are the measurements behind that c
 | **memory-sized** (set fits RAM) | memcached | same latency, **7.4× less RAM** → ~6–7× cheaper |
 | **disk-sized** (set ≫ RAM) | memcached + extstore | **+68% throughput, ~25% cheaper** on the same HDD; goblin-store holds 100% of the set, extstore **sheds 41%** |
 | **small objects** (sub-2 KB) | memcached | **memcached wins** (~12× less RAM, ~2× faster) — small values are not goblin-store's game |
+| **native RDMA, 256 KiB values** | nominal 40 Gbit/s InfiniBand | **38.232 Gbit/s payload** (95.58% of link rate); 7.659 us median response-header TTFB |
 
 The win is large objects, and the mechanism is the tiering: a hot **RAM head** + **SSD prefix** answer
 instantly while a **read-ahead pipeline** hides the ~5 ms HDD seek that extstore eats whole on every cold GET.
@@ -197,6 +198,27 @@ Sixteen 2 MiB hot blocks moved local, exchanging 32 MiB hot for 32 MiB cold and 
 logical copy traffic, 10.90 ms total swap time, and a 0.750 ms maximum. FPGA NICs and direct userspace
 networking are on the development path. NIC/FPGA timestamps and kernel-bypass queues should make the
 first-payload-byte latency effect measurable without the host-side jitter that obscured it here.
+
+## 5. Native RDMA over InfiniBand — two QPs nearly fill a 40 Gbit/s link
+
+The full method, latency distributions, QP sweep, and timing semantics are in
+**[Native RDMA over InfiniBand: 256 KiB latency and throughput](docs/native-rdma-256k-performance.md)**.
+On July 15, 2026, `rain` read a fixed-seed uniform 4 GiB working set from `dopey` over their direct
+40 Gbit/s Connect-IB link. Both HCAs, the server's resident heads, and the client/server CPU sets were
+local to NUMA node 1. Objects were exactly 256 KiB—one resident head and one registered bulk
+window—so the test measured RAM plus native verbs rather than disk streaming.
+
+Five 200,000-request serial repetitions produced one million measured samples. Median
+application-visible response-header TTFB was 7.659 us; the complete 256 KiB bulk window was visible
+at 98.837 us; and the memcache response completed at 99.740 us. `BULK_READY` follows the complete
+RDMA write, so the payload timestamp is full-window readiness rather than literal first-body-byte
+arrival.
+
+One closed-loop QP delivered 20.911 Gbit/s of object payload. Two reached 37.957 Gbit/s, and the
+12-QP sweep maximum was 38.232 Gbit/s—95.58% of the nominal link rate, excluding framing and fabric
+overhead. Three additional 30-second two-QP runs averaged 37.858 Gbit/s with a 0.193 Gbit/s sample
+standard deviation. The benchmark is reproducible with `bench/run_rdma_256k_ib.sh` and
+`bench/analyze_rdma_256k.py`.
 
 ---
 

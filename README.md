@@ -23,9 +23,9 @@ for edge/CDN use.
 ## Benchmarks — the short version
 
 
-We setup a 2-core server running goblin-store and pitted ig against a
-16-vCPU load box running mutilate across a real NIC transfering mixed
-256KiB-8MiB objects.  Full methodology, rig, and tables in
+We set up a 2-core server running goblin-store and pitted it against a
+16-vCPU load box running mutilate across a real NIC, transferring mixed
+256 KiB–8 MiB objects. Full methodology, rig, and tables are in
 **[`BENCHMARKS.md`](BENCHMARKS.md)**.
 
 | workload | vs | result |
@@ -43,65 +43,89 @@ spindle throughput.
 Each object is split
 ([ADR-0006](docs/adr/0006-positional-tiering-pipeline.md)) into three
 parts: RAM, SSD and optionally an HDD tail. The position of each part
-depends on the latecy of its underlying storage and when the demand
-for it across the wire will actually arive.  Traffic flows down the
-teirs to cheaper and higher latency storage, latency absorbed by the
-laters beore it.
+depends on the latency of its underlying storage and when the demand
+for it will arrive across the wire. Traffic flows down the tiers to
+cheaper, higher-latency storage, with earlier layers absorbing the
+latency of later ones.
 
-When a request arrives all three layers are dispatched at once, but
-not every byte is delivered to the wire at once.  Data to be delivered
-immediately comes from ram.  Later data comes at a later time on the
-wire; this data comes from SSD where the latency can be hidden by
-transmission time on the wire.  Even later data comes from cheaper
-HDD.  Samll objects are stored in RAM only.  Medium sized objects in
-SSD only.  Large objects across RAM, SSD and HDD.
+When a request arrives, the resident RAM head is delivered first. Once
+that initial response send is queued, the first bounded disk-tail read
+starts at the configured head boundary and runs while the head is in
+flight; completed tail bytes remain ordered behind the head. Subsequent
+io_uring reads overlap transmission of the current chunk. Bytes reached
+later in a three-layer stream come from SSD and then cheaper HDD, so
+their latency can be hidden behind earlier wire time. Small objects are
+stored in RAM only. Medium objects use RAM plus SSD. Large objects use
+RAM, SSD, and HDD when the HDD tier is configured.
 
 
-- **RAM head** — first `ram_head` bytes (default 256 KiB), served zero-copy for instant time-to-first-byte.
+- **RAM head** — first `ram_head` bytes (default 256 KiB), resident for immediate time-to-first-byte.
+  Responses up to 16 KiB are framed inline for one send; larger resident heads use a pinned
+  zero-copy send.
   Heads are packed inside larger allocation/promotion blocks (default 2 MiB on x86, so eight default
   heads per block); the allocation block is not a per-file reservation.
-- **SSD prefix** — the warm middle (default up to 32 MiB/object) on fast storage.
+- **SSD bytes** — in three-layer mode, the warm prefix (default up to 32 MiB/object); in two-layer
+  mode, SSD holds the complete backing value for every disk-backed object.
 - **HDD tail** — the cold remainder on cheap, throughput-optimized disk (3-layer mode).
 
 
 
-Underneath: **thread-per-core** shared-nothing loops on **io_uring** ([ADR-0001](docs/adr/0001-thread-per-core-concurrency.md)/[ADR-0002](docs/adr/0002-iouring-rings-shared-drives.md)), **O_DIRECT**
+Underneath: **thread-per-core TCP/HTTP** network loops on **io_uring** over a shared locked store
+([ADR-0001](docs/adr/0001-thread-per-core-concurrency.md)/[ADR-0002](docs/adr/0002-iouring-rings-shared-drives.md)); native RDMA currently uses a connection-owned progress thread. **O_DIRECT**
 backing store so the cache owns its RAM budget instead of fighting the page cache ([ADR-0011](docs/adr/0011-odirect-bypass-page-cache.md)), **atomic
 copy-on-write publish** (readers never see a torn value, [ADR-0018](docs/adr/0018-concurrency-model.md)), a **buddy** RAM-head allocator
 ([ADR-0008](docs/adr/0008-ram-allocator.md)), **s3fifo** + whole-object multi-resource eviction ([ADR-0007](docs/adr/0007-eviction-policy.md)/[ADR-0012](docs/adr/0012-multi-resource-eviction.md)), keyless **SHA-256
-digest identity** ([ADR-0014](docs/adr/0014-keyless-digest-identity.md)), and a **bounded, mlock-able** memory model ([ADR-0016](docs/adr/0016-bounded-locked-memory.md)).
+digest identity** ([ADR-0014](docs/adr/0014-keyless-digest-identity.md)), and **bounded,
+mlock-able data pools** ([ADR-0016](docs/adr/0016-bounded-locked-memory.md)).
 
-Start at **[`docs/adr/README.md`](docs/adr/README.md)** — 19 ADRs covering the full design.
+Start at **[`docs/adr/README.md`](docs/adr/README.md)** — 20 ADRs covering the full design.
 For a focused explanation of the NUMA-aware head cache, HugeTLB geometry, and the two-R820
 interconnect test, read **[NUMA-local RAM heads and interconnect bandwidth](docs/numa-interconnect-bandwidth.md)**.
 The longer direct-link experiment—including nanosecond traces, tail percentiles, and probability of
 superiority—is **[Looking for NUMA latency below the network noise floor](docs/numa-first-byte-latency.md)**.
+The native data path's direct 40 Gbit/s InfiniBand measurements are in
+**[Native RDMA over InfiniBand: 256 KiB latency and throughput](docs/native-rdma-256k-performance.md)**.
+The small-object channel and short-key hashing results are summarized in
+**[Small-object channel and short-key SHA-256 performance](docs/small-object-channel-performance.md)**.
+For the storage-full path, including per-admission EVICT/BLOCK policy, exact shard reservation,
+filesystem-local reclaim, and immutable publication, read
+**[Full-filesystem writes: reservation, reclaim, and publication](docs/full-filesystem-writes.md)**.
 
 ## Protocols
 
-- **memcache (TCP):** classic text (`get`/`gets`/`set`/`add`/`replace`/`append`/`prepend`/`cas`/
-  `delete`/`incr`/`decr`/`touch`/`stats`) + the **meta** protocol (`mn`/`mg`/`ms`/`md`), TTL, and
+- **memcache (TCP):** classic text (`get`/`gets`/`set`/`add`/`replace`/`cas`/`delete`/`stats`/
+  `version`/`quit`) + the **meta** protocol (`mn`/`mg`/`ms`/`md`), TTL, and
   **CAS** (= a per-store ETag, essentially free). No binary protocol, no UDP, no built-in auth.
+- **memcache (native InfiniBand/RoCE):** optional reliable-connected v3 endpoint for the classic
+  operations. Commands and framing use a small one-sided control ring; every nonempty object body
+  uses registered, credit-controlled bulk windows. With the defaults, 1 MiB is four bulk writes
+  instead of roughly 5,462 192-byte inline writes. This is not TCP over IPoIB and does not fall back
+  to the old inline-body ABI. The initial server owns one QP and progress thread per connection;
+  TCP/HTTP retain their core-local multiplexed loops. See
+  [ADR-0020](docs/adr/0020-native-rdma-bulk-windows.md) and the separately installable
+  [C++/Python client](python/README.md).
 - **HTTP/1.1 (read-only):** `GET`/`HEAD`, byte ranges, conditional GET (ETag / `If-None-Match` → 304),
   `Content-Type`, `Accept-Ranges`. **No write surface by design** (edge-cache role; put a writer in
   front). **HTTPS** via OpenSSL + **kTLS** with SNI cert selection.
 
 > **Status:** working memcache + HTTP/HTTPS server on io_uring + O_DIRECT — 3-tier store, atomic
-> publish, zero-copy head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **153 unit-test cases
-> run under Release, ASan, and TSan.** macOS is a non-goal (no io_uring / O_DIRECT analog); FreeBSD
-> (kqueue/aio) is a planned port.
+> publish, RAM-head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **213 unit-test
+> cases, with Release, ASan/UBSan, and TSan coverage.** macOS is a non-goal (no io_uring / O_DIRECT
+> analog); FreeBSD (kqueue/aio) is a planned port.
 
 ## Dependencies
 
 **Build:** **C++23** compiler (GCC ≥ 14, developed on GCC 16; or Clang ≥ 18), **CMake ≥ 3.28** +
-**Ninja**, **OpenSSL** (`libssl-dev`, for the HTTPS listener — always linked; the key-digest SHA-256 is
-vendored so the storage path never links TLS, [ADR-0014](docs/adr/0014-keyless-digest-identity.md)), **liburing** (`liburing-dev`, the io_uring
-backend — without it the logic layers still compile but the reactor is stubbed and the server can't serve).
+**Ninja**, **OpenSSL** (`libssl-dev`, for HTTPS and the long-input SHA-256 fallback where selected;
+short-key and hardware SHA implementations are vendored, [ADR-0014](docs/adr/0014-keyless-digest-identity.md)), **liburing** (`liburing-dev`, the io_uring
+backend — without it the logic layers still compile but the server cannot serve). Native RDMA is
+optional and is built when **libibverbs** and **librdmacm** development headers are present.
 
-**Runtime:** Linux kernel ≥ 5.19 (io_uring multishot).
+**Runtime:** Linux kernel ≥ 5.19 (project io_uring support floor).
 
 ```sh
-sudo apt-get install -y build-essential cmake ninja-build libssl-dev liburing-dev
+sudo apt-get install -y build-essential cmake ninja-build libssl-dev liburing-dev \
+    libibverbs-dev librdmacm-dev
 ```
 
 ## Build & run
@@ -117,15 +141,25 @@ ctest --test-dir build --output-on-failure
 ./build/goblin-store-path-prep /mnt/ssd/pool
 ./build/goblin-store-path-prep /mnt/hdd/pool          # optional cold tier (enables 3-layer)
 
-# 3-tier: 4 GiB RAM heads, SSD prefix, HDD tail; memcache on 11211 + HTTP on 8080
+# 3-tier: 4 GiB shared resident-data RAM, SSD prefix, HDD tail; memcache + HTTP
 ./build/goblin-store --memory 4G \
     --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool \
     --memcache-port 11211 --http-port 8080
 
-# Four NUMA nodes: 100 GiB on the serving/NIC-local node, 20 GiB on each of the other three.
-# Total head-cache capacity = 100 + (3 x 20) = 160 GiB.
+# Four NUMA nodes, legacy shared mode: 100 GiB on the serving/NIC-local node and 20 GiB on
+# each of the other three. Fixed heads and packed small objects share all 160 GiB.
 ./build/goblin-store --numa 0 --memory 100G --sub-memory 20G \
     --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool
+
+# Strict split mode: fixed heads get 100 GiB local + 20 GiB per remote node (160 GiB total).
+# Packed small objects get their own 16 GiB local + 4 GiB per remote node (28 GiB total).
+./build/goblin-store --numa 0 --memory 100G --sub-memory 20G \
+    --small-memory 16G --small-sub-memory 4G \
+    --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool
+
+# Native RDMA-only memcache. Without an explicit --numa, the exact address selects its HCA node.
+./build/goblin-store --no-memcache --no-http --rdma 10.88.88.1 \
+    --memory 4G --ssd-dir /mnt/ssd/pool
 ```
 
 Key knobs (see `--help`): `--ram-head` (power-of-two per-object resident head, default 256 KiB),
@@ -133,11 +167,14 @@ Key knobs (see `--help`): `--ram-head` (power-of-two per-object resident head, d
 2 MiB on x86 and 32 MiB on Arm/LoongArch), `--io-buffers` /
 `--io-chunk` (bounded streaming RAM), `--eviction`, `--max-objects`, `--no-mlock` (dev), `--tls-cert`/
 `--tls-key` (HTTPS), `--source` (preload a directory tree), `--numa NODE` (explicit NUMA
-placement), `--sub-memory SIZE` (head-cache RAM on each non-local NUMA node), `--increment FLOAT`
-(score added per successful key read), `--decay FLOAT` (per-minute score multiplier in `(0, 1)`),
-and `--perverse` (benchmark-only inversion of preferred head-memory placement).
+placement), `--memory SIZE` / `--sub-memory SIZE` (fixed-head RAM on the local / each non-local
+NUMA node), `--small-memory SIZE` / `--small-sub-memory SIZE` (packed-small-object RAM on the local /
+each non-local node), `--increment FLOAT` (score added per successful key read), `--decay FLOAT`
+(per-minute score multiplier in `(0, 1)`), and `--perverse` (benchmark-only inversion of preferred
+head-memory placement).
 
-On Linux, every fixed pool first requests explicit HugeTLB backing using the platform page order
+On Linux, every fixed pool—including both sides of an explicit head/small-object split—first
+requests HugeTLB backing using the platform page order
 (2 MiB on x86, 32 MiB on Arm/LoongArch). `--block` is a logical allocator and promotion unit: it must
 be a power-of-two multiple of that page size, and a larger block spans several real HugeTLB pages.
 Streaming pools retain their smaller `--io-chunk` allocation granule within the same kind of backing
@@ -149,40 +186,56 @@ total a whole number of HugeTLB pages; for example, the default 16 MiB streaming
 Arm/LoongArch falls back unless it is resized (such as `--io-buffers 128` with the default 256 KiB
 chunks).
 
-On Linux, Goblin Store binds the main thread before allocating its fixed RAM arenas; the worker and
-maintenance threads inherit that affinity, and `--cores 0` uses the number of CPUs available on the
-selected NUMA node as the worker count for each enabled protocol. A strict inherited local memory
-policy also keeps the dynamic key index, I/O buffers, and thread allocations on that node. Without
-`--numa`, the node is derived from the UP Ethernet interfaces covered by the wildcard listeners. If
-those interface addresses belong to different nodes—or locality is unknown on a multi-node
-host—startup stops and reports each Linux interface name, listening address, NUMA node, and the
-corresponding `--numa NODE` override.
+On Linux, Goblin Store binds the main thread before allocating its fixed RAM arenas; serving and
+coordinator threads inherit that affinity, and `--cores 0` uses the number of CPUs available on the
+selected NUMA node as the worker count for each enabled protocol. Score-table workers instead bind
+to the node whose score memory they scan. A strict inherited local memory policy keeps the dynamic
+key index, I/O buffers, and ordinary thread allocations on the serving node. Without `--numa`, the
+serving node is derived from the UP Ethernet interfaces covered by the wildcard listeners. If those
+interface addresses belong to different nodes—or locality is unknown on a multi-node host—startup
+stops and reports each Linux interface name, listening address, NUMA node, and the corresponding
+`--numa NODE` override.
 
 `--perverse` leaves the serving threads, key index, I/O pools, and inherited default memory policy on
-that selected NIC-local node, but maps the preferred region-zero `--memory` head arena on the online
-node with the greatest Linux NUMA distance. Equal distances choose the lowest node ID. This is a
-benchmark control for comparing local and remote DRAM with an otherwise identical CPU/NIC path; it
-is rejected with `--no-numa` and on a single-node machine.
+that selected NIC-local node, but maps the preferred region-zero `--memory` head arena—and an
+explicit `--small-memory` arena—on the online node with the greatest Linux NUMA distance. Equal
+distances choose the lowest node ID. This is a benchmark control for comparing local and remote DRAM
+with an otherwise identical CPU/NIC path; it is rejected with `--no-numa` and on a single-node
+machine.
 
-With explicit `--numa`, `--memory` is the head-cache budget on that local node. Optional
-`--sub-memory` adds the stated budget on **each** other online NUMA node and is rejected without an
-explicit `--numa`. Each arena range is bound to its physical node with Linux `mbind(MPOL_BIND)`. The
-allocator always searches local blocks first—including local blocks returned after foreign memory
-has been used—and falls through to foreign regions only when the local region cannot satisfy the
-allocation. Total head-cache capacity is `--memory + (other_nodes × --sub-memory)`; bounded streaming
-I/O pools remain additional per-worker memory. In benchmark-only perverse mode, "local" in this
-allocator policy means the deliberately far preferred region; subordinate regions include the real
-serving node, so promotion is intentionally inverted as well.
+`--memory` is the local fixed-head budget. With explicit `--numa`, optional `--sub-memory` adds the
+stated fixed-head budget on **each** other online NUMA node. By default, packed small objects continue
+to use those same blocks, preserving the legacy shared-pool policy and capacity. Supplying
+`--small-memory` opts into a strict split: fixed heads may allocate only from the `--memory` /
+`--sub-memory` pool, while packed small objects may allocate only from their dedicated local
+`--small-memory` pool and optional per-remote-node `--small-sub-memory` regions. Neither class borrows
+unused blocks from the other. `--small-sub-memory` requires both `--small-memory` and explicit
+`--numa`, just as `--sub-memory` requires explicit `--numa`.
+
+Every nonzero configured budget must be a whole multiple of `--block` (and therefore of the platform
+HugeTLB page size). Each configured range is bound to its physical node with Linux `mbind(MPOL_BIND)`, attempts
+HugeTLB independently, and falls back to ordinary locked memory without changing its size or block
+geometry. Each pool searches its local blocks first and falls through to its own foreign regions
+only when local capacity is exhausted. In split mode, fixed-head capacity is
+`--memory + (other_nodes × --sub-memory)` and packed-small-object capacity is
+`--small-memory + (other_nodes × --small-sub-memory)`. Bounded streaming read-I/O pools remain
+additional per-worker memory, while the write-staging pool is shared by the store. In benchmark-only
+perverse mode, "local" for both resident pools means the deliberately far preferred region;
+subordinate regions include the real serving node, so fixed-head promotion is intentionally inverted
+as well. Packed small-object blocks are never NUMA-promotion candidates.
 
 Each key starts with a score of zero. A successful logical read adds `--increment` (default `1.0`),
-and once per minute every score is multiplied by `--decay` (default `0.5`). With foreign head-memory
-regions, a local maintenance thread compares the summed key score of complete buddy blocks: while the
-hottest eligible foreign block is hotter than the coldest eligible local block, their contents and
-allocator state are exchanged and the affected key locators are rewritten. Pinned, partially filled,
-in-flight, and compactable small-object arena blocks are not moved. When no safe score inversion
-exists, the thread waits one second before scanning again. The minute rescore has priority: once it
-announces that it is pending, no new promotion starts; an active block exchange finishes and then the
-entire decay traversal runs without promotion ([ADR-0019](docs/adr/0019-access-score-numa-promotion.md)).
+and once per minute every score is multiplied by `--decay` (default `0.5`). A fixed resident head's
+score lives only in a dense `std::atomic<double>` array on the same NUMA node as its bytes; fractional
+or headless objects keep their atomic score in the key index. Per-node workers scan and decay their
+own dense arrays, returning only compact extrema summaries to the local coordinator. While the
+hottest eligible foreign block is hotter than the coldest eligible local block, their contents,
+score slices, and allocator state are exchanged and the affected key locators are rewritten. Pinned,
+partially filled, in-flight, and compactable small-object arena blocks are not moved. When no safe
+score inversion exists, the coordinator waits one second before scanning again. The minute rescore
+has priority: once it announces that it is pending, no new promotion starts; an active block exchange
+finishes and then the entire decay traversal runs without promotion
+([ADR-0019](docs/adr/0019-access-score-numa-promotion.md)).
 
 FPGA NICs and direct userspace networking are on the product development path. They will allow NIC
 queues, workers, RAM heads, and hardware timestamps to share one NUMA node while removing the kernel
@@ -192,15 +245,15 @@ TCP path from first-payload-byte measurements.
 ```
 src/goblin/common/    types, error (std::expected), config + validation
 src/goblin/core/      RAM block/buddy allocator, io_uring reactor, thread-per-core runtime
-src/goblin/crypto/    vendored SHA-256 (keyless digest identity)
+src/goblin/crypto/    multi-backend SHA-256 (keyless digest identity)
 src/goblin/storage/   positional layout, drive-pool striping, index, tiering, eviction
 src/goblin/net/       shared stream loop (memcache / HTTP / HTTPS subclasses)
 src/goblin/protocol/  memcache text + meta front-end
 src/goblin/http/      HTTP request/response, key derivation
 src/goblin/tls/       OpenSSL + kTLS, SNI
 src/goblin/tools/     goblin-store-path-prep, goblin-bench
-tests/                dependency-free unit tests (Release + ASan + TSan)
-docs/adr/             19 architecture decision records
+tests/                dependency-free unit tests (Release + ASan/UBSan + TSan)
+docs/adr/             20 architecture decision records
 ```
 
 ## License

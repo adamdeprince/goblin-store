@@ -18,6 +18,27 @@ namespace fs = std::filesystem;
 using namespace goblin;
 using namespace goblin::storage;
 
+TEST("striped_io: ENOSPC preserves an out_of_space classification and failed drive") {
+#if defined(__linux__)
+    const int fd = ::open("/dev/full", O_WRONLY);
+    if (fd < 0) {
+        std::println("    (skipped: /dev/full unavailable)");
+        return;
+    }
+    const DrivePool pool(/*N=*/1, 4 * KiB);
+    const std::array<int, 1> fds{fd};
+    const std::array<std::byte, 4 * KiB> bytes{};
+    unsigned failed_drive = 99;
+    const auto written = striped_pwrite(pool, 0, fds, 0, bytes, &failed_drive);
+    CHECK(!written.has_value());
+    if (!written) CHECK_EQ(written.error().code, Errc::out_of_space);
+    CHECK_EQ(failed_drive, 0u);
+    ::close(fd);
+#else
+    std::println("    (skipped: /dev/full ENOSPC probe is Linux-only)");
+#endif
+}
+
 TEST("striped_io: scatter a 40 KiB object across 4 drives, gather it back through io_uring") {
     if (!core::Reactor::available()) {
         std::println("    (skipped: built without liburing)");

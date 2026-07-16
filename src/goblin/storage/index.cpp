@@ -1,8 +1,19 @@
 #include "goblin/storage/index.hpp"
 
+#include <cassert>
+#include <bit>
+#include <cmath>
 #include <mutex> // std::unique_lock
 
 namespace goblin::storage {
+
+namespace {
+
+constexpr std::uint64_t kExternalScoreBits = UINT64_C(0x7ff8000000000000);
+
+double external_score_marker() noexcept { return std::bit_cast<double>(kExternalScoreBits); }
+
+} // namespace
 
 Index::Index(unsigned shard_bits)
     : shards_(std::make_unique<Shard[]>(std::size_t{1} << shard_bits)),
@@ -34,6 +45,21 @@ void Index::set(const Digest& d, const ObjectMeta& m) {
     const auto [it, inserted] = s.map.try_emplace(d, m);
     if (!inserted)
         it->second.meta = m; // replacing a value does not erase the key's accumulated heat
+}
+
+void Index::set_with_score(const Digest& d, const ObjectMeta& m,
+                           std::optional<double> local_score) {
+    if (local_score && (std::isnan(*local_score) || *local_score < 0.0)) {
+        assert(false && "a numeric index score must be nonnegative and not NaN");
+        return;
+    }
+
+    Shard& s = shard_for(d);
+    std::unique_lock lk(s.mu);
+    const auto [it, inserted] = s.map.try_emplace(d, m);
+    if (!inserted) it->second.meta = m;
+    it->second.score.store(local_score.value_or(external_score_marker()),
+                           std::memory_order_relaxed);
 }
 
 bool Index::add(const Digest& d, const ObjectMeta& m) {
@@ -76,12 +102,19 @@ bool Index::update_expiry(const Digest& d, std::uint32_t expiry) {
 }
 
 bool Index::increment_score(const Digest& d, double increment) {
+    if (!std::isfinite(increment) || increment <= 0.0) return false;
     Shard& s = shard_for(d);
     std::shared_lock lk(s.mu); // keeps the entry alive while the relaxed atomic is updated
     const auto it = s.map.find(d);
     if (it == s.map.end()) return false;
-    it->second.score.fetch_add(increment, std::memory_order_relaxed);
-    return true;
+    double current = it->second.score.load(std::memory_order_relaxed);
+    while (!std::isnan(current)) {
+        if (it->second.score.compare_exchange_weak(current, current + increment,
+                                                   std::memory_order_relaxed,
+                                                   std::memory_order_relaxed))
+            return true;
+    }
+    return false;
 }
 
 std::optional<double> Index::score(const Digest& d) const {
@@ -89,18 +122,63 @@ std::optional<double> Index::score(const Digest& d) const {
     std::shared_lock lk(s.mu);
     const auto it = s.map.find(d);
     if (it == s.map.end()) return std::nullopt;
-    return it->second.score.load(std::memory_order_relaxed);
+    const double value = it->second.score.load(std::memory_order_relaxed);
+    if (std::isnan(value)) return std::nullopt;
+    return value;
+}
+
+bool Index::score_external(const Digest& d) const {
+    const Shard& s = shard_for(d);
+    std::shared_lock lk(s.mu);
+    const auto it = s.map.find(d);
+    return it != s.map.end() &&
+           std::isnan(it->second.score.load(std::memory_order_relaxed));
+}
+
+std::optional<double> Index::extract_score(const Digest& d) {
+    Shard& s = shard_for(d);
+    std::shared_lock lk(s.mu);
+    const auto it = s.map.find(d);
+    if (it == s.map.end()) return std::nullopt;
+
+    double current = it->second.score.load(std::memory_order_relaxed);
+    while (!std::isnan(current)) {
+        if (it->second.score.compare_exchange_weak(current, external_score_marker(),
+                                                   std::memory_order_relaxed,
+                                                   std::memory_order_relaxed))
+            return current;
+    }
+    return std::nullopt;
+}
+
+bool Index::restore_score(const Digest& d, double value) {
+    if (std::isnan(value) || value < 0.0) return false;
+
+    Shard& s = shard_for(d);
+    std::shared_lock lk(s.mu);
+    const auto it = s.map.find(d);
+    if (it == s.map.end()) return false;
+
+    double current = it->second.score.load(std::memory_order_relaxed);
+    while (std::isnan(current)) {
+        if (it->second.score.compare_exchange_weak(current, value, std::memory_order_relaxed,
+                                                   std::memory_order_relaxed))
+            return true;
+    }
+    return false;
 }
 
 void Index::decay_scores(double decay) {
+    if (!std::isfinite(decay) || decay <= 0.0 || decay >= 1.0) return;
     for (std::size_t i = 0; i < nshards_; ++i) {
         std::shared_lock lk(shards_[i].mu); // erase waits; score updates remain independent
         for (auto& [digest, entry] : shards_[i].map) {
             (void)digest;
             double current = entry.score.load(std::memory_order_relaxed);
-            while (!entry.score.compare_exchange_weak(current, current * decay,
-                                                      std::memory_order_relaxed,
-                                                      std::memory_order_relaxed)) {
+            while (!std::isnan(current) &&
+                   !entry.score.compare_exchange_weak(current, current * decay,
+                                                       std::memory_order_relaxed,
+                                                       std::memory_order_relaxed)) {
             }
         }
     }
@@ -138,19 +216,6 @@ std::vector<std::pair<Digest, HeadLoc>> Index::resident_heads() const {
         std::shared_lock lk(shards_[i].mu);
         for (const auto& [d, entry] : shards_[i].map)
             if (entry.meta.head.resident()) out.push_back({d, entry.meta.head});
-    }
-    return out;
-}
-
-std::vector<ScoredHead> Index::scored_resident_heads() const {
-    std::vector<ScoredHead> out;
-    for (std::size_t i = 0; i < nshards_; ++i) {
-        std::shared_lock lk(shards_[i].mu);
-        for (const auto& [d, entry] : shards_[i].map) {
-            if (!entry.meta.head.resident()) continue;
-            out.push_back(
-                {d, entry.meta.head, entry.score.load(std::memory_order_relaxed)});
-        }
     }
     return out;
 }

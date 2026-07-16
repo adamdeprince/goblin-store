@@ -4,11 +4,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <limits>
 #include <optional>
 #include <span>
+#include <thread>
 #include <vector>
 
 using namespace goblin;
@@ -56,9 +58,9 @@ void publish(NumaHeadScoreTable& table, unsigned block, double first, double sec
 
 } // namespace
 
-TEST("numa score scan: scalar and automatic paths match tails of every AVX width") {
-    // Four doubles fit in one AVX1 vector. Test empty input, every partial-vector tail, and several
-    // complete vectors. The fixed pattern also puts eligible and ineligible values in every lane.
+TEST("numa score scan: scalar path handles every short-span length") {
+    // Exercise empty input, unequal spans, and a range of short and longer arrays. The fixed
+    // pattern puts eligible and ineligible values at several positions.
     for (std::size_t count = 0; count <= 19; ++count) {
         std::vector<double> scores(count);
         std::vector<double> eligible(count, 1.0);
@@ -67,22 +69,17 @@ TEST("numa score scan: scalar and automatic paths match tails of every AVX width
             if ((i + count) % 5 == 2) eligible[i] = 0.0;
         }
         if (count > 1) {
-            scores[count - 1] = -1000.0 - static_cast<double>(count); // scalar tail for most sizes
+            scores[count - 1] = -1000.0 - static_cast<double>(count);
             eligible[count - 1] = 1.0;
         }
         if (count > 4) {
-            scores[3] = 1000.0 + static_cast<double>(count); // last lane of the first vector
+            scores[3] = 1000.0 + static_cast<double>(count);
             eligible[3] = 1.0;
         }
 
         const auto expected = reference_extrema(scores, eligible);
         check_extrema(scan_score_extrema_scalar(scores, eligible), expected);
-        check_extrema(scan_score_extrema(scores, eligible), expected);
     }
-
-    // The availability query is intentionally exercised on every architecture. Automatic scanning
-    // is required to retain scalar semantics whether this reports true or false.
-    (void)avx_score_scan_available();
 }
 
 TEST("numa score scan: ties, eligibility, NaN, infinity, and common-prefix length") {
@@ -95,16 +92,39 @@ TEST("numa score scan: ties, eligibility, NaN, infinity, and common-prefix lengt
     // infinities remain valid, and equal finite maxima would choose the lower index.
     const ScoreExtrema expected{ScoreCandidate{2, -inf}, ScoreCandidate{4, inf}};
     check_extrema(scan_score_extrema_scalar(scores, eligible), expected);
-    check_extrema(scan_score_extrema(scores, eligible), expected);
 
     const std::array tied_scores{7.0, 2.0, 7.0, 2.0, 7.0};
     const std::array all_eligible{1.0, 1.0, 1.0, 1.0, 1.0};
     const ScoreExtrema tied_expected{ScoreCandidate{1, 2.0}, ScoreCandidate{0, 7.0}};
     check_extrema(scan_score_extrema_scalar(tied_scores, all_eligible), tied_expected);
-    check_extrema(scan_score_extrema(tied_scores, all_eligible), tied_expected);
 
     const std::array none_eligible{0.0, 0.0, 0.0, 0.0, 0.0};
-    check_extrema(scan_score_extrema(tied_scores, none_eligible), ScoreExtrema{});
+    check_extrema(scan_score_extrema_scalar(tied_scores, none_eligible), ScoreExtrema{});
+}
+
+TEST("numa head score table: slot ownership is exclusive and transferable") {
+    const std::array regions{NumaScoreRegionConfig{0, 1, std::nullopt, {}}};
+    auto made = NumaHeadScoreTable::create(8 * KiB, 4 * KiB, regions);
+    CHECK(made.has_value());
+    if (!made) return;
+    auto& table = *made;
+    const HeadLoc loc = head(0, 0);
+
+    CHECK(table.publish(loc, 7.5).has_value());
+    CHECK(!table.publish(loc, 99.0).has_value());
+    CHECK_EQ(*table.score(loc), 7.5);
+
+    const auto extracted = table.extract(loc);
+    CHECK(extracted.has_value());
+    if (extracted) CHECK_EQ(*extracted, 7.5);
+    CHECK(!table.score(loc).has_value());
+    CHECK(!table.extract(loc).has_value());
+    CHECK(!table.erase(loc).has_value());
+
+    CHECK(table.publish(loc, 3.0).has_value());
+    CHECK(table.erase(loc).has_value());
+    CHECK(!table.score(loc).has_value());
+    CHECK(!table.erase(loc).has_value());
 }
 
 TEST("numa head score table: dense slots map block and offset to the right score") {
@@ -247,4 +267,81 @@ TEST("numa head score table: increment and decay preserve dense slots") {
 
     CHECK(table.erase(head(0, 4 * KiB)).has_value());
     CHECK(!table.score(head(0, 4 * KiB)).has_value());
+}
+
+TEST("numa head score table: concurrent increments produce an exact atomic total") {
+    const std::array regions{NumaScoreRegionConfig{0, 1, std::nullopt, {}}};
+    auto made = NumaHeadScoreTable::create(8 * KiB, 4 * KiB, regions);
+    CHECK(made.has_value());
+    if (!made) return;
+    auto& table = *made;
+    const HeadLoc loc = head(0, 0);
+    CHECK(table.publish(loc, 0.0).has_value());
+
+    constexpr int kThreads = 8;
+    constexpr int kIncrements = 10'000;
+    std::atomic<bool> start{false};
+    std::atomic<bool> operations_ok{true};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int i = 0; i < kIncrements; ++i)
+                if (!table.increment(loc, 1.0))
+                    operations_ok.store(false, std::memory_order_relaxed);
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) thread.join();
+
+    CHECK(operations_ok.load(std::memory_order_relaxed));
+    const auto final_score = table.score(loc);
+    CHECK(final_score.has_value());
+    if (final_score) CHECK_EQ(*final_score, static_cast<double>(kThreads * kIncrements));
+}
+
+TEST("numa head score table: increments and node-local decay can race safely") {
+    const std::array regions{NumaScoreRegionConfig{0, 1, std::nullopt, {}}};
+    auto made = NumaHeadScoreTable::create(8 * KiB, 4 * KiB, regions);
+    CHECK(made.has_value());
+    if (!made) return;
+    auto& table = *made;
+    const HeadLoc loc = head(0, 0);
+    CHECK(table.publish(loc, 0.0).has_value());
+
+    constexpr int kReaders = 4;
+    constexpr int kIncrements = 20'000;
+    constexpr int kDecays = 2'000;
+    constexpr double kAmount = 0.125;
+    std::atomic<bool> start{false};
+    std::atomic<bool> operations_ok{true};
+    std::vector<std::thread> readers;
+    readers.reserve(kReaders);
+    for (int t = 0; t < kReaders; ++t) {
+        readers.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int i = 0; i < kIncrements; ++i)
+                if (!table.increment(loc, kAmount))
+                    operations_ok.store(false, std::memory_order_relaxed);
+        });
+    }
+    std::thread decayer([&] {
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        for (int i = 0; i < kDecays; ++i)
+            if (!table.decay(0.999)) operations_ok.store(false, std::memory_order_relaxed);
+    });
+
+    start.store(true, std::memory_order_release);
+    for (auto& reader : readers) reader.join();
+    decayer.join();
+
+    CHECK(operations_ok.load(std::memory_order_relaxed));
+    const auto final_score = table.score(loc);
+    CHECK(final_score.has_value());
+    if (final_score) {
+        CHECK(std::isfinite(*final_score));
+        CHECK(*final_score >= 0.0);
+        CHECK(*final_score <= static_cast<double>(kReaders * kIncrements) * kAmount);
+    }
 }

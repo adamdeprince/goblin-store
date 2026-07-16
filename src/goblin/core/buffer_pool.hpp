@@ -74,12 +74,18 @@ private:
     Size live_ = 0;     // sum of live slot sizes (rounded); block is reclaimable when this hits 0
 };
 
-// One physical part of a BlockPool. Regions are ordered by allocation preference. A NUMA node
-// selects that node's hugetlb pool first and otherwise applies MPOL_BIND to a normal mapping;
-// nullopt is useful for the ordinary allocator and tests.
+// Fixed-head and small-object reservations share one BlockPool (and therefore one block/address
+// namespace), but allocations from either reservation never borrow from the other. `shared` keeps
+// the original policy in which both kinds of allocation compete for the same regions.
+enum class BufferPoolClass : std::uint8_t { shared, fixed_head, small_object };
+
+// One physical part of a BlockPool. Regions are ordered by allocation preference within an
+// allocation class. A NUMA node selects that node's hugetlb pool first and otherwise applies
+// MPOL_BIND to a normal mapping; nullopt is useful for the ordinary allocator and tests.
 struct BlockPoolRegion {
     Size bytes = 0;
     std::optional<unsigned> numa_node;
+    BufferPoolClass allocation_class = BufferPoolClass::shared;
 };
 
 class BlockPool {
@@ -111,6 +117,7 @@ public:
     unsigned region_first_block(std::size_t region) const noexcept;
     unsigned region_end_block(std::size_t region) const noexcept;
     std::optional<unsigned> region_numa_node(std::size_t region) const noexcept;
+    BufferPoolClass region_allocation_class(std::size_t region) const noexcept;
     std::optional<std::size_t> block_region(unsigned block) const noexcept;
     std::optional<unsigned> block_numa_node(unsigned block) const noexcept;
     bool region_uses_hugetlb(std::size_t region) const noexcept;
@@ -121,6 +128,7 @@ private:
         unsigned first_block = 0;
         unsigned end_block = 0; // exclusive
         std::optional<unsigned> numa_node;
+        BufferPoolClass allocation_class = BufferPoolClass::shared;
         std::vector<unsigned> free;
         std::byte* base = nullptr;
         Size bytes = 0;
@@ -161,8 +169,12 @@ public:
     };
 
     // `min_alloc` selects the block class (buddy min-order); a block is typed on first use and only
-    // reused by allocations of the same class. nullopt if no room or bytes > block.
-    std::optional<Region> allocate(std::uint32_t bytes, Size min_alloc);
+    // reused by allocations of the same class. `allocation_class` restricts the search to matching
+    // physical regions, so reserved fixed-head and small-object pools cannot borrow from each other.
+    // The default preserves the original shared-pool API. nullopt if no matching room or bytes > block.
+    std::optional<Region> allocate(
+        std::uint32_t bytes, Size min_alloc,
+        BufferPoolClass allocation_class = BufferPoolClass::shared);
     void deallocate(unsigned block, std::uint32_t offset, std::uint32_t bytes);
     std::byte* addr(unsigned block, std::uint32_t offset) const noexcept;
 
@@ -178,6 +190,10 @@ public:
     std::optional<unsigned> region_numa_node(std::size_t region) const noexcept {
         return blocks_.region_numa_node(region);
     }
+    BufferPoolClass region_allocation_class(std::size_t region) const noexcept {
+        return blocks_.region_allocation_class(region);
+    }
+    // True when the block belongs to the first (preferred/local) region for its allocation class.
     bool block_is_local(unsigned block) const noexcept;
     std::optional<std::size_t> block_region(unsigned block) const noexcept {
         return blocks_.block_region(block);

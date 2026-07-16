@@ -11,13 +11,14 @@ void S3Fifo::insert(const Digest& d) {
         it->second.visited = true; // already cached -> treat as a hit
         return;
     }
-    if (ghost_set_.erase(d) > 0) { // recently evicted -> straight to main
-        meta_.emplace(d, Entry{Q::main, false});
-        main_.push_back(d);
+    const std::uint64_t ticket = next_ticket();
+    if (ghost_tickets_.erase(d) > 0) { // recently evicted -> straight to main
+        meta_.emplace(d, Entry{Q::main, false, ticket});
+        main_.push_back(QueueNode{d, ticket});
         ++main_n_;
     } else {
-        meta_.emplace(d, Entry{Q::small, false});
-        small_.push_back(d);
+        meta_.emplace(d, Entry{Q::small, false, ticket});
+        small_.push_back(QueueNode{d, ticket});
         ++small_n_;
     }
 }
@@ -34,26 +35,30 @@ void S3Fifo::remove(const Digest& d) {
             --main_n_;
         meta_.erase(it);
     }
-    ghost_set_.erase(d);
+    ghost_tickets_.erase(d);
 }
 
-std::optional<Digest> S3Fifo::pop_front_resident(std::deque<Digest>& q, Q which) {
+std::optional<Digest> S3Fifo::pop_front_resident(std::deque<QueueNode>& q, Q which) {
     while (!q.empty()) {
-        const Digest d = q.front();
+        const QueueNode node = q.front();
         q.pop_front();
-        const auto it = meta_.find(d);
-        if (it != meta_.end() && it->second.q == which) return d;
-        // else stale (removed, or promoted to the other queue) -> skip
+        const auto it = meta_.find(node.digest);
+        if (it != meta_.end() && it->second.q == which && it->second.ticket == node.ticket)
+            return node.digest;
+        // Else stale: removed, promoted, or an older incarnation of the same digest.
     }
     return std::nullopt;
 }
 
-void S3Fifo::ghost_push(const Digest& d) {
-    ghost_.push_back(d);
-    ghost_set_.insert(d);
+void S3Fifo::ghost_push(const Digest& d, std::uint64_t ticket) {
+    ghost_.push_back(QueueNode{d, ticket});
+    ghost_tickets_.insert_or_assign(d, ticket);
     while (ghost_.size() > cap_) {
-        ghost_set_.erase(ghost_.front());
+        const QueueNode old = ghost_.front();
         ghost_.pop_front();
+        const auto current = ghost_tickets_.find(old.digest);
+        if (current != ghost_tickets_.end() && current->second == old.ticket)
+            ghost_tickets_.erase(current);
     }
 }
 
@@ -75,13 +80,15 @@ std::optional<Digest> S3Fifo::evict() {
             --small_n_;
             const auto it = meta_.find(*d);
             if (it->second.visited) {
-                it->second = Entry{Q::main, false};
-                main_.push_back(*d);
+                it->second.q = Q::main;
+                it->second.visited = false;
+                main_.push_back(QueueNode{*d, it->second.ticket});
                 ++main_n_;
                 continue;
             }
+            const std::uint64_t ticket = it->second.ticket;
             meta_.erase(it);
-            ghost_push(*d);
+            ghost_push(*d, ticket);
             return d;
         }
         // small drained (all promoted) -> fall through to main
@@ -92,7 +99,7 @@ std::optional<Digest> S3Fifo::evict() {
         const auto it = meta_.find(*d);
         if (it->second.visited) {
             it->second.visited = false;
-            main_.push_back(*d);
+            main_.push_back(QueueNode{*d, it->second.ticket});
             continue;
         }
         --main_n_;

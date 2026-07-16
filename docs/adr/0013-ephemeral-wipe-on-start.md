@@ -14,7 +14,8 @@ Durable/recoverable operation is deferred to a future "professional" version.
 - **Marker-gated wipe.** A pool directory is wiped to a blank slate at startup **only if it
   contains a `.goblin-store-marker` file**. If the marker is absent, Goblin **aborts and refuses
   to start** — so a fat-fingered `--ssd-dir /var` can never erase anything. The wipe removes all
-  object / partial files but **preserves the marker** (otherwise the next restart would abort).
+  immutable `<digest>.g<generation>` files, including unpublished generations left by a crash, but
+  **preserves the marker** (otherwise the next restart would abort).
 - **A separate one-time prep tool blesses directories:** `goblin-store-path-prep /a/b/c ...`
   - `mkdir -p` the path (or confirm it already exists), then
   - **refuse if the directory contains anything** (it will only mark an empty / freshly-created
@@ -24,12 +25,14 @@ Durable/recoverable operation is deferred to a future "professional" version.
     tool refuses to place anywhere non-empty.
   - *(Re-running prep on an already-blessed dir fails — it now contains the marker, so it's
     non-empty. An idempotent "already prepared → ok" can be added later if wanted.)*
-- **Fast blank slate despite many small files** ([ADR-0012](0012-multi-resource-eviction.md)
-  partial-fill reality): move everything except the marker into a `goblin-trash.<pid>/` sidecar
-  inside the pool dir and unlink it in the background, so startup isn't blocked unlinking
-  potentially millions of files.
+- **Synchronous blank slate.** Startup removes every entry except the marker with `remove_all`
+  before the pools are opened. This is simple and deterministic, but a directory containing many
+  generation files can make startup wait for their removal. A rename-to-trash/background-unlink
+  path remains a possible optimization.
 
 ## Consequences
-- ➕ No crash-recovery, no index persistence/rebuild, no durability bookkeeping — a large v1 simplification. Atomic-publish partials ([ADR-0010](0010-write-admission-modes.md)) are cleaned by the wipe.
+- ➕ No crash-recovery, no index persistence/rebuild, no durability bookkeeping — a large v1
+  simplification. Unpublished or retired generation files left by a crash
+  ([ADR-0010](0010-write-admission-modes.md)) are cleaned by the wipe.
 - ➖ Cold start is always empty (no warm cache after a restart) — acceptable for a cache; the "professional" version adds persistence/recovery.
 - ➖ Operators must run `goblin-store-path-prep` on scratch dirs first; the marker gate plus the prep tool's empty-only rule prevent collateral deletion.

@@ -8,6 +8,7 @@
 #include "goblin/http/key_derivation.hpp"
 #include "goblin/http/source_loader.hpp"
 #include "goblin/net/numa.hpp"
+#include "goblin/net/rdma_server.hpp"
 #include "goblin/protocol/memcache/server.hpp"
 #include "goblin/storage/pool_dir.hpp"
 
@@ -75,10 +76,12 @@ void print_help() {
     std::println(
         "goblin-store — large-object tiered cache / HTTP object server (scaffold)\n"
         "usage: goblin-store [options]\n"
-        "  --memory SIZE       local NUMA head RAM, mlock'd          [default 1G]\n"
-        "  --sub-memory SIZE   RAM on each non-local NUMA node       [requires --numa]\n"
+        "  --memory SIZE       local NUMA fixed-head RAM, mlock'd    [default 1G]\n"
+        "  --sub-memory SIZE   fixed-head RAM on each remote node    [requires --numa]\n"
+        "  --small-memory SIZE dedicated local small-object RAM      [omitted: legacy shared pool]\n"
+        "  --small-sub-memory SIZE  small-object RAM on each remote node [requires --small-memory, --numa]\n"
         "  --block SIZE        allocation/promotion block, power of two HugeTLB multiple [default {}]\n"
-        "  --small-min-alloc SIZE  RAM min-order for <=ram-head heads [default 16]\n"
+        "  --small-min-alloc SIZE  RAM min-order for <ram-head heads  [default 16]\n"
         "  --ssd-dir DIR       SSD pool directory (repeatable, >=1 required)\n"
         "  --hdd-dir DIR       HDD cold-pool directory (repeatable; enables 3-layer)\n"
         "  --ram-head SIZE     packed per-object RAM head, power of two [default 256K]\n"
@@ -87,6 +90,11 @@ void print_help() {
         "  --io-buffers N      streaming I/O buffers per worker      [default 64]\n"
         "  --io-timeout MS     drop a stalled transfer (slow client) [default 30000, 0=off]\n"
         "  --memcache-port N   memcache/TCP port                     [default 11211]\n"
+        "  --rdma ADDRESS      native RDMA memcache bind address      [disabled]\n"
+        "  --rdma-port N       native RDMA memcache port              [default 11211]\n"
+        "  --rdma-ring SIZE    control-ring budget per connection     [default 64K]\n"
+        "  --rdma-window SIZE  registered bulk window size            [default 256K]\n"
+        "  --rdma-windows N    bulk windows per direction             [default 4]\n"
         "  --http-port N       HTTP port                             [default 8080]\n"
         "  --cores N           workers/protocol, 0=node CPU count    [default 0]\n"
         "  --numa NODE         bind all threads to this NUMA node    [default listener NIC]\n"
@@ -106,7 +114,7 @@ void print_help() {
         "  --no-mlock          don't mlock the RAM pool (dev; raise RLIMIT_MEMLOCK in prod)\n"
         "  --no-read-ahead     disable double-buffered GET read-ahead (serial; for A/B benchmarking)\n"
         "  --eviction NAME     head-cache eviction policy: s3fifo (only one implemented yet)\n"
-        "  --max-objects N     cap on stored objects (0 = unbounded); evicts whole objects over it\n"
+        "  --max-objects N     cap disk-backed objects (0 = unbounded); evicts whole objects over it\n"
         "  --net MODE          network: async (default, io_uring loop) | blocking\n"
         "  --tls-cert FILE     PEM cert chain; enables HTTPS. Repeat per domain — SNI selects\n"
         "  --tls-key FILE      PEM private key, paired with the preceding --tls-cert\n"
@@ -139,6 +147,11 @@ int main(int argc, char** argv) {
         else if (a == "--ssd-dir") { auto v = take(a); if (!v) return 2; cfg.ssd.dirs.emplace_back(*v); }
         else if (a == "--hdd-dir") { auto v = take(a); if (!v) return 2; cfg.hdd.dirs.emplace_back(*v); }
         else if (a == "--source")  { auto v = take(a); if (!v) return 2; cfg.sources.emplace_back(*v); }
+        else if (a == "--rdma") {
+            auto v = take(a); if (!v) return 2;
+            cfg.rdma.enabled = true;
+            cfg.rdma.address = std::string(*v);
+        }
         else if (a == "--http-vhost")     { cfg.http_vhost = true; }
         else if (a == "--key-on-query")   { cfg.key_on_query = true; }
         else if (a == "--key-strip-slash") { cfg.key_strip_slash = true; }
@@ -164,7 +177,10 @@ int main(int argc, char** argv) {
         else if (a == "--tls-cert")  { auto v = take(a); if (!v) return 2; cfg.tls_cert_paths.emplace_back(*v); }
         else if (a == "--tls-key")   { auto v = take(a); if (!v) return 2; cfg.tls_key_paths.emplace_back(*v); }
         else if (a == "--https-port") { auto v = take(a); if (!v) return 2; auto p = parse_int<std::uint16_t>(*v); if (!p) { bad("port", *v); return 2; } cfg.https_port = *p; }
-        else if (a == "--memory" || a == "--sub-memory" || a == "--block" || a == "--ram-head" || a == "--ssd-prefix" || a == "--io-chunk" || a == "--small-min-alloc") {
+        else if (a == "--memory" || a == "--sub-memory" || a == "--small-memory" ||
+                 a == "--small-sub-memory" || a == "--block" || a == "--ram-head" ||
+                 a == "--ssd-prefix" || a == "--io-chunk" || a == "--small-min-alloc" ||
+                 a == "--rdma-ring" || a == "--rdma-window") {
             auto v = take(a); if (!v) return 2;
             auto s = parse_size(*v); if (!s) { bad("size", *v); return 2; }
             if (a == "--memory")               cfg.memory.total_bytes = *s;
@@ -172,16 +188,28 @@ int main(int argc, char** argv) {
                 if (*s == 0) { bad("sub-memory", *v); return 2; }
                 cfg.memory.sub_bytes = *s;
             }
+            else if (a == "--small-memory") {
+                if (*s == 0) { bad("small-memory", *v); return 2; }
+                cfg.memory.small_total_bytes = *s;
+            }
+            else if (a == "--small-sub-memory") {
+                if (*s == 0) { bad("small-sub-memory", *v); return 2; }
+                cfg.memory.small_sub_bytes = *s;
+            }
             else if (a == "--block")           cfg.memory.block_bytes = *s;
             else if (a == "--ram-head")        cfg.tiers.ram_head = *s;
             else if (a == "--ssd-prefix")      cfg.tiers.ssd_prefix = *s;
             else if (a == "--small-min-alloc") cfg.memory.small_min_alloc = *s;
+            else if (a == "--rdma-ring")       cfg.rdma.ring_bytes = *s;
+            else if (a == "--rdma-window")     cfg.rdma.bulk_window_bytes = *s;
             else                               cfg.io_chunk_bytes = *s;
         }
-        else if (a == "--memcache-port" || a == "--http-port") {
+        else if (a == "--memcache-port" || a == "--http-port" || a == "--rdma-port") {
             auto v = take(a); if (!v) return 2;
             auto p = parse_int<std::uint16_t>(*v); if (!p) { bad("port", *v); return 2; }
-            if (a == "--memcache-port") cfg.memcache_port = *p; else cfg.http_port = *p;
+            if (a == "--memcache-port") cfg.memcache_port = *p;
+            else if (a == "--rdma-port") cfg.rdma.port = *p;
+            else cfg.http_port = *p;
         }
         else if (a == "--cores") {
             auto v = take(a); if (!v) return 2;
@@ -210,6 +238,11 @@ int main(int argc, char** argv) {
             auto n = parse_int<unsigned>(*v); if (!n || *n == 0) { bad("io-buffers", *v); return 2; }
             cfg.io_buffers = *n;
         }
+        else if (a == "--rdma-windows") {
+            auto v = take(a); if (!v) return 2;
+            auto n = parse_int<unsigned>(*v); if (!n || *n == 0) { bad("rdma-windows", *v); return 2; }
+            cfg.rdma.bulk_window_count = *n;
+        }
         else if (a == "--io-timeout") {
             auto v = take(a); if (!v) return 2;
             auto n = parse_int<unsigned>(*v); if (!n) { bad("io-timeout", *v); return 2; }
@@ -224,13 +257,25 @@ int main(int argc, char** argv) {
         std::println(stderr, "config error: {}", ok.error().detail);
         return 1;
     }
+    if (cfg.rdma.enabled && !net::rdma_server_available()) {
+        std::println(stderr,
+                     "config error: --rdma requested, but this build has no "
+                     "libibverbs/librdmacm support");
+        return 1;
+    }
 
     // Bind before allocating any pools. Local transient pools first-touch on this node; the head
     // arena receives explicit per-range NUMA policies below. Protocol workers inherit this node;
     // each score scanner later overrides the inherited CPU and memory policy for its own node.
     std::optional<net::NumaBinding> numa;
     if (cfg.numa_enabled) {
-        auto configured = net::configure_numa(cfg.numa_node, cfg.numa_perverse);
+        std::vector<std::string> exact_listener_addresses;
+        if (cfg.rdma.enabled) exact_listener_addresses.push_back(cfg.rdma.address);
+        const bool wildcard_ethernet_listener =
+            cfg.enable_memcache || cfg.enable_http || cfg.enable_https;
+        auto configured = net::configure_numa(cfg.numa_node, cfg.numa_perverse,
+                                              exact_listener_addresses,
+                                              wildcard_ethernet_listener);
         if (!configured) {
             std::println(stderr, "numa error: {}", configured.error().detail);
             return 1;
@@ -255,32 +300,74 @@ int main(int argc, char** argv) {
             cfg.memory.numa_regions.push_back(
                 {region.node, region.bytes, std::move(*cpus)});
         }
+        if (cfg.memory.small_total_bytes) {
+            const Size small_sub = cfg.memory.small_sub_bytes.value_or(0);
+            auto small_plan = net::plan_numa_memory(
+                numa->preferred_memory_node, numa->online_nodes,
+                *cfg.memory.small_total_bytes, small_sub, "--small-memory",
+                "--small-sub-memory");
+            if (!small_plan) {
+                std::println(stderr, "NUMA small-object memory error: {}",
+                             small_plan.error().detail);
+                return 1;
+            }
+            cfg.memory.small_numa_regions.clear();
+            cfg.memory.small_numa_regions.reserve(small_plan->size());
+            // Small-object arenas are placement-only; unlike fixed-head score regions, they do
+            // not own scanner threads and therefore do not require CPUs on the memory node.
+            for (const auto& region : *small_plan)
+                cfg.memory.small_numa_regions.push_back({region.node, region.bytes, {}});
+        }
     }
 
     std::println("┌─ goblin-store 0.0.2 ─────────────────────────");
     std::println("│ mode        : {}", cfg.three_layer() ? "3-layer (RAM+SSD+HDD)" : "2-layer (RAM+SSD)");
     if (numa && cfg.numa_perverse)
-        std::println("│ RAM preferred: {} on NUMA node {} (perverse; distance {} from serving node {})",
+        std::println("│ head RAM preferred: {} on NUMA node {} (perverse; distance {} from serving node {})",
                      format_size(cfg.memory.total_bytes), numa->preferred_memory_node,
                      *numa->preferred_memory_distance, numa->node);
     else if (numa)
-        std::println("│ RAM local   : {} on NUMA node {}", format_size(cfg.memory.total_bytes),
+        std::println("│ head RAM local: {} on NUMA node {}", format_size(cfg.memory.total_bytes),
                      numa->preferred_memory_node);
     else
-        std::println("│ RAM         : {} (ordinary OS placement)", format_size(cfg.memory.total_bytes));
+        std::println("│ head RAM    : {} (ordinary OS placement)", format_size(cfg.memory.total_bytes));
     if (numa && cfg.memory.sub_bytes > 0) {
         const Size foreign_nodes = cfg.memory.numa_regions.size() - 1;
         std::vector<unsigned> node_ids;
         node_ids.reserve(static_cast<std::size_t>(foreign_nodes));
         for (std::size_t i = 1; i < cfg.memory.numa_regions.size(); ++i)
             node_ids.push_back(*cfg.memory.numa_regions[i].node);
-        std::println("│ RAM foreign : {}/node on NUMA nodes {} ({} total)",
+        std::println("│ head RAM remote: {}/node on NUMA nodes {} ({} total)",
                      format_size(cfg.memory.sub_bytes), net::format_cpu_list(node_ids),
                      format_size(cfg.memory.sub_bytes * foreign_nodes));
     }
-    std::println("│ RAM total   : {} (allocation block {}, mlock={})",
+    std::println("│ head RAM total: {} (allocation block {}, mlock={})",
                  format_size(cfg.memory.arena_bytes()), format_size(cfg.memory.block_bytes),
                  cfg.memory.lock_memory);
+    if (cfg.memory.small_total_bytes) {
+        if (numa && cfg.numa_perverse)
+            std::println("│ small RAM preferred: {} on NUMA node {} (perverse)",
+                         format_size(*cfg.memory.small_total_bytes),
+                         numa->preferred_memory_node);
+        else
+            std::println("│ small RAM local: {}{}", format_size(*cfg.memory.small_total_bytes),
+                         numa ? " on NUMA node " + std::to_string(numa->preferred_memory_node)
+                              : " (ordinary OS placement)");
+        if (numa && cfg.memory.small_sub_bytes.value_or(0) > 0) {
+            const Size foreign_nodes = cfg.memory.small_numa_regions.size() - 1;
+            std::vector<unsigned> node_ids;
+            node_ids.reserve(static_cast<std::size_t>(foreign_nodes));
+            for (std::size_t i = 1; i < cfg.memory.small_numa_regions.size(); ++i)
+                node_ids.push_back(*cfg.memory.small_numa_regions[i].node);
+            std::println("│ small RAM remote: {}/node on NUMA nodes {} ({} total)",
+                         format_size(*cfg.memory.small_sub_bytes),
+                         net::format_cpu_list(node_ids),
+                         format_size(*cfg.memory.small_sub_bytes * foreign_nodes));
+        }
+        std::println("│ small RAM total: {}", format_size(cfg.memory.small_arena_bytes()));
+    } else {
+        std::println("│ small RAM   : shared with fixed-head pool (legacy mode)");
+    }
     std::println("│ ram_head    : {} / object ({} per allocation block)",
                  format_size(cfg.tiers.ram_head), cfg.memory.block_bytes / cfg.tiers.ram_head);
     std::println("│ HugeTLB     : best effort, {} pages (ordinary memory fallback)",
@@ -290,6 +377,11 @@ int main(int argc, char** argv) {
     std::println("│ hdd pool    : {} drive(s), stripe {} KiB", cfg.hdd.dirs.size(), cfg.hdd.stripe_unit / KiB);
     std::println("│ memcache    : {}", cfg.enable_memcache ? ":" + std::to_string(cfg.memcache_port)
                                                             : std::string("off"));
+    std::println("│ rdma cache  : {}", cfg.rdma.enabled
+                     ? cfg.rdma.address + ":" + std::to_string(cfg.rdma.port) + " (v3, " +
+                           format_size(cfg.rdma.bulk_window_bytes) + " x " +
+                           std::to_string(cfg.rdma.bulk_window_count) + "/direction)"
+                     : std::string("off"));
     std::println("│ http        : {}", cfg.enable_http ? ":" + std::to_string(cfg.http_port)
                                                         : std::string("off"));
     std::println("│ https       : {}", cfg.enable_https ? ":" + std::to_string(cfg.https_port)
@@ -357,12 +449,15 @@ int main(int argc, char** argv) {
         keyopt.mode = cfg.http_vhost ? http::KeyMode::vhost : http::KeyMode::path;
         keyopt.keep_query = cfg.key_on_query;
         keyopt.strip_leading_slash = cfg.key_strip_slash;
-        const std::size_t n = http::preload_sources(cfg.sources, keyopt, *tm);
+        const std::size_t n =
+            http::preload_sources(cfg.sources, keyopt, *tm, cfg.http_write_mode);
         std::println("preloaded {} file(s) from {} source dir(s)", n, cfg.sources.size());
     }
 
     std::string listening = "listening:";
     if (cfg.enable_memcache) listening += " memcache/tcp :" + std::to_string(cfg.memcache_port);
+    if (cfg.rdma.enabled)
+        listening += " memcache/rdma " + cfg.rdma.address + ":" + std::to_string(cfg.rdma.port);
     if (cfg.enable_http) listening += " http/tcp :" + std::to_string(cfg.http_port);
     if (cfg.enable_https) listening += " https/tcp :" + std::to_string(cfg.https_port);
     std::println("{}  (Ctrl-C to stop)", listening);

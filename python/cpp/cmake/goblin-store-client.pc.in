@@ -1,0 +1,12 @@
+prefix=@GOBLIN_STORE_CLIENT_PC_PREFIX@
+exec_prefix=${prefix}
+libdir=@GOBLIN_STORE_CLIENT_PC_LIBDIR@
+includedir=@GOBLIN_STORE_CLIENT_PC_INCLUDEDIR@
+
+Name: goblin-store-client
+Description: Native InfiniBand memcache client for Goblin Store
+Version: @PROJECT_VERSION@
+Requires.private: @GOBLIN_STORE_CLIENT_PC_REQUIRES@
+Libs: -L${libdir} -lgoblin-store-client
+Libs.private: -pthread
+Cflags: -I${includedir} -pthread

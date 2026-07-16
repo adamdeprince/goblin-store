@@ -8,6 +8,7 @@
 #include "goblin/net/stream_loop.hpp"
 
 #include <string>
+#include <string_view>
 
 namespace goblin::http {
 
@@ -20,9 +21,10 @@ public:
 
 protected:
     void process(Conn*) override;
-    void frame_get_hit(Conn*, const std::string& key, const storage::ObjectMeta&) override;
+    void frame_get_hit(Conn*, std::string_view key, const storage::ObjectMeta&) override;
     void frame_get_miss(Conn*) override;
     void on_value_sent(Conn*) override;
+    void append_value_trailer(Conn*) override;
 
 private:
     KeyOptions keyopt_; // path vs vhost key derivation (ADR-0015)

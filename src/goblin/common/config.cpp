@@ -1,6 +1,25 @@
 #include "goblin/common/config.hpp"
 
+#include "goblin/store/rdma_wire.hpp"
+
 #include <cmath>
+#include <limits>
+#include <netdb.h>
+
+namespace {
+
+bool numeric_network_address(const std::string& address) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST;
+    addrinfo* result = nullptr;
+    const int status = ::getaddrinfo(address.c_str(), nullptr, &hints, &result);
+    if (result) ::freeaddrinfo(result);
+    return status == 0;
+}
+
+} // namespace
 
 namespace goblin {
 
@@ -32,6 +51,27 @@ Status validate(const ServerConfig& c) {
             return err(Errc::invalid_argument,
                        "--sub-memory must be at least one --block and a multiple of --block");
     }
+    if (m.small_sub_bytes && !m.small_total_bytes)
+        return err(Errc::invalid_argument,
+                   "--small-sub-memory requires --small-memory");
+    if (m.small_total_bytes) {
+        if (*m.small_total_bytes < m.block_bytes ||
+            *m.small_total_bytes % m.block_bytes != 0)
+            return err(Errc::invalid_argument,
+                       "--small-memory must be at least one --block and a multiple of --block");
+    }
+    if (m.small_sub_bytes && *m.small_sub_bytes > 0) {
+        if (!c.numa_enabled)
+            return err(Errc::invalid_argument,
+                       "--small-sub-memory cannot be used with --no-numa");
+        if (!c.numa_node)
+            return err(Errc::invalid_argument,
+                       "--small-sub-memory requires an explicit --numa NODE");
+        if (*m.small_sub_bytes < m.block_bytes ||
+            *m.small_sub_bytes % m.block_bytes != 0)
+            return err(Errc::invalid_argument,
+                       "--small-sub-memory must be at least one --block and a multiple of --block");
+    }
     if (!is_power_of_two(m.small_min_alloc) || m.small_min_alloc < 8 || m.small_min_alloc > m.block_bytes)
         return err(Errc::invalid_argument, "memory.small_min_alloc must be a power of two in [8, block_bytes]");
 
@@ -52,6 +92,32 @@ Status validate(const ServerConfig& c) {
         return err(Errc::invalid_argument, "io_chunk_bytes must be a power of two >= 4 KiB");
     if (c.io_buffers == 0)
         return err(Errc::invalid_argument, "io_buffers must be >= 1");
+
+    if (c.rdma.enabled) {
+        namespace wire = store::rdma_wire;
+        if (c.rdma.address.empty() || !numeric_network_address(c.rdma.address))
+            return err(Errc::invalid_argument, "--rdma needs a numeric IPv4 or IPv6 address");
+        if (c.rdma.port == 0)
+            return err(Errc::invalid_argument, "--rdma-port must be between 1 and 65535");
+        if (c.rdma.ring_bytes / wire::kControlSlotStride < 2 ||
+            c.rdma.ring_bytes / wire::kControlSlotStride >
+                std::numeric_limits<std::uint32_t>::max())
+            return err(Errc::invalid_argument,
+                       "--rdma-ring must hold between 2 and 2^32-1 control slots");
+        if (c.rdma.bulk_window_bytes > std::numeric_limits<std::uint32_t>::max() ||
+            c.rdma.bulk_window_count > std::numeric_limits<std::uint16_t>::max() ||
+            !wire::valid_bulk_geometry(
+                static_cast<std::uint32_t>(c.rdma.bulk_window_bytes),
+                static_cast<std::uint32_t>(c.rdma.bulk_window_count)))
+            return err(Errc::invalid_argument,
+                       "--rdma-window must be a power of two of at least 4 KiB, and the "
+                       "combined TX/RX window mapping must fit the v3 descriptor");
+        if (c.rdma.bulk_window_count < 2)
+            return err(Errc::invalid_argument,
+                       "--rdma-windows must be at least 2 so tail I/O can overlap the RAM head");
+        if (c.rdma.backlog == 0)
+            return err(Errc::invalid_argument, "RDMA listen backlog must be nonzero");
+    }
 
     if (c.ssd.dirs.empty())
         return err(Errc::invalid_argument, "at least one --ssd-dir is required");
@@ -78,9 +144,9 @@ Status validate(const ServerConfig& c) {
         c.access_score.decay >= 1.0)
         return err(Errc::invalid_argument, "--decay must be finite and strictly between 0 and 1");
 
-    if (!c.enable_memcache && !c.enable_http && !c.enable_https)
+    if (!c.enable_memcache && !c.enable_http && !c.enable_https && !c.rdma.enabled)
         return err(Errc::invalid_argument,
-                   "no listeners enabled (need at least one of memcache, HTTP, HTTPS)");
+                   "no listeners enabled (need memcache, RDMA memcache, HTTP, or HTTPS)");
     if (c.tls_cert_paths.size() != c.tls_key_paths.size())
         return err(Errc::invalid_argument, "each --tls-cert needs a matching --tls-key");
     if (c.enable_https && c.tls_cert_paths.empty())

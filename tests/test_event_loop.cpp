@@ -122,7 +122,7 @@ static std::string pattern(int seed, std::size_t n) {
 }
 
 static Result<TierManager> open_tm(const std::string& base, Index& index, bool three_layer,
-                                   unsigned write_buffers = 8) {
+                                   unsigned write_buffers = 8, Size ram_head = 4 * KiB) {
     PoolConfig ssd, hdd;
     ssd.stripe_unit = 64 * KiB;
     ssd.dirs = {base + "/s0", base + "/s1"};
@@ -133,7 +133,7 @@ static Result<TierManager> open_tm(const std::string& base, Index& index, bool t
         for (const auto& d : hdd.dirs) fs::create_directories(d);
     }
     TierSizes tiers;
-    tiers.ram_head = 4 * KiB;
+    tiers.ram_head = ram_head;
     tiers.ssd_prefix = three_layer ? 64 * KiB : 1 * MiB;
     MemoryConfig mem;
     mem.total_bytes = 64 * MiB;
@@ -154,6 +154,39 @@ static std::string tmp_base(const char* tag) {
 }
 
 static Result<IoBufferPool> make_iopool() { return IoBufferPool::create(128 * KiB, 64, false); }
+
+// Observe the connection immediately after EventLoop::process() has queued its work but before the
+// outer run_once() can submit or reap any of those SQEs. This makes the read-vs-head ordering test
+// deterministic without a timing hook in production code.
+class PrefetchProbeLoop : public EventLoop {
+public:
+    using EventLoop::EventLoop;
+
+    bool observed() const noexcept { return observed_.load(std::memory_order_acquire); }
+    bool valid() const noexcept { return valid_.load(std::memory_order_relaxed); }
+    Size tail_start() const noexcept { return tail_start_.load(std::memory_order_relaxed); }
+
+protected:
+    void process(Conn* c) override {
+        EventLoop::process(c);
+        if (observed_.load(std::memory_order_relaxed) || c->state != St::get_header ||
+            c->get_size <= c->send_pos)
+            return;
+
+        const int lane = c->read_lane;
+        const bool read_queued = lane >= 0 && c->lane[static_cast<std::size_t>(lane)].reads > 0;
+        tail_start_.store(c->send_pos, std::memory_order_relaxed);
+        valid_.store(c->head_sent == 0 && c->send_lane == -1 && c->coalesced_send &&
+                         read_queued && c->plan_pos > c->send_pos && c->inflight >= 2,
+                     std::memory_order_relaxed);
+        observed_.store(true, std::memory_order_release);
+    }
+
+private:
+    std::atomic<bool> observed_{false};
+    std::atomic<bool> valid_{false};
+    std::atomic<Size> tail_start_{0};
+};
 
 // Send "<verb> key 0 0 <len>\r\n<val>\r\n"; return the reply line ("STORED\r\n", etc.).
 static std::string set_value(int fd, const std::string& key, const std::string& val,
@@ -380,6 +413,44 @@ TEST("event loop: GET spanning SSD prefix -> HDD tail (3-layer)") {
     ::close(lfd);
     fs::remove_all(base);
     CHECK(ok);
+}
+
+TEST("event loop: initial response send queues the disk tail behind the configured head") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("earlytail");
+    Index index;
+    constexpr Size kHead = 32 * KiB; // deliberately not the 256 KiB product default
+    auto tm = open_tm(base, index, false, /*write_buffers=*/8, kHead);
+    auto io = make_iopool();
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+    const std::string value = pattern(71, 96 * KiB); // configured head plus a 64 KiB disk tail
+    CHECK(store_obj(*tm, "early", value));
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    PrefetchProbeLoop loop(*rc, lfd, *tm, index, *io);
+    std::thread th([&] { loop.run(); });
+
+    bool served = false;
+    const int c = client_connect(port);
+    if (c >= 0) {
+        const auto got = get_value(c, "early");
+        served = got && *got == value;
+        ::close(c);
+    }
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+
+    CHECK(served);
+    CHECK(loop.observed());
+    CHECK(loop.valid());
+    CHECK_EQ(loop.tail_start(), kHead);
 }
 
 TEST("event loop: two loops share storage; 64 concurrent GETs across both (TSan)") {

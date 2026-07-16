@@ -54,10 +54,10 @@ std::string available_hint(std::span<const unsigned> online) {
 std::string ambiguity_detail(std::span<const NicAddress> interfaces,
                              std::span<const unsigned> online) {
     std::string out =
-        "automatic NUMA selection is ambiguous: the 0.0.0.0 listeners cover Ethernet addresses "
+        "automatic NUMA selection is ambiguous: the configured listeners cover network addresses "
         "on different or unknown NUMA nodes:\n";
     if (interfaces.empty()) {
-        out += "  (no UP, non-loopback IPv4 Ethernet interface was found)\n";
+        out += "  (no UP, non-loopback listener interface was found)\n";
     } else {
         for (const auto& nic : interfaces) {
             out += "  " + nic.name + " " + nic.address + " -> ";
@@ -141,24 +141,83 @@ std::optional<unsigned> interface_numa_node(const std::string& name) {
     return static_cast<unsigned>(node);
 }
 
-Result<std::vector<NicAddress>> discover_listener_interfaces() {
+bool matches_numeric_address(std::string_view requested, const sockaddr* actual,
+                             std::string_view interface_name) {
+    if (!actual) return false;
+    if (actual->sa_family == AF_INET) {
+        in_addr parsed{};
+        if (::inet_pton(AF_INET, std::string(requested).c_str(), &parsed) != 1) return false;
+        return std::memcmp(&parsed,
+                           &reinterpret_cast<const sockaddr_in*>(actual)->sin_addr,
+                           sizeof(parsed)) == 0;
+    }
+    if (actual->sa_family != AF_INET6) return false;
+    const std::size_t percent = requested.find('%');
+    const std::string_view address = requested.substr(0, percent);
+    const std::string_view zone = percent == std::string_view::npos
+                                      ? std::string_view{}
+                                      : requested.substr(percent + 1);
+    in6_addr parsed{};
+    if (::inet_pton(AF_INET6, std::string(address).c_str(), &parsed) != 1) return false;
+    if (!zone.empty()) {
+        const auto actual_scope = reinterpret_cast<const sockaddr_in6*>(actual)->sin6_scope_id;
+        unsigned numeric_scope = 0;
+        const auto [end, ec] = std::from_chars(zone.data(), zone.data() + zone.size(),
+                                               numeric_scope);
+        if (ec == std::errc{} && end == zone.data() + zone.size()) {
+            if (numeric_scope != actual_scope) return false;
+        } else {
+            const unsigned index = ::if_nametoindex(std::string(zone).c_str());
+            if (index != 0) {
+                if (index != actual_scope) return false;
+            } else if (zone != interface_name) {
+                return false;
+            }
+        }
+    }
+    return std::memcmp(&parsed,
+                       &reinterpret_cast<const sockaddr_in6*>(actual)->sin6_addr,
+                       sizeof(parsed)) == 0;
+}
+
+Result<std::vector<NicAddress>> discover_listener_interfaces(
+    std::span<const std::string> exact_addresses, bool wildcard_ethernet) {
     ifaddrs* head = nullptr;
     if (::getifaddrs(&head) != 0)
         return err(Errc::io_error, std::string("getifaddrs: ") + std::strerror(errno));
 
     std::vector<NicAddress> out;
+    std::vector<bool> matched(exact_addresses.size(), false);
     for (const ifaddrs* p = head; p; p = p->ifa_next) {
-        if (!p->ifa_addr || !p->ifa_name || p->ifa_addr->sa_family != AF_INET) continue;
+        if (!p->ifa_addr || !p->ifa_name ||
+            (p->ifa_addr->sa_family != AF_INET && p->ifa_addr->sa_family != AF_INET6))
+            continue;
         if (!(p->ifa_flags & IFF_UP) || (p->ifa_flags & IFF_LOOPBACK)) continue;
         const std::string name(p->ifa_name);
-        if (!is_ethernet(name)) continue;
+        bool selected = wildcard_ethernet && p->ifa_addr->sa_family == AF_INET &&
+                        is_ethernet(name);
+        for (std::size_t i = 0; i < exact_addresses.size(); ++i) {
+            if (!matches_numeric_address(exact_addresses[i], p->ifa_addr, name)) continue;
+            matched[i] = true;
+            selected = true; // includes native InfiniBand (ARPHRD_INFINIBAND) netdevs
+        }
+        if (!selected) continue;
 
-        char address[INET_ADDRSTRLEN]{};
-        const auto* sin = reinterpret_cast<const sockaddr_in*>(p->ifa_addr);
-        if (!::inet_ntop(AF_INET, &sin->sin_addr, address, sizeof address)) continue;
+        char address[INET6_ADDRSTRLEN]{};
+        const void* source = p->ifa_addr->sa_family == AF_INET
+            ? static_cast<const void*>(&reinterpret_cast<const sockaddr_in*>(p->ifa_addr)->sin_addr)
+            : static_cast<const void*>(&reinterpret_cast<const sockaddr_in6*>(p->ifa_addr)->sin6_addr);
+        if (!::inet_ntop(p->ifa_addr->sa_family, source, address, sizeof address)) continue;
         out.push_back(NicAddress{name, address, interface_numa_node(name)});
     }
     ::freeifaddrs(head);
+
+    for (std::size_t i = 0; i < matched.size(); ++i)
+        if (!matched[i])
+            return err(Errc::invalid_argument,
+                       "listener address " + exact_addresses[i] +
+                           " is not assigned to an UP, non-loopback Linux interface; "
+                           "choose its node explicitly with --numa NODE");
 
     std::sort(out.begin(), out.end(), [](const NicAddress& a, const NicAddress& b) {
         return a.name < b.name || (a.name == b.name && a.address < b.address);
@@ -355,7 +414,9 @@ Status bind_numa_worker(unsigned node, std::span<const unsigned> cpus) {
 #endif
 }
 
-Result<NumaBinding> configure_numa(std::optional<unsigned> requested, bool perverse) {
+Result<NumaBinding> configure_numa(std::optional<unsigned> requested, bool perverse,
+                                   std::span<const std::string> exact_listener_addresses,
+                                   bool wildcard_ethernet_listener) {
 #if defined(__linux__)
     auto allowed = current_thread_cpus();
     if (!allowed) return std::unexpected(allowed.error());
@@ -364,7 +425,8 @@ Result<NumaBinding> configure_numa(std::optional<unsigned> requested, bool perve
 
     std::vector<NicAddress> interfaces;
     if (!requested) {
-        auto discovered = discover_listener_interfaces();
+        auto discovered = discover_listener_interfaces(exact_listener_addresses,
+                                                       wildcard_ethernet_listener);
         if (!discovered) return std::unexpected(discovered.error());
         interfaces = std::move(*discovered);
     }
@@ -399,14 +461,18 @@ Result<NumaBinding> configure_numa(std::optional<unsigned> requested, bool perve
 #else
     (void)requested;
     (void)perverse;
+    (void)exact_listener_addresses;
+    (void)wildcard_ethernet_listener;
     return err(Errc::unsupported, "NUMA affinity is supported only on Linux");
 #endif
 }
 
 Result<std::vector<NumaMemoryBudget>> plan_numa_memory(
     unsigned local_node, std::span<const unsigned> online_nodes, Size local_bytes,
-    Size foreign_bytes) {
-    if (local_bytes == 0) return err(Errc::invalid_argument, "--memory must be greater than zero");
+    Size foreign_bytes, std::string_view local_option, std::string_view foreign_option) {
+    if (local_bytes == 0)
+        return err(Errc::invalid_argument,
+                   std::string(local_option) + " must be greater than zero");
     if (std::find(online_nodes.begin(), online_nodes.end(), local_node) == online_nodes.end())
         return err(Errc::invalid_argument,
                    "local NUMA node " + std::to_string(local_node) + " is not online");
@@ -419,13 +485,14 @@ Result<std::vector<NumaMemoryBudget>> plan_numa_memory(
     for (const unsigned node : online_nodes) {
         if (!seen.insert(node).second) continue;
         if (foreign_bytes > std::numeric_limits<Size>::max() - local_bytes)
-            return err(Errc::invalid_argument, "NUMA head-memory budget overflows Size");
+            return err(Errc::invalid_argument, "NUMA memory budget overflows Size");
         local_bytes += foreign_bytes;
         plan.push_back({node, foreign_bytes});
     }
     if (foreign_bytes > 0 && plan.size() == 1)
         return err(Errc::invalid_argument,
-                   "--sub-memory was specified but there are no other online NUMA nodes");
+                   std::string(foreign_option) +
+                       " was specified but there are no other online NUMA nodes");
     return plan;
 }
 

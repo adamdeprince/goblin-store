@@ -14,7 +14,7 @@ namespace goblin {
 
 enum class WriteMode {  // ADR-0010
     evict,              // cache: evict low-value objects to admit
-    block,              // origin: pin existing objects, refuse/backpressure on full
+    block,              // this admission does not reclaim on filesystem exhaustion
 };
 
 enum class CacheBypass { // ADR-0011
@@ -61,6 +61,10 @@ inline constexpr Size kDefaultMemoryBlock = kDefaultHugeTlbPage;
 struct MemoryConfig {                  // ADR-0008
     Size total_bytes  = 1 * GiB;       // --memory: preferred head arena (selected node normally)
     Size sub_bytes    = 0;             // --sub-memory: head arena bytes on each other NUMA node
+    // Supplying --small-memory opts into physically separate fixed-head and small-object pools.
+    // nullopt preserves the historical shared pool for existing invocations and library callers.
+    std::optional<Size> small_total_bytes; // --small-memory: preferred small-object arena
+    std::optional<Size> small_sub_bytes;   // --small-sub-memory: bytes on each other NUMA node
     // Logical allocation/promotion blocks may span several physical HugeTLB pages. Keeping the two
     // sizes distinct prevents --block 4M on x86 from requesting a nonexistent 4 MiB page order.
     Size block_bytes  = kDefaultMemoryBlock; // --block; power-of-two multiple of hugetlb_page_bytes
@@ -73,11 +77,26 @@ struct MemoryConfig {                  // ADR-0008
     // Runtime-resolved preferred-first layout. Empty for direct library/test callers that want the
     // ordinary single-region allocator; main() populates it after NUMA selection.
     std::vector<NumaMemoryRegionConfig> numa_regions;
+    std::vector<NumaMemoryRegionConfig> small_numa_regions;
+
+    bool split_pools() const noexcept { return small_total_bytes.has_value(); }
 
     Size arena_bytes() const noexcept {
         if (numa_regions.empty()) return total_bytes;
         Size total = 0;
         for (const auto& region : numa_regions) total += region.bytes;
+        return total;
+    }
+
+    Size small_arena_bytes() const noexcept {
+        if (!small_total_bytes) return 0;
+        if (small_numa_regions.empty()) {
+            const Size foreign_nodes =
+                numa_regions.empty() ? 0 : static_cast<Size>(numa_regions.size() - 1);
+            return *small_total_bytes + small_sub_bytes.value_or(0) * foreign_nodes;
+        }
+        Size total = 0;
+        for (const auto& region : small_numa_regions) total += region.bytes;
         return total;
     }
 };
@@ -92,9 +111,23 @@ struct AccessScoreConfig {
 
 struct EvictionConfig {                // ADR-0007 / ADR-0012
     EvictionPolicyKind policy = EvictionPolicyKind::s3fifo;
-    std::uint64_t max_ssd_objects = 0; // SSD count bound; 0 => derive ssd_capacity/ssd_prefix
+    std::uint64_t max_ssd_objects = 0; // disk-backed object count bound; 0 => unbounded
     double high_watermark = 0.90;      // start background reclaim
     double low_watermark  = 0.80;      // reclaim down to here
+};
+
+// Native reliable-connected RDMA memcache endpoint. The control ring carries only typed command,
+// status, credit, and completion records; object bodies use the separately registered bulk windows.
+// One connection owns two bulk halves (TX staging and peer-write RX), each containing window_count
+// fixed-size windows. The v3 wire descriptor derives the count from this geometry.
+struct RdmaConfig {
+    bool enabled = false;
+    std::string address;                    // numeric IPv4/IPv6 bind address; --rdma enables
+    std::uint16_t port = 11211;
+    Size ring_bytes = 64 * KiB;             // requested control-ring slot budget / connection
+    Size bulk_window_bytes = 256 * KiB;     // power of two; one large RDMA WRITE per body piece
+    unsigned bulk_window_count = 4;         // per direction; >=2 preserves head/tail overlap
+    unsigned backlog = 128;
 };
 
 struct ServerConfig {
@@ -140,6 +173,7 @@ struct ServerConfig {
     WriteMode      memcache_write_mode = WriteMode::evict;  // cache default
     WriteMode      http_write_mode     = WriteMode::block;  // origin default
     CacheBypass    cache_bypass = CacheBypass::o_direct;
+    RdmaConfig     rdma;                    // native InfiniBand/RoCE memcache (not TCP/IPoIB)
 
     bool three_layer() const noexcept { return !hdd.dirs.empty(); }
 };

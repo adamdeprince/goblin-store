@@ -1,0 +1,77 @@
+[build-system]
+requires = [
+  # 0.11's vendored metadata layer imports newer typing_extensions symbols.
+  # Ubuntu 22.04's system pip can put its old distro copy ahead of the PEP 517
+  # overlay, so retain the tested 0.10 backend until that LTS ages out.
+  "scikit-build-core>=0.10,<0.11",
+  "nanobind>=2.12",
+  # exceptiongroup 1.3 uses TypeVar(default=...), which Ubuntu 22.04's old
+  # system typing_extensions cannot provide when distro pip leaks it into the
+  # isolated overlay.
+  "exceptiongroup<1.3; python_version < '3.11'",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "goblin-store-client"
+version = "0.1.0"
+description = "Native InfiniBand memcache client for Goblin Store"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Goblin Reactor" }]
+keywords = ["memcache", "infiniband", "rdma", "object-cache", "nanobind"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Distributed Computing",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://goblin-store.dev"
+Repository = "https://github.com/adamdeprince/goblin-store"
+Documentation = "https://github.com/adamdeprince/goblin-store/tree/master/python"
+Issues = "https://github.com/adamdeprince/goblin-store/issues"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["goblin_store"]
+sdist.include = [
+  "/CMakeLists.txt",
+  "/LICENSE",
+  "/README.md",
+  "cpp/CMakeLists.txt",
+  "cpp/README.md",
+  "cpp/cmake/*.in",
+  "cpp/include/**/*.hpp",
+  "cpp/src/*.cpp",
+  "cpp/tests/*.cpp",
+  "cpp/tests/consumer/*",
+  "goblin_store/*.py",
+  "src/*.cpp",
+  "tests/*.py",
+]
+sdist.exclude = [
+  "build*/**",
+  "dist*/**",
+  "install*/**",
+  "wheel-target*/**",
+  ".pytest_cache/**",
+  "**/__pycache__/**",
+  "**/*.pyc",
+]
+
+[tool.scikit-build.cmake]
+version = ">=3.22"
+args = ["-GUnix Makefiles"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

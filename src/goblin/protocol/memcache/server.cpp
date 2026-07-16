@@ -4,6 +4,7 @@
 #include "goblin/crypto/sha256.hpp"
 #include "goblin/http/http_loop.hpp"
 #include "goblin/http/https_loop.hpp"
+#include "goblin/net/rdma_server.hpp"
 #include "goblin/protocol/memcache/event_loop.hpp"
 #include "goblin/protocol/memcache/protocol.hpp"
 
@@ -17,6 +18,7 @@
 #include <netinet/tcp.h>
 #include <optional>
 #include <print>
+#include <future>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
@@ -57,13 +59,29 @@ void sleep_interruptibly(const std::atomic<bool>& shutdown, unsigned millisecond
             std::chrono::milliseconds(std::min(100u, milliseconds - slept)));
 }
 
-// Stream an object's value in fixed I/O-pool chunks, head-first (ADR-0006/0016). read() copies the
-// head out under the storage read-lock (ADR-0018); the zero-copy head returns once heads can be
-// pinned against concurrent eviction.
+class HeadPinGuard {
+public:
+    HeadPinGuard(storage::TierManager& tm, storage::TierManager::HeadPin& pin)
+        : tm_(&tm), pin_(&pin) {}
+    ~HeadPinGuard() {
+        if (pin_->valid) tm_->unpin_head(*pin_);
+    }
+    HeadPinGuard(const HeadPinGuard&) = delete;
+    HeadPinGuard& operator=(const HeadPinGuard&) = delete;
+
+private:
+    storage::TierManager* tm_;
+    storage::TierManager::HeadPin* pin_;
+};
+
+// Stream one immutable snapshot for the response's whole lifetime. Its fixed head locator and open
+// generation fds cannot be mixed with a concurrent replacement between chunks (ADR-0018).
 bool stream_value(int fd, storage::TierManager& tm, core::Reactor& reactor,
-                  core::IoBufferPool& iobufs, const crypto::Digest& digest,
-                  const storage::ObjectMeta& meta) {
-    if (meta.size == 0) return true;
+                  core::IoBufferPool& iobufs, storage::TierManager::Snapshot& snapshot) {
+    if (snapshot.meta.size == 0) return true;
+    if (!snapshot.rs) {
+        return snapshot.pin.valid && send_all(fd, tm.pinned_bytes(snapshot.pin));
+    }
     // Backpressure (ADR-0011): wait for a read buffer rather than dropping the GET. A blocking worker
     // serves one conn at a time, so io_buffers >= cores means this never spins.
     std::optional<MutBytes> chunk = iobufs.acquire();
@@ -73,10 +91,9 @@ bool stream_value(int fd, storage::TierManager& tm, core::Reactor& reactor,
     }
     bool ok = true;
     Size pos = 0;
-    while (pos < meta.size) {
-        const Size want = std::min<Size>(chunk->size(), meta.size - pos);
-        const auto n = tm.read(reactor, digest, pos, chunk->subspan(0, want),
-                               /*record_access=*/false);
+    while (pos < snapshot.meta.size) {
+        const Size want = std::min<Size>(chunk->size(), snapshot.meta.size - pos);
+        const auto n = snapshot.rs->read(reactor, pos, *chunk);
         if (!n || *n != want) { ok = false; break; }
         if (!send_all(fd, chunk->subspan(0, want))) { ok = false; break; }
         pos += want;
@@ -86,7 +103,7 @@ bool stream_value(int fd, storage::TierManager& tm, core::Reactor& reactor,
 }
 
 void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::Reactor& reactor,
-                 core::IoBufferPool& iobufs) {
+                 core::IoBufferPool& iobufs, WriteMode write_mode) {
     std::string buf;
     while (true) {
         std::size_t eol = buf.find("\r\n");
@@ -131,7 +148,7 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
                 // retry rather than fail. A spinning worker holds no buffer, so a peer mid-SET will
                 // commit and free one -> forward progress (size io_buffers >= cores to never spin).
                 for (;;) {
-                    auto h = tm.begin_store(digest, nbytes);
+                    auto h = tm.begin_store(digest, nbytes, write_mode);
                     if (h) { handle.emplace(std::move(*h)); break; }
                     if (h.error().code != Errc::would_block) break; // real failure -> NOT_STORED
                     std::this_thread::yield();
@@ -149,8 +166,10 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
                 if (handle && write_ok) {
                     if (auto st = handle->write(
                             ByteView(reinterpret_cast<const std::byte*>(buf.data()), take));
-                        !st)
+                        !st) {
                         write_ok = false;
+                        handle.reset(); // drain framing without retaining scarce store resources
+                    }
                 }
                 written += take;
                 buf.erase(0, take);
@@ -169,7 +188,8 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
                                               cas_check);
                      !st)
                 reply = (st.error().code == Errc::cas_mismatch) ? kExists : kNotStored;
-            else reply = kStored;
+            else
+                reply = kStored; // st holds the new etag; unused on the sync path
             // (An uncommitted handle aborts on scope exit — the object stays unindexed/invisible.)
             if (!noreply && !send_all(fd, reply)) return;
             continue;
@@ -179,17 +199,21 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
             case Verb::get:
             case Verb::gets: {
                 const auto digest = crypto::hash_key(cmd->key);
-                const auto meta = index.lookup(digest);
-                if (!meta || storage::is_expired(*meta, storage::now_unix())) {
+                auto snapshot = tm.open_snapshot(digest, /*record_access=*/true,
+                                                 storage::now_unix());
+                if (!snapshot) {
                     if (!send_all(fd, kEnd)) return; // miss (or expired)
                     break;
                 }
-                tm.touch(digest); // record the hit for eviction (no-op if head not cached)
+                HeadPinGuard pin_guard(tm, snapshot->pin);
+                tm.touch_policies(digest, snapshot->pin.valid);
                 if (!send_all(fd, cmd->verb == Verb::gets
-                                      ? value_header_cas(cmd->key, meta->flags, meta->size, meta->etag)
-                                      : value_header(cmd->key, meta->flags, meta->size)))
+                                      ? value_header_cas(cmd->key, snapshot->meta.flags,
+                                                         snapshot->meta.size, snapshot->meta.etag)
+                                      : value_header(cmd->key, snapshot->meta.flags,
+                                                     snapshot->meta.size)))
                     return;
-                if (!stream_value(fd, tm, reactor, iobufs, digest, *meta)) return;
+                if (!stream_value(fd, tm, reactor, iobufs, *snapshot)) return;
                 if (!send_all(fd, std::string_view{"\r\n"})) return;
                 if (!send_all(fd, kEnd)) return;
                 break;
@@ -239,13 +263,22 @@ Result<int> make_listener(std::uint16_t port, bool reuseport = false) {
 // manager are shared and thread-safe. (SO_REUSEPORT per-core listeners return with the io_uring
 // multishot-accept async loop, where a worker multiplexes many connections.)
 void worker_loop(int lfd, const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-                 const std::atomic<bool>& shutdown, unsigned id) {
+                 const std::atomic<bool>& shutdown, unsigned id,
+                 std::promise<Status> startup) {
+    (void)id;
     auto reactor = core::Reactor::create();
-    if (!reactor) { std::println(stderr, "worker {}: {}", id, reactor.error().detail); return; }
+    if (!reactor) {
+        startup.set_value(std::unexpected(reactor.error()));
+        return;
+    }
     auto iobufs =
         core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory,
                                    cfg.memory.use_hugepages, cfg.memory.hugetlb_page_bytes);
-    if (!iobufs) { std::println(stderr, "worker {}: {}", id, iobufs.error().detail); return; }
+    if (!iobufs) {
+        startup.set_value(std::unexpected(iobufs.error()));
+        return;
+    }
+    startup.set_value(Status{});
 
     while (!shutdown.load(std::memory_order_relaxed)) {
         pollfd pfd{lfd, POLLIN, 0};
@@ -265,7 +298,7 @@ void worker_loop(int lfd, const ServerConfig& cfg, storage::TierManager& tm, sto
             ::setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
             ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         }
-        handle_conn(cfd, tm, index, *reactor, *iobufs);
+        handle_conn(cfd, tm, index, *reactor, *iobufs, cfg.memcache_write_mode);
         ::close(cfd);
     }
 }
@@ -273,18 +306,31 @@ void worker_loop(int lfd, const ServerConfig& cfg, storage::TierManager& tm, sto
 // Async worker (ADR-0002): its own io_uring ring + I/O pool + SO_REUSEPORT listener; the EventLoop
 // multiplexes many connections on the one ring (accept / recv+parse / GET stream / SET ingest / send).
 void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-                  core::StatsRegistry& reg, const std::atomic<bool>& shutdown, unsigned id) {
+                  core::StatsRegistry& reg, const std::atomic<bool>& shutdown, unsigned id,
+                  std::promise<Status> startup) {
+    (void)id;
     auto reactor = core::Reactor::create();
-    if (!reactor) { std::println(stderr, "worker {}: {}", id, reactor.error().detail); return; }
+    if (!reactor) {
+        startup.set_value(std::unexpected(reactor.error()));
+        return;
+    }
     auto iobufs =
         core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory,
                                    cfg.memory.use_hugepages, cfg.memory.hugetlb_page_bytes);
-    if (!iobufs) { std::println(stderr, "worker {}: {}", id, iobufs.error().detail); return; }
+    if (!iobufs) {
+        startup.set_value(std::unexpected(iobufs.error()));
+        return;
+    }
     auto lfd = make_listener(cfg.memcache_port, /*reuseport=*/true);
-    if (!lfd) { std::println(stderr, "worker {}: {}", id, lfd.error().detail); return; }
-    EventLoop loop(*reactor, *lfd, tm, index, *iobufs, cfg.io_timeout_ms, &reg);
+    if (!lfd) {
+        startup.set_value(std::unexpected(lfd.error()));
+        return;
+    }
+    EventLoop loop(*reactor, *lfd, tm, index, *iobufs, cfg.io_timeout_ms, &reg,
+                   cfg.memcache_write_mode);
     loop.set_read_ahead(cfg.read_ahead);
     loop.set_shutdown(&shutdown, cfg.shutdown_grace_ms);
+    startup.set_value(Status{});
     loop.run();
     ::close(*lfd);
 }
@@ -292,15 +338,26 @@ void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
 // HTTP object server (ADR-0005/0015): its own io_uring ring + read pool + SO_REUSEPORT listener on
 // the HTTP port, so slow HTTP downloads draw from a separate buffer budget and can't starve memcache.
 void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-                 core::StatsRegistry& reg, const std::atomic<bool>& shutdown, unsigned id) {
+                 core::StatsRegistry& reg, const std::atomic<bool>& shutdown, unsigned id,
+                 std::promise<Status> startup) {
+    (void)id;
     auto reactor = core::Reactor::create();
-    if (!reactor) { std::println(stderr, "http worker {}: {}", id, reactor.error().detail); return; }
+    if (!reactor) {
+        startup.set_value(std::unexpected(reactor.error()));
+        return;
+    }
     auto iobufs =
         core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory,
                                    cfg.memory.use_hugepages, cfg.memory.hugetlb_page_bytes);
-    if (!iobufs) { std::println(stderr, "http worker {}: {}", id, iobufs.error().detail); return; }
+    if (!iobufs) {
+        startup.set_value(std::unexpected(iobufs.error()));
+        return;
+    }
     auto lfd = make_listener(cfg.http_port, /*reuseport=*/true);
-    if (!lfd) { std::println(stderr, "http worker {}: {}", id, lfd.error().detail); return; }
+    if (!lfd) {
+        startup.set_value(std::unexpected(lfd.error()));
+        return;
+    }
     http::KeyOptions keyopt;
     keyopt.mode = cfg.http_vhost ? http::KeyMode::vhost : http::KeyMode::path;
     keyopt.keep_query = cfg.key_on_query;
@@ -309,6 +366,7 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
     http::HttpLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, cfg.io_timeout_ms, &reg);
     loop.set_read_ahead(cfg.read_ahead);
     loop.set_shutdown(&shutdown, cfg.shutdown_grace_ms);
+    startup.set_value(Status{});
     loop.run();
     ::close(*lfd);
 }
@@ -319,15 +377,25 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
 // after it, kTLS makes the data path the ordinary HttpLoop flow (ADR-0005/0011).
 void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
                   tls::Context& ctx, core::StatsRegistry& reg, const std::atomic<bool>& shutdown,
-                  unsigned id) {
+                  unsigned id, std::promise<Status> startup) {
+    (void)id;
     auto reactor = core::Reactor::create();
-    if (!reactor) { std::println(stderr, "https worker {}: {}", id, reactor.error().detail); return; }
+    if (!reactor) {
+        startup.set_value(std::unexpected(reactor.error()));
+        return;
+    }
     auto iobufs =
         core::IoBufferPool::create(cfg.io_chunk_bytes, cfg.io_buffers, cfg.memory.lock_memory,
                                    cfg.memory.use_hugepages, cfg.memory.hugetlb_page_bytes);
-    if (!iobufs) { std::println(stderr, "https worker {}: {}", id, iobufs.error().detail); return; }
+    if (!iobufs) {
+        startup.set_value(std::unexpected(iobufs.error()));
+        return;
+    }
     auto lfd = make_listener(cfg.https_port, /*reuseport=*/true);
-    if (!lfd) { std::println(stderr, "https worker {}: {}", id, lfd.error().detail); return; }
+    if (!lfd) {
+        startup.set_value(std::unexpected(lfd.error()));
+        return;
+    }
     http::KeyOptions keyopt;
     keyopt.mode = cfg.http_vhost ? http::KeyMode::vhost : http::KeyMode::path;
     keyopt.keep_query = cfg.key_on_query;
@@ -336,6 +404,7 @@ void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
     http::HttpsLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, ctx, cfg.io_timeout_ms, &reg);
     loop.set_read_ahead(cfg.read_ahead);
     loop.set_shutdown(&shutdown, cfg.shutdown_grace_ms);
+    startup.set_value(Status{});
     loop.run();
     ::close(*lfd);
 }
@@ -344,7 +413,7 @@ void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
 } // namespace
 
 Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-             const std::atomic<bool>& shutdown) {
+             std::atomic<bool>& shutdown) {
     // main() binds itself before calling serve(), so every thread created below inherits the
     // selected NUMA node's CPU mask. Direct library callers may leave numa_cpus unresolved.
     unsigned n = cfg.cores ? cfg.cores : static_cast<unsigned>(cfg.numa_cpus.size());
@@ -355,50 +424,148 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
     // One registry shared by every async loop (memcache + HTTP + HTTPS). Each loop registers its own
     // per-worker Stats slot; the memcache `stats` command aggregates them. Outlives the workers.
     core::StatsRegistry stats_reg;
+    std::optional<Error> rdma_runtime_failure;
 
-    // memcache: async io_uring loops, or the blocking thread-per-core fallback (--net blocking).
-    if (cfg.enable_memcache) {
-        if (cfg.net == NetMode::async) {
-            for (unsigned i = 0; i < n; ++i)
-                workers.emplace_back([&cfg, &tm, &index, &stats_reg, &shutdown, i] {
-                    async_worker(cfg, tm, index, stats_reg, shutdown, i);
-                });
-        } else {
-            auto lfd = make_listener(cfg.memcache_port); // one shared listener, kernel load-balances
-            if (!lfd) return std::unexpected(lfd.error());
-            blocking_lfd = *lfd;
-            for (unsigned i = 0; i < n; ++i)
-                workers.emplace_back([&cfg, &tm, &index, &shutdown, i, fd = blocking_lfd] {
-                    worker_loop(fd, cfg, tm, index, shutdown, i);
-                });
+    auto join_workers = [&] {
+        for (auto& worker : workers) {
+            if (worker.joinable()) worker.join();
         }
-    }
-    // HTTP: always async, on its own loops + read pool (per-protocol isolation, ADR-0011).
-    if (cfg.enable_http) {
-        for (unsigned i = 0; i < n; ++i)
-            workers.emplace_back([&cfg, &tm, &index, &stats_reg, &shutdown, i] {
-                http_worker(cfg, tm, index, stats_reg, shutdown, i);
-            });
+        if (blocking_lfd >= 0) {
+            ::close(blocking_lfd);
+            blocking_lfd = -1;
+        }
+    };
+    auto abort_startup = [&](std::string_view endpoint, Error error) -> Status {
+        shutdown.store(true, std::memory_order_relaxed);
+        join_workers();
+        if (!endpoint.empty()) {
+            if (error.detail.empty()) error.detail.assign(endpoint);
+            else error.detail = std::string(endpoint) + ": " + error.detail;
+        }
+        return std::unexpected(std::move(error));
+    };
+
+    if (cfg.rdma.enabled && !net::rdma_server_available())
+        return err(Errc::unsupported,
+                   "--rdma requested, but this build has no libibverbs/librdmacm support");
+
+    // Complete every fallible setup that can run on the coordinator before launching a thread.
+    // In particular, an RDMA listener must never be left live when a later TCP bind or TLS-context
+    // construction fails.
+    if (cfg.enable_memcache && cfg.net == NetMode::blocking) {
+        auto listener = make_listener(cfg.memcache_port);
+        if (!listener) return std::unexpected(listener.error());
+        blocking_lfd = *listener;
     }
 
-    // HTTPS: build one shared per-host cert context (SNI) and spawn TLS loops on the HTTPS port.
 #if GOBLIN_HAVE_TLS
-    std::optional<tls::Context> https_ctx; // outlives the workers; freed after the join below
+    std::optional<tls::Context> https_ctx; // outlives every HTTPS worker
     if (cfg.enable_https) {
         std::vector<tls::Context::CertKey> certs;
         for (std::size_t i = 0; i < cfg.tls_cert_paths.size(); ++i)
             certs.push_back({cfg.tls_cert_paths[i], cfg.tls_key_paths[i]});
-        auto c = tls::Context::create(certs);
-        if (!c) return std::unexpected(c.error());
-        https_ctx.emplace(std::move(*c));
-        tls::Context& ctx = *https_ctx;
-        for (unsigned i = 0; i < n; ++i)
-            workers.emplace_back([&cfg, &tm, &index, &ctx, &stats_reg, &shutdown, i] {
-                https_worker(cfg, tm, index, ctx, stats_reg, shutdown, i);
-            });
+        auto context = tls::Context::create(certs);
+        if (!context) {
+            if (blocking_lfd >= 0) ::close(blocking_lfd);
+            return std::unexpected(context.error());
+        }
+        https_ctx.emplace(std::move(*context));
     }
 #else
-    if (cfg.enable_https) return err(Errc::unsupported, "built without OpenSSL — HTTPS unavailable");
+    if (cfg.enable_https) {
+        if (blocking_lfd >= 0) ::close(blocking_lfd);
+        return err(Errc::unsupported, "built without OpenSSL — HTTPS unavailable");
+    }
+#endif
+
+    // Native RDMA is a distinct reliable-connected endpoint, not TCP over IPoIB. CM acceptance and
+    // each connection's verbs/io_uring progress run outside the TCP worker loops while sharing the
+    // same canonical index, TierManager, write policy, and stats registry.
+    if (cfg.rdma.enabled) {
+        std::promise<Status> startup;
+        auto ready = startup.get_future();
+        workers.emplace_back([&cfg, &tm, &index, &stats_reg, &shutdown,
+                              &rdma_runtime_failure, startup = std::move(startup)]() mutable {
+            bool announced = false;
+            auto status = net::serve_rdma(
+                cfg.rdma, cfg.memcache_write_mode, tm, index, stats_reg, shutdown,
+                [&startup, &announced](Status value) {
+                    announced = true;
+                    startup.set_value(std::move(value));
+                });
+            if (!status && announced) {
+                rdma_runtime_failure.emplace(status.error());
+                shutdown.store(true, std::memory_order_relaxed);
+                std::println(stderr, "RDMA listener: {}", status.error().detail);
+            }
+        });
+        Status opened = ready.get();
+        if (!opened) return abort_startup("RDMA listener", opened.error());
+    }
+
+    // memcache: async io_uring loops, or the blocking thread-per-core fallback (--net blocking).
+    if (cfg.enable_memcache) {
+        if (cfg.net == NetMode::async) {
+            for (unsigned i = 0; i < n; ++i) {
+                std::promise<Status> startup;
+                auto ready = startup.get_future();
+                workers.emplace_back([&cfg, &tm, &index, &stats_reg, &shutdown, i,
+                                      startup = std::move(startup)]() mutable {
+                    async_worker(cfg, tm, index, stats_reg, shutdown, i, std::move(startup));
+                });
+                Status opened = ready.get();
+                if (!opened)
+                    return abort_startup("memcache worker " + std::to_string(i),
+                                         opened.error());
+            }
+        } else {
+            for (unsigned i = 0; i < n; ++i) {
+                std::promise<Status> startup;
+                auto ready = startup.get_future();
+                workers.emplace_back([&cfg, &tm, &index, &shutdown, i, fd = blocking_lfd,
+                                      startup = std::move(startup)]() mutable {
+                    worker_loop(fd, cfg, tm, index, shutdown, i, std::move(startup));
+                });
+                Status opened = ready.get();
+                if (!opened)
+                    return abort_startup("blocking memcache worker " + std::to_string(i),
+                                         opened.error());
+            }
+        }
+    }
+    // HTTP: always async, on its own loops + read pool (per-protocol isolation, ADR-0011).
+    if (cfg.enable_http) {
+        for (unsigned i = 0; i < n; ++i) {
+            std::promise<Status> startup;
+            auto ready = startup.get_future();
+            workers.emplace_back([&cfg, &tm, &index, &stats_reg, &shutdown, i,
+                                  startup = std::move(startup)]() mutable {
+                http_worker(cfg, tm, index, stats_reg, shutdown, i, std::move(startup));
+            });
+            Status opened = ready.get();
+            if (!opened)
+                return abort_startup("HTTP worker " + std::to_string(i), opened.error());
+        }
+    }
+
+    // HTTPS: the shared context was built before any listener thread; now start each endpoint and
+    // wait for its own ring, buffer pool, and SO_REUSEPORT listener to be ready.
+#if GOBLIN_HAVE_TLS
+    if (cfg.enable_https) {
+        tls::Context& ctx = *https_ctx;
+        for (unsigned i = 0; i < n; ++i) {
+            std::promise<Status> startup;
+            auto ready = startup.get_future();
+            workers.emplace_back([&cfg, &tm, &index, &ctx, &stats_reg, &shutdown, i,
+                                  startup = std::move(startup)]() mutable {
+                https_worker(cfg, tm, index, ctx, stats_reg, shutdown, i,
+                             std::move(startup));
+            });
+            Status opened = ready.get();
+            if (!opened)
+                return abort_startup("HTTPS worker " + std::to_string(i), opened.error());
+        }
+    }
 #endif
 
     // TTL reaper: periodically reclaim expired objects (reads already lazy-skip them). Runs for the
@@ -431,8 +598,8 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
             }
         });
 
-    for (auto& t : workers) t.join();
-    if (blocking_lfd >= 0) ::close(blocking_lfd);
+    join_workers();
+    if (rdma_runtime_failure) return std::unexpected(std::move(*rdma_runtime_failure));
     return {};
 }
 

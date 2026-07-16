@@ -7,6 +7,7 @@
 #include "goblin/net/stream_loop.hpp"
 
 #include <string>
+#include <string_view>
 
 namespace goblin::memcache {
 
@@ -16,9 +17,10 @@ public:
 
 protected:
     void process(Conn*) override;
-    void frame_get_hit(Conn*, const std::string& key, const storage::ObjectMeta&) override;
+    void frame_get_hit(Conn*, std::string_view key, const storage::ObjectMeta&) override;
     void frame_get_miss(Conn*) override;
     void on_value_sent(Conn*) override;
+    void append_value_trailer(Conn*) override;
 
 private:
     std::string format_stats() const; // STAT lines for the memcache `stats` command (aggregated)

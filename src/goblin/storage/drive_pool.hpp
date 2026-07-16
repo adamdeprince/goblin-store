@@ -37,11 +37,19 @@ public:
     // Number of constituent files an object of `tier_bytes` occupies: min(N, ceil(bytes/S)).
     unsigned files_used(Size tier_bytes) const noexcept;
 
+    // Final byte extent of one constituent file after striping `tier_bytes`. This is O(1) even for
+    // multi-terabyte objects and includes a possible partial last stripe. Summing this over all
+    // drives equals tier_bytes exactly. Used by fallocate admission before streaming starts.
+    Size file_extent(std::uint64_t key_hash, Size tier_bytes, unsigned drive) const noexcept;
+
     // Map tier-local range [off, off+len) to read segments: one per chunk, in logical order,
     // each contiguous in BOTH file and logical space (gather them by accumulating lengths).
-    // A single row (N*S) -> one segment per drive (N-way parallel). Merging a drive's chunks into
-    // one readv/writev for big sequential per-drive I/O is a later optimization — flat coalescing
-    // is wrong for N>1 because a drive's chunks are strided in the logical buffer.
+    // Writes up to `out.size()` segments into `out`; returns the count written. If the range needs
+    // more segments than `out` has room, fills what fits and returns out.size() (caller should size
+    // for worst-case: ~ceil(len/stripe_unit) entries). Prefer this over the vector form on hot paths.
+    std::size_t plan_reads(std::uint64_t key_hash, Offset off, Size len,
+                           std::span<ReadSegment> out) const noexcept;
+    // Heap form for callers that need a dynamic list (tests, rare paths).
     std::vector<ReadSegment> plan_reads(std::uint64_t key_hash, Offset off, Size len) const;
 
 private:

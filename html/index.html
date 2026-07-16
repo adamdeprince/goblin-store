@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Goblin Store is a NUMA-aware large-object memcache clone and HTTP object server that keeps object heads in RAM while streaming tails from SSD and HDD.">
+  <meta name="description" content="Goblin Store is a NUMA-aware large-object memcache clone with TCP, native InfiniBand/RoCE, and HTTP front ends. Object heads stay in RAM while tails stream from SSD and HDD.">
   <meta name="theme-color" content="#11130f">
   <meta property="og:title" content="Goblin Store — first byte from RAM, the rest already on its way">
   <meta property="og:description" content="Memcache latency for large objects with 7.4× less RAM. A RAM head hides SSD and HDD latency while a read-ahead pipeline keeps the wire fed.">
@@ -107,6 +107,8 @@
     .button.primary:hover { color: var(--white); background: var(--acid-dark); border-color: var(--acid-dark); }
     .button.secondary { background: rgba(255,255,255,.72); }
     .button.secondary:hover { color: var(--cyan); background: var(--white); }
+    .button.bug-button { background: var(--acid); box-shadow: 4px 4px 0 var(--ink); }
+    .button.bug-button:hover { color: var(--white); background: var(--orange); }
     .hero-note { max-width: 650px; margin: 25px 0 0; color: var(--muted); font: .73rem/1.5 var(--mono); }
     .hero-note::before { content: "✓ "; color: var(--acid-dark); font-weight: 900; }
 
@@ -205,6 +207,20 @@
     .quick-links { display: flex; flex-wrap: wrap; gap: 12px 25px; margin-top: 26px; }
     .quick-links a { color: var(--cyan-bright); font: .76rem var(--mono); }
 
+    .support { padding: 62px max(20px, calc((100vw - var(--max)) / 2)); background: var(--acid); border-top: 1px solid var(--ink); }
+    .support-inner {
+      display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 42px;
+      width: min(100%, var(--max)); margin: 0 auto;
+    }
+    .support .section-label { margin-bottom: 12px; color: var(--ink); }
+    .support .section-label::before { color: var(--ink); }
+    .support h2 { max-width: 800px; font-size: clamp(2rem, 4.4vw, 4rem); }
+    .support-copy { max-width: 720px; margin-top: 15px; font: 1.08rem/1.55 var(--serif); }
+    .support .button {
+      min-width: 230px; color: var(--white); background: var(--ink); box-shadow: 7px 7px 0 var(--white);
+    }
+    .support .button:hover { color: var(--white); background: var(--orange); border-color: var(--ink); }
+
     .site-footer { padding: 38px max(20px, calc((100vw - var(--max)) / 2)); color: #bfc2b8; background: #090a08; }
     .footer-inner { display: flex; justify-content: space-between; gap: 30px; width: min(100%, var(--max)); margin: 0 auto; }
     .footer-brand { color: var(--white); font: 750 .84rem var(--mono); }
@@ -235,6 +251,8 @@
       .feature { min-height: auto; padding: 30px 0; }
       .feature + .feature { padding-left: 0; border-left: 0; border-top: 1px solid var(--ink); }
       .feature-num { margin-bottom: 30px; }
+      .support-inner { grid-template-columns: 1fr; }
+      .support .button { justify-self: start; }
     }
 
     @media (max-width: 620px) {
@@ -254,6 +272,8 @@
       .metric:last-child { border-bottom: 0; }
       .fit-list, .pipeline-note { grid-template-columns: 1fr; }
       .scope-card { padding: 27px; box-shadow: 6px 6px 0 var(--ink); }
+      .support { padding-top: 50px; padding-bottom: 54px; }
+      .support .button { width: 100%; box-shadow: 5px 5px 0 var(--white); }
       .footer-inner { display: block; }
       .footer-copy { margin-top: 18px; text-align: left; }
     }
@@ -287,13 +307,14 @@
         <h1 id="hero-title">First byte from RAM. The rest is already on its way.</h1>
         <p class="hero-copy">
           Goblin Store keeps each object’s latency-sensitive <strong>head in RAM</strong>, streams the middle from SSD,
-          and hoards the cold tail on cheap HDD. It speaks memcache, but large objects no longer require an all-RAM bill.
+          and hoards the cold tail on cheap HDD. It speaks memcache over TCP or native RDMA, but large objects no longer require an all-RAM bill.
         </p>
         <div class="hero-actions">
           <a class="button primary" href="#quickstart">Build Goblin Store</a>
           <a class="button secondary" href="BENCHMARKS.html">Read the full benchmarks</a>
+          <a class="button bug-button" href="https://buymeacoffee.com/goblinreactor" aria-label="Support Goblin Reactor on Buy Me a Coffee">Feed the goblin bugs →</a>
         </div>
-        <p class="hero-note">Open source · Apache-2.0 · C++23 · NUMA-aware · HugeTLB · Linux io_uring · memcache text + meta · HTTP/HTTPS</p>
+        <p class="hero-note">Open source · Apache-2.0 · C++23 · NUMA-aware · HugeTLB · Linux io_uring · memcache/TCP · native InfiniBand/RoCE · HTTP/HTTPS</p>
       </div>
     </section>
 
@@ -360,7 +381,7 @@
           <article class="pipeline-step">
             <small>01 · now</small>
             <h3>RAM head</h3>
-            <p>The first 256 KiB is resident and served zero-copy for immediate time-to-first-byte.</p>
+            <p>The configurable resident head is ready immediately; TCP can pin it for zero-copy while RDMA stages it in registered bulk memory.</p>
           </article>
           <div class="pipeline-arrow" aria-hidden="true">→</div>
           <article class="pipeline-step">
@@ -402,6 +423,7 @@
             <a class="bench-link" href="BENCHMARKS.html">Full rig, methodology, tables, and caveats →</a>
             <p><a class="bench-link" href="docs/numa-interconnect-bandwidth.html">NUMA interconnect-bandwidth report →</a></p>
             <p><a class="bench-link" href="docs/numa-first-byte-latency.html">68 million requests: local vs remote first-byte latency →</a></p>
+            <p><a class="bench-link" href="docs/native-rdma-256k-performance.html">Native InfiniBand: 38.2 Gbit/s and 7.7 us median header TTFB →</a></p>
           </div>
 
           <figure class="bar-chart">
@@ -508,13 +530,13 @@
         <div class="features-grid">
           <article class="feature">
             <span class="feature-num">01 / protocol</span>
-            <h3>Drop-in memcache surface</h3>
-            <p>Classic text and meta protocols over TCP, with TTL and CAS. HTTP/1.1 adds <code>GET</code>, <code>HEAD</code>, ranges, ETags, and optional HTTPS via OpenSSL + kTLS.</p>
+            <h3>TCP and native RDMA</h3>
+            <p>Classic memcache over TCP, plus a native InfiniBand/RoCE v3 path: small commands stay inline while object bodies use registered, credit-controlled bulk windows. HTTP/1.1 adds <code>GET</code>, <code>HEAD</code>, ranges, ETags, and optional HTTPS.</p>
           </article>
           <article class="feature">
             <span class="feature-num">02 / runtime</span>
-            <h3>NUMA-aware, thread per core</h3>
-            <p>Workers, key space, and NIC-facing traffic stay local. Heads pack into HugeTLB-backed blocks, and hot full blocks move off remote memory. FPGA NICs and direct userspace networking are on the development path.</p>
+            <h3>NUMA-aware data paths</h3>
+            <p>TCP/HTTP use core-local loops; each native RDMA connection owns its QP and progress thread. Exact HCA addresses select their NUMA node, heads pack into HugeTLB-backed blocks, and hot full blocks move off remote memory. FPGA NICs and direct userspace networking are on the development path.</p>
           </article>
           <article class="feature">
             <span class="feature-num">03 / safety</span>
@@ -537,6 +559,7 @@
             <span>CMake ≥ 3.28</span>
             <span>liburing</span>
             <span>OpenSSL</span>
+            <span>libibverbs + librdmacm (optional)</span>
           </div>
         </div>
         <div>
@@ -554,12 +577,25 @@
   --memcache-port 11211 --http-port 8080</code></pre>
           <div class="quick-links">
             <a href="README.html">Complete README →</a>
-            <a href="docs/adr/README.html">19 architecture decisions →</a>
+            <a href="docs/adr/README.html">20 architecture decisions →</a>
+            <a href="docs/adr/0020-native-rdma-bulk-windows.html">Native RDMA bulk-window design →</a>
+            <a href="docs/native-rdma-256k-performance.html">Native InfiniBand performance report →</a>
             <a href="docs/numa-interconnect-bandwidth.html">NUMA interconnect-bandwidth report →</a>
             <a href="docs/numa-first-byte-latency.html">Direct-link NUMA latency study →</a>
             <a href="https://github.com/adamdeprince/goblin-store">Source + issues →</a>
           </div>
         </div>
+      </div>
+    </section>
+
+    <section class="support" aria-labelledby="support-title">
+      <div class="support-inner">
+        <div>
+          <p class="section-label">Feed the goblin</p>
+          <h2 id="support-title">Chickens eat bugs. This goblin eats software bugs.</h2>
+          <p class="support-copy">If Goblin Store saves you RAM, feed it through Buy Me a Coffee and keep the open-source chicken pecking through the bug pile.</p>
+        </div>
+        <a class="button" href="https://buymeacoffee.com/goblinreactor" aria-label="Support Goblin Reactor on Buy Me a Coffee">Buy the goblin some bugs →</a>
       </div>
     </section>
   </main>
@@ -569,7 +605,8 @@
       <div class="footer-brand">Goblin Store</div>
       <div class="footer-copy">
         First byte from RAM. The rest is already on its way. · © 2026 Adam DePrince ·
-        <a href="LICENSE">Apache-2.0</a> · Built by <a href="https://goblinreactor.com">Goblin Reactor</a>
+        <a href="LICENSE">Apache-2.0</a> · Built by <a href="https://goblinreactor.com">Goblin Reactor</a> ·
+        <a href="https://buymeacoffee.com/goblinreactor">Feed the goblin</a>
       </div>
     </div>
   </footer>

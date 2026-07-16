@@ -235,6 +235,7 @@ Result<BlockPool> BlockPool::create_regions(Size block_bytes,
         num_blocks += count;
         region.end_block = static_cast<unsigned>(num_blocks);
         region.numa_node = requested.numa_node;
+        region.allocation_class = requested.allocation_class;
         region.bytes = requested.bytes;
         region.free.reserve(static_cast<std::size_t>(count));
         for (unsigned i = region.end_block; i-- > region.first_block;) region.free.push_back(i);
@@ -289,7 +290,7 @@ Result<BlockPool> BlockPool::create_regions(Size block_bytes,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (p == MAP_FAILED) {
                 return err(Errc::out_of_memory,
-                           std::string("mmap NUMA head arena: ") + std::strerror(errno));
+                           std::string("mmap NUMA RAM arena: ") + std::strerror(errno));
             }
             region.base = static_cast<std::byte*>(p);
             region.mapped = true;
@@ -308,7 +309,7 @@ Result<BlockPool> BlockPool::create_regions(Size block_bytes,
         }
 
         if (lock_memory && ::mlock(region.base, static_cast<std::size_t>(region.bytes)) != 0) {
-            const std::string detail = std::string("mlock head arena: ") + std::strerror(errno) +
+            const std::string detail = std::string("mlock RAM arena: ") + std::strerror(errno) +
                                        " (need sufficient per-node RAM and "
                                        "RLIMIT_MEMLOCK/CAP_IPC_LOCK)";
             return err(Errc::out_of_memory, detail);
@@ -403,6 +404,11 @@ std::optional<unsigned> BlockPool::region_numa_node(std::size_t region) const no
     return region < regions_.size() ? regions_[region].numa_node : std::nullopt;
 }
 
+BufferPoolClass BlockPool::region_allocation_class(std::size_t region) const noexcept {
+    return region < regions_.size() ? regions_[region].allocation_class
+                                    : BufferPoolClass::shared;
+}
+
 std::optional<std::size_t> BlockPool::block_region(unsigned block) const noexcept {
     for (std::size_t region = 0; region < regions_.size(); ++region)
         if (block >= regions_[region].first_block && block < regions_[region].end_block)
@@ -454,7 +460,8 @@ Result<BufferPool> BufferPool::create_regions(std::span<const BlockPoolRegion> r
     return BufferPool(std::move(*bp));
 }
 
-std::optional<BufferPool::Region> BufferPool::allocate(std::uint32_t bytes, Size min_alloc) {
+std::optional<BufferPool::Region> BufferPool::allocate(std::uint32_t bytes, Size min_alloc,
+                                                       BufferPoolClass allocation_class) {
     if (bytes == 0 || static_cast<Size>(bytes) > blocks_.block_bytes()) return std::nullopt;
     const bool small = min_alloc < kDeviceBlock; // small heads never DMA -> byte-granular bump arena;
                                                  // large heads stay buddy (power-of-two, O_DIRECT-aligned)
@@ -462,6 +469,7 @@ std::optional<BufferPool::Region> BufferPool::allocate(std::uint32_t bytes, Size
     // Search one NUMA region at a time. Existing foreign arenas must not steal an allocation while
     // the local region still has either compatible arena space or an unused block.
     for (std::size_t region = 0; region < blocks_.region_count(); ++region) {
+        if (blocks_.region_allocation_class(region) != allocation_class) continue;
         for (unsigned b = blocks_.region_first_block(region);
              b < blocks_.region_end_block(region); ++b) {
             std::optional<Offset> off;
@@ -525,8 +533,12 @@ std::byte* BufferPool::addr(unsigned block, std::uint32_t offset) const noexcept
 }
 
 bool BufferPool::block_is_local(unsigned block) const noexcept {
-    return blocks_.region_count() > 0 && block >= blocks_.region_first_block(0) &&
-           block < blocks_.region_end_block(0);
+    const auto region = blocks_.block_region(block);
+    if (!region) return false;
+    const auto allocation_class = blocks_.region_allocation_class(*region);
+    for (std::size_t prior = 0; prior < *region; ++prior)
+        if (blocks_.region_allocation_class(prior) == allocation_class) return false;
+    return true;
 }
 
 std::optional<Size> BufferPool::buddy_allocation_bytes(unsigned block, Size bytes) const noexcept {
@@ -546,6 +558,12 @@ bool BufferPool::full_buddy_block(unsigned block, Size indexed_bytes) const noex
 
 bool BufferPool::swap_blocks(unsigned first, unsigned second) {
     if (first == second || first >= arenas_.size() || second >= arenas_.size()) return false;
+    const auto first_region = blocks_.block_region(first);
+    const auto second_region = blocks_.block_region(second);
+    if (!first_region || !second_region ||
+        blocks_.region_allocation_class(*first_region) !=
+            blocks_.region_allocation_class(*second_region))
+        return false;
     if (!std::holds_alternative<BuddyAllocator>(arenas_[first]) ||
         !std::holds_alternative<BuddyAllocator>(arenas_[second]))
         return false;

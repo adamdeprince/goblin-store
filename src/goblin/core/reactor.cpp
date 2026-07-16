@@ -32,10 +32,20 @@ bool Reactor::submit_recv(int fd, MutBytes buf, std::uint64_t user_data) {
     return true;
 }
 
-bool Reactor::submit_send(int fd, ByteView buf, std::uint64_t user_data) {
+bool Reactor::submit_send(int fd, ByteView buf, std::uint64_t user_data, int flags) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
     if (!sqe) return false;
-    io_uring_prep_send(sqe, fd, buf.data(), buf.size(), MSG_NOSIGNAL);
+    io_uring_prep_send(sqe, fd, buf.data(), static_cast<unsigned>(buf.size()),
+                       MSG_NOSIGNAL | flags);
+    sqe->user_data = user_data;
+    return true;
+}
+
+bool Reactor::submit_sendmsg(int fd, msghdr* msg, std::uint64_t user_data, int flags) {
+    if (!msg) return false;
+    io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
+    if (!sqe) return false;
+    io_uring_prep_sendmsg(sqe, fd, msg, MSG_NOSIGNAL | flags);
     sqe->user_data = user_data;
     return true;
 }
@@ -54,6 +64,10 @@ bool Reactor::submit_poll(int fd, unsigned poll_mask, std::uint64_t user_data) {
     io_uring_prep_poll_add(sqe, fd, poll_mask);
     sqe->user_data = user_data;
     return true;
+}
+
+unsigned Reactor::submission_space() const noexcept {
+    return io_uring_sq_space_left(ring_.get());
 }
 
 int Reactor::submit() {
@@ -114,9 +128,11 @@ Result<Reactor> Reactor::create(unsigned) {
 }
 bool Reactor::submit_read(int, std::uint64_t, MutBytes, std::uint64_t) { return false; }
 bool Reactor::submit_recv(int, MutBytes, std::uint64_t) { return false; }
-bool Reactor::submit_send(int, ByteView, std::uint64_t) { return false; }
+bool Reactor::submit_send(int, ByteView, std::uint64_t, int) { return false; }
+bool Reactor::submit_sendmsg(int, msghdr*, std::uint64_t, int) { return false; }
 bool Reactor::submit_accept(int, std::uint64_t) { return false; }
 bool Reactor::submit_poll(int, unsigned, std::uint64_t) { return false; }
+unsigned Reactor::submission_space() const noexcept { return 0; }
 int Reactor::submit() { return 0; }
 int Reactor::submit_and_wait(unsigned) { return 0; }
 void Reactor::submit_and_wait_timeout(unsigned) {}

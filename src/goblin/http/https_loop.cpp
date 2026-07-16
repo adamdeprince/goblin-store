@@ -49,6 +49,11 @@ void HttpsLoop::ssl_read_step(Conn* c) {
     char buf[16 * 1024];
     const int r = SSL_read(ssl, buf, sizeof buf);
     if (r > 0) {
+        // Compact any consume cursor before appending so unparsed bytes stay contiguous.
+        if (c->in_off) {
+            c->in.erase(0, c->in_off);
+            c->in_off = 0;
+        }
         c->in.append(buf, static_cast<std::size_t>(r));
         process(c); // HttpLoop::process; its tail re-enters start_recv() to drain buffered records
         return;

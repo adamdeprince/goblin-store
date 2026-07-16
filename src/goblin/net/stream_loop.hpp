@@ -23,6 +23,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <sys/socket.h> // iovec, msghdr, MSG_MORE
 #include <unordered_map>
 
 namespace goblin::net {
@@ -30,7 +32,8 @@ namespace goblin::net {
 class StreamLoop {
 public:
     StreamLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm, storage::Index& index,
-               core::IoBufferPool& iobufs, unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr);
+               core::IoBufferPool& iobufs, unsigned io_timeout_ms = 0,
+               core::StatsRegistry* reg = nullptr, WriteMode write_mode = WriteMode::evict);
     virtual ~StreamLoop();
 
     void run();           // arm accept, then loop until stop()
@@ -55,12 +58,20 @@ protected:
         std::chrono::steady_clock::time_point last_progress{}; // last completion that moved bytes (stall timeout)
         std::array<std::byte, 16 * 1024> rbuf;
         std::string in;           // accumulated unparsed request bytes
+        std::size_t in_off = 0;   // consume cursor into `in` (avoids front-erase memmove until compact)
+        std::size_t phr_prev_len = 0; // picohttpparser resume length (HTTP partial headers)
         std::string out;          // response header / status line / trailer pending send
         std::size_t out_sent = 0; // partial-send progress into out
+        // Coalesced header+head sendmsg (TTFB): iov lives here until the CQE, not on the stack.
+        iovec send_iov[2]{};
+        msghdr send_msg{};
+        bool coalesced_send = false;     // in-flight CQE spans out + head pin
+        Size coalesced_head_len = 0;     // head bytes included in the writev
         std::string sni;          // TLS SNI, set after the handshake (empty = plaintext); HTTPS enforces Host==sni
 
         // GET streaming state:
         std::string get_key;        // final (post-derivation) key, kept to re-open_snapshot when parked
+        crypto::Digest get_digest{}; // hashed key for park/retry (avoid re-SHA-256 on drain)
         std::optional<ByteRange> req_range; // requested sub-range (HTTP Range), resolved in frame_get_hit
         std::string inm;            // HTTP If-None-Match (conditional GET), used in frame_get_hit; empty=absent
         bool get_with_cas = false;  // memcache `gets`: emit the CAS in the VALUE header
@@ -114,9 +125,12 @@ protected:
 
     // ---- the four protocol seams ----
     virtual void process(Conn*) = 0;                  // parse `in`, act, queue replies / start streams
-    virtual void frame_get_hit(Conn*, const std::string& key, const storage::ObjectMeta&) = 0; // header + range
+    virtual void frame_get_hit(Conn*, std::string_view key, const storage::ObjectMeta&) = 0; // header + range
     virtual void frame_get_miss(Conn*) = 0;           // queue the miss response (END / 404), state -> idle
     virtual void on_value_sent(Conn*) = 0;            // value fully streamed: trailer (memcache) or finish (HTTP)
+    // Append only the after-value framing into `out` (memcache CRLF+END; HTTP nothing). Used by the
+    // small-object inline path that already copied the body into `out` for a single send.
+    virtual void append_value_trailer(Conn*) = 0;
 
     // ---- optional seams (default to plaintext); HTTPS overrides them to drive the TLS handshake/read ----
     virtual void on_connection(Conn* c) { start_recv(c); } // first action after accept (TLS: handshake)
@@ -124,12 +138,31 @@ protected:
     virtual void on_destroy(Conn*) {}                      // conn retiring -> free any per-conn TLS state
 
     // ---- shared machinery the subclass drives ----
-    bool begin_get(Conn*, const std::string& key,
-                   bool record_access = true); // false if parked on read-pool exhaustion
+    // Hash `key` once; on read-pool exhaustion parks with get_key+get_digest and returns false.
+    // Drain retries via the digest overload so the key is not re-hashed.
+    bool begin_get(Conn*, std::string_view key, bool record_access = true, std::uint32_t now = 0);
+    bool begin_get(Conn*, std::string_view key, const crypto::Digest& digest, bool record_access,
+                   std::uint32_t now = 0);
     virtual void start_recv(Conn*);                 // post a recv (HTTPS overrides: poll-driven SSL_read)
-    void start_send(Conn*);                         // (re)send the pending `out`
+    void start_send(Conn*);                         // (re)send the pending `out` (may coalesce with head)
     void close_conn(Conn*);
     void finish_get(Conn*); // GET fully served -> release buffers, resume parsing
+
+    // Input-buffer helpers: `in_off` is a consume cursor so pipelined leftovers aren't memmoved
+    // on every request. Compact when waste grows large or the buffer is fully consumed.
+    static std::string_view in_view(const Conn* c) noexcept {
+        return std::string_view(c->in).substr(c->in_off);
+    }
+    static void consume_in(Conn* c, std::size_t n) noexcept {
+        c->in_off += n;
+        if (c->in_off >= c->in.size()) {
+            c->in.clear();
+            c->in_off = 0;
+        } else if (c->in_off >= 4096) { // bound wasted prefix so capacity doesn't grow unbounded
+            c->in.erase(0, c->in_off);
+            c->in_off = 0;
+        }
+    }
 
     enum Op : unsigned { kRecv = 1, kSend = 2, kRead = 3, kPoll = 4 }; // user_data low 3 bits
     static std::uint64_t tag(Conn* c, unsigned op) { return reinterpret_cast<std::uint64_t>(c) | op; }
@@ -140,6 +173,7 @@ protected:
     core::IoBufferPool& iobufs_;
     core::Stats stats_;                 // this worker's counters (single-writer; aggregated via reg_)
     core::StatsRegistry* reg_ = nullptr; // registry to aggregate on `stats` (memcache only); may be null
+    WriteMode write_mode_ = WriteMode::evict; // protocol-specific disk-full admission policy
     bool read_ahead_ = true;             // acquire a 2nd read lane for pipelining in begin_get (A/B knob)
     std::deque<Conn*> set_waiters_; // writes parked on staging exhaustion (ADR-0011 backpressure)
     std::deque<Conn*> get_waiters_; // GETs parked on read I/O-pool exhaustion (per-loop; queue, never shed)
@@ -154,8 +188,9 @@ private:
     void on_read(Conn*, int res);
     void start_send_head(Conn*);  // send the pinned head region zero-copy (partial-aware)
     void start_lane_send(Conn*);  // (re)send the current lane's piece (partial-aware)
-    void enter_stream(Conn*);     // head done -> begin streaming the disk tail through the lanes
-    void pump_stream(Conn*);      // start the next ordered send + read-ahead, or finish the value
+    void prime_tail_read(Conn*);  // initial response queued -> start disk I/O behind the head
+    void enter_stream(Conn*);     // head done -> allow the prefetched disk tail to send
+    void pump_stream(Conn*);      // drive ordered sends plus read-ahead, or finish the value
     bool plan_lane_read(Conn*, int lane); // plan + issue a piece's reads into a lane; false -> abort
     void abort_get(Conn*);        // error mid-GET -> release buffers, close
     void drain_set_waiters();     // retry parked writes once a staging buffer may be free

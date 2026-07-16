@@ -14,6 +14,30 @@ endif()
 option(GOBLIN_WERROR   "Treat warnings as errors"        ON)
 option(GOBLIN_SANITIZE "ASan/UBSan in Debug builds"      ON)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(_goblin_rdma_default ON)
+else()
+  set(_goblin_rdma_default OFF)
+endif()
+option(GOBLIN_ENABLE_RDMA "Build the native libibverbs/librdmacm memcache endpoint"
+       ${_goblin_rdma_default})
+
+# ---- native RDMA: optional on Linux; the server source supplies an unsupported stub otherwise ----
+set(GOBLIN_HAVE_RDMA 0)
+if(GOBLIN_ENABLE_RDMA AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_path(GOBLIN_IBVERBS_INCLUDE_DIR NAMES infiniband/verbs.h)
+  find_path(GOBLIN_RDMACM_INCLUDE_DIR NAMES rdma/rdma_cma.h)
+  find_library(GOBLIN_IBVERBS_LIBRARY NAMES ibverbs)
+  find_library(GOBLIN_RDMACM_LIBRARY NAMES rdmacm)
+  if(GOBLIN_IBVERBS_INCLUDE_DIR AND GOBLIN_RDMACM_INCLUDE_DIR AND
+     GOBLIN_IBVERBS_LIBRARY AND GOBLIN_RDMACM_LIBRARY)
+    set(GOBLIN_HAVE_RDMA 1)
+  else()
+    message(STATUS
+      "goblin-store: native RDMA disabled (install libibverbs-dev and librdmacm-dev)")
+  endif()
+endif()
+
 # ---- liburing (ADR-0002): optional; a stub reactor is used when absent ----
 find_package(PkgConfig QUIET)
 set(GOBLIN_HAVE_URING 0)
@@ -46,10 +70,13 @@ target_include_directories(picohttpparser SYSTEM PUBLIC
   "${CMAKE_SOURCE_DIR}/third_party/picohttpparser")
 
 add_library(goblin_core STATIC ${GOBLIN_LIB_SOURCES})
-target_include_directories(goblin_core PUBLIC "${CMAKE_SOURCE_DIR}/src")
+target_include_directories(goblin_core PUBLIC
+  "${CMAKE_SOURCE_DIR}/src"
+  "${CMAKE_SOURCE_DIR}/python/cpp/include")
 target_compile_features(goblin_core PUBLIC cxx_std_23)
 target_compile_definitions(goblin_core PUBLIC GOBLIN_HAVE_URING=${GOBLIN_HAVE_URING})
 target_compile_definitions(goblin_core PUBLIC GOBLIN_HAVE_TLS=${GOBLIN_HAVE_TLS})
+target_compile_definitions(goblin_core PUBLIC GOBLIN_HAVE_RDMA=${GOBLIN_HAVE_RDMA})
 
 set(GOBLIN_WARNINGS -Wall -Wextra -Wpedantic)
 if(GOBLIN_WERROR)
@@ -64,6 +91,15 @@ endif()
 
 if(GOBLIN_HAVE_TLS)
   target_link_libraries(goblin_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
+if(GOBLIN_HAVE_RDMA)
+  target_include_directories(goblin_core SYSTEM PUBLIC
+    "${GOBLIN_IBVERBS_INCLUDE_DIR}"
+    "${GOBLIN_RDMACM_INCLUDE_DIR}")
+  target_link_libraries(goblin_core PUBLIC
+    "${GOBLIN_IBVERBS_LIBRARY}"
+    "${GOBLIN_RDMACM_LIBRARY}")
 endif()
 
 if(GOBLIN_SANITIZE)
@@ -99,4 +135,4 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-message(STATUS "goblin-store ${PROJECT_VERSION}  io_uring=${GOBLIN_HAVE_URING}  build=${CMAKE_BUILD_TYPE}  werror=${GOBLIN_WERROR}")
+message(STATUS "goblin-store ${PROJECT_VERSION}  io_uring=${GOBLIN_HAVE_URING}  rdma=${GOBLIN_HAVE_RDMA}  build=${CMAKE_BUILD_TYPE}  werror=${GOBLIN_WERROR}")

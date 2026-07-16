@@ -1,12 +1,13 @@
 #include "goblin/storage/striped_io.hpp"
 
+#include <cerrno>
 #include <unistd.h> // pwrite
 #include <vector>
 
 namespace goblin::storage {
 
 Status striped_pwrite(const DrivePool& pool, std::uint64_t key_hash, std::span<const int> fds,
-                      Offset offset, ByteView data) {
+                      Offset offset, ByteView data, unsigned* failed_drive) {
     const auto segs = pool.plan_reads(key_hash, offset, data.size());
     Size dst = 0;
     for (const auto& s : segs) {
@@ -15,6 +16,11 @@ Status striped_pwrite(const DrivePool& pool, std::uint64_t key_hash, std::span<c
         Offset fo = s.file_offset;
         while (left > 0) {
             const ssize_t w = ::pwrite(fds[s.drive], src, left, static_cast<off_t>(fo));
+            if (w < 0 && errno == EINTR) continue;
+            if (w < 0 && (errno == ENOSPC || errno == EDQUOT)) {
+                if (failed_drive) *failed_drive = s.drive;
+                return err(Errc::out_of_space, "pwrite exhausted backing filesystem capacity");
+            }
             if (w <= 0) return err(Errc::io_error, "pwrite failed");
             src += w;
             fo += static_cast<Size>(w);
@@ -33,33 +39,44 @@ Result<std::size_t> striped_read(core::Reactor& reactor, const DrivePool& pool,
 
     // Queue one read per chunk; the kernel reads each into its (contiguous) slice of `out`.
     Size dst = 0;
+    unsigned submitted = 0;
+    bool submission_failed = false;
     for (const auto& s : segs) {
         if (!reactor.submit_read(fds[s.drive], s.file_offset, out.subspan(dst, s.length), 0)) {
             reactor.submit(); // SQ full: flush and retry once (TODO: batch for huge reads)
-            if (!reactor.submit_read(fds[s.drive], s.file_offset, out.subspan(dst, s.length), 0))
-                return err(Errc::io_error, "submission queue full");
+            if (!reactor.submit_read(fds[s.drive], s.file_offset,
+                                     out.subspan(dst, s.length), 0)) {
+                submission_failed = true;
+                break;
+            }
         }
         dst += s.length;
+        ++submitted;
     }
 
-    const unsigned n = static_cast<unsigned>(segs.size());
-    reactor.submit_and_wait(n);
+    if (submitted > 0) reactor.submit_and_wait(submitted);
 
-    std::vector<core::Completion> comps(n);
+    std::vector<core::Completion> comps(submitted);
     std::size_t total = 0;
     unsigned got = 0;
-    while (got < n) {
-        const unsigned r = reactor.reap(std::span<core::Completion>(comps.data(), n));
+    bool read_failed = false;
+    while (got < submitted) {
+        const unsigned r = reactor.reap(
+            std::span<core::Completion>(comps.data(), submitted - got));
         if (r == 0) {
             reactor.submit_and_wait(1);
             continue;
         }
         for (unsigned k = 0; k < r; ++k) {
-            if (comps[k].res < 0) return err(Errc::io_error, "striped read failed");
-            total += static_cast<std::size_t>(comps[k].res);
+            if (comps[k].res < 0)
+                read_failed = true;
+            else
+                total += static_cast<std::size_t>(comps[k].res);
         }
         got += r;
     }
+    if (submission_failed) return err(Errc::io_error, "submission queue full");
+    if (read_failed) return err(Errc::io_error, "striped read failed");
     return total;
 }
 

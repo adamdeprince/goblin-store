@@ -3,10 +3,16 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+// Linux coalesces with MSG_MORE; macOS/BSD lack it — soft-disable (still zero-cost flags=0).
+#ifndef MSG_MORE
+#define MSG_MORE 0
+#endif
 
 namespace goblin::net {
 
@@ -16,9 +22,10 @@ constexpr auto rlx = std::memory_order_relaxed;
 
 StreamLoop::StreamLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm,
                        storage::Index& index, core::IoBufferPool& iobufs, unsigned io_timeout_ms,
-                       core::StatsRegistry* reg)
-    : r_(reactor), tm_(tm), index_(index), iobufs_(iobufs), reg_(reg), lfd_(listen_fd),
-      io_timeout_ms_(io_timeout_ms), last_sweep_(std::chrono::steady_clock::now()) {
+                       core::StatsRegistry* reg, WriteMode write_mode)
+    : r_(reactor), tm_(tm), index_(index), iobufs_(iobufs), reg_(reg),
+      write_mode_(write_mode), lfd_(listen_fd), io_timeout_ms_(io_timeout_ms),
+      last_sweep_(std::chrono::steady_clock::now()) {
     if (reg_) reg_->add(&stats_);
 }
 
@@ -126,17 +133,58 @@ void StreamLoop::start_recv(Conn* c) {
 
 void StreamLoop::start_send(Conn* c) {
     if (c->closing) return;
+    // TTFB: first send of a GET header can be writev'd with the pinned head (zero-copy body).
+    if (c->state == St::get_header && c->out_sent == 0 && c->head_pin.valid &&
+        c->head_sent == c->get_pos) {
+        const Size head_hi = std::min<Size>(c->head_pin.len, c->get_size);
+        if (c->get_pos < head_hi) {
+            const ByteView head = tm_.pinned_bytes(c->head_pin);
+            const Size head_n = head_hi - c->get_pos;
+            c->send_iov[0].iov_base = const_cast<char*>(c->out.data());
+            c->send_iov[0].iov_len = c->out.size();
+            c->send_iov[1].iov_base =
+                const_cast<std::byte*>(head.data() + static_cast<std::size_t>(c->get_pos));
+            c->send_iov[1].iov_len = static_cast<std::size_t>(head_n);
+            std::memset(&c->send_msg, 0, sizeof c->send_msg);
+            c->send_msg.msg_iov = c->send_iov;
+            c->send_msg.msg_iovlen = 2;
+            // MORE when a disk tail (or further stream) follows the head slice.
+            const int flags = (c->get_size > head_hi) ? MSG_MORE : 0;
+            if (r_.submit_sendmsg(c->fd, &c->send_msg, tag(c, kSend), flags)) {
+                c->coalesced_send = true;
+                c->coalesced_head_len = head_n;
+                ++c->inflight;
+                prime_tail_read(c);
+                return;
+            }
+            // Fall through to plain send if sendmsg couldn't be queued.
+            c->coalesced_send = false;
+        }
+    }
     const auto* p = reinterpret_cast<const std::byte*>(c->out.data()) + c->out_sent;
-    if (r_.submit_send(c->fd, ByteView(p, c->out.size() - c->out_sent), tag(c, kSend)))
+    // MORE when this is a GET header and a head/body send will follow.
+    int flags = 0;
+    if (c->state == St::get_header) {
+        const Size head_hi = c->head_pin.valid ? std::min<Size>(c->head_pin.len, c->get_size) : 0;
+        if (c->get_pos < head_hi || c->get_pos < c->get_size) flags = MSG_MORE;
+    }
+    if (r_.submit_send(c->fd, ByteView(p, c->out.size() - c->out_sent), tag(c, kSend), flags)) {
         ++c->inflight;
-    else
+        prime_tail_read(c);
+    } else {
         close_conn(c);
+    }
 }
 
 void StreamLoop::on_recv(Conn* c, int res) {
     if (res <= 0) {
         close_conn(c);
         return;
+    }
+    // Keep unparsed bytes contiguous at the front so append stays O(new bytes), not O(buffer).
+    if (c->in_off) {
+        c->in.erase(0, c->in_off);
+        c->in_off = 0;
     }
     c->in.append(reinterpret_cast<const char*>(c->rbuf.data()), static_cast<std::size_t>(res));
     process(c);
@@ -148,8 +196,13 @@ void StreamLoop::on_recv(Conn* c, int res) {
 // parks in get_wait with the snapshot released (re-taken on retry; ADR-0011 backpressure -- queue,
 // never shed). On a hit, frame_get_hit() queues the header and state becomes get_header; on a miss,
 // frame_get_miss() queues the miss reply and state returns to idle.
-bool StreamLoop::begin_get(Conn* c, const std::string& key, bool record_access) {
-    auto snap = tm_.open_snapshot(crypto::hash_key(key), record_access);
+bool StreamLoop::begin_get(Conn* c, std::string_view key, bool record_access, std::uint32_t now) {
+    return begin_get(c, key, crypto::hash_key(key), record_access, now);
+}
+
+bool StreamLoop::begin_get(Conn* c, std::string_view key, const crypto::Digest& digest,
+                           bool record_access, std::uint32_t now) {
+    auto snap = tm_.open_snapshot(digest, record_access, now);
     if (!snap) {
         stats_.get_misses.fetch_add(1, rlx);
         frame_get_miss(c);
@@ -161,7 +214,8 @@ bool StreamLoop::begin_get(Conn* c, const std::string& key, bool record_access) 
         if (!buf) { // pool exhausted -> park: drop the snapshot now, re-take it when a buffer frees
             if (snap->pin.valid) tm_.unpin_head(snap->pin);
             stats_.get_backpressure.fetch_add(1, rlx);
-            c->get_key = key;
+            c->get_key.assign(key.data(), key.size());
+            c->get_digest = digest; // drain retries without re-hashing
             c->state = St::get_wait;
             get_waiters_.push_back(c);
             return false;
@@ -184,7 +238,39 @@ bool StreamLoop::begin_get(Conn* c, const std::string& key, bool record_access) 
     c->head_pin = snap->pin;
     c->head_sent = 0;
     stats_.get_hits.fetch_add(1, rlx);
+    // Eviction visited bits outside the snapshot critical section (scores already updated there).
+    if (record_access) tm_.touch_policies(digest, c->head_pin.valid);
     frame_get_hit(c, key, snap->meta); // protocol header + get_pos/get_size
+
+    // The protocol hook has now resolved the requested byte range. Start the tail after whichever
+    // bytes the pinned resident head will serve; this is derived from the actual head allocation,
+    // not the configurable --ram-head default. The first response send primes reads from plan_pos,
+    // while send_pos holds the strict network-order boundary until the head has finished sending.
+    const Size head_hi = c->head_pin.valid ? std::min<Size>(c->head_pin.len, c->get_size) : 0;
+    c->send_pos = c->plan_pos = std::max<Size>(c->get_pos, head_hi);
+
+    // Small-object fast path: the entire response body lives in the pinned head and fits a modest
+    // inline threshold. Append body + trailer into `out` for one send (no head/stream state machine).
+    // Above the threshold, keep zero-copy head sends. state stays idle so the caller's process()
+    // flushes `out` via start_send at the bottom of the parse loop.
+    constexpr Size kInlineBodyMax = 16 * 1024;
+    if (c->head_pin.valid && c->n_lanes == 0 && c->get_pos < c->get_size &&
+        c->get_size <= c->head_pin.len) {
+        const Size body_n = c->get_size - c->get_pos;
+        if (body_n <= kInlineBodyMax) {
+            const ByteView head = tm_.pinned_bytes(c->head_pin);
+            const ByteView body = head.subspan(static_cast<std::size_t>(c->get_pos),
+                                               static_cast<std::size_t>(body_n));
+            c->out.append(reinterpret_cast<const char*>(body.data()), body.size());
+            append_value_trailer(c);
+            unpin_if_held(c);
+            c->rs.reset();
+            c->get_pos = c->get_size; // value fully delivered into `out`
+            c->state = St::idle;
+            return true;
+        }
+    }
+
     c->state = St::get_header;
     return true;
 }
@@ -199,7 +285,8 @@ void StreamLoop::drain_set_waiters() {
             set_waiters_.pop_front();
             continue;
         }
-        auto h = tm_.begin_store(c->set_digest, c->set_remaining); // set_remaining == full nbytes here
+        auto h = tm_.begin_store(c->set_digest, c->set_remaining,
+                                 write_mode_); // set_remaining == full nbytes here
         if (!h) {
             if (h.error().code == Errc::would_block) return; // still no buffer -> retry next tick
             c->set_reject = true;                            // real open failure -> reject
@@ -223,16 +310,30 @@ void StreamLoop::drain_get_waiters() {
             continue;
         }
         get_waiters_.pop_front();
-        if (!begin_get(c, c->get_key, /*record_access=*/false))
+        // Reuse the digest stored at park time — no second SHA-256 of get_key.
+        if (!begin_get(c, c->get_key, c->get_digest, /*record_access=*/false))
             return; // re-parked -> pool still empty, retry next tick
-        if (c->state == St::get_header) start_send(c); // hit -> stream the value (header first)
-        else process(c);                                // miss while parked (removed) -> flush + resume
+        if (c->state == St::get_header)
+            start_send(c); // hit -> stream the value (header first)
+        else if (!c->out.empty())
+            start_send(c); // inlined small body already fully framed in `out`
+        else
+            process(c); // miss while parked (removed) -> flush + resume
     }
 }
 
-// Head/header fully sent: begin streaming the disk tail [get_pos, get_size) through the read lanes.
+// Queue the disk tail as soon as the first response send is queued. pump_stream() may fill both
+// read-ahead lanes while the header/head is still in flight, but its state gate prevents those lanes
+// from reaching the socket before enter_stream() declares the head complete.
+void StreamLoop::prime_tail_read(Conn* c) {
+    if (c->state != St::get_header || c->n_lanes == 0 || !c->rs ||
+        c->plan_pos >= c->get_size)
+        return;
+    pump_stream(c);
+}
+
+// Head/header fully sent: allow the already-prefetched disk tail to flow through the lanes.
 void StreamLoop::enter_stream(Conn* c) {
-    c->send_pos = c->plan_pos = c->get_pos;
     c->state = St::get_stream;
     pump_stream(c);
 }
@@ -242,8 +343,22 @@ void StreamLoop::enter_stream(Conn* c) {
 bool StreamLoop::plan_lane_read(Conn* c, int i) {
     Conn::Lane& L = c->lane[i];
     const Size want = std::min<Size>(L.buf.size(), c->get_size - c->plan_pos);
-    const auto plan = c->rs->plan(c->plan_pos, L.buf.subspan(0, want));
+    const auto plan = c->rs->plan(c->plan_pos, L.buf, want);
     if (plan.total != want) return false; // couldn't map the whole piece
+
+    // Validate and reserve the complete read batch before advancing any lane cursors. Early tail
+    // prefetch can coincide with many receive completions in one event-loop tick; without this
+    // preflight, a nearly full SQ could accept half a striped read and leave an unrepresentable lane.
+    for (const auto& s : plan.segments()) {
+        if (s.out_off > L.buf.size()) return false;
+        const Size rlen = std::min<Size>(align_up(s.len, kDeviceBlock), L.buf.size() - s.out_off);
+        if (rlen < s.len || !is_aligned(rlen, kDeviceBlock)) return false;
+    }
+    if (plan.nsegs > r_.submission_space()) {
+        (void)r_.submit(); // flush already-queued sends/reads, then recheck the now-drained SQ
+        if (plan.nsegs > r_.submission_space()) return false;
+    }
+
     L.len = plan.total;
     L.sent = 0;
     L.reads = 0;
@@ -251,11 +366,11 @@ bool StreamLoop::plan_lane_read(Conn* c, int i) {
     L.ready = false;
     c->plan_pos += L.len;
     c->fill_i = (c->fill_i + 1) % c->n_lanes;
-    if (plan.segs.empty()) { // all-head piece already copied into the buffer -> no disk reads
+    if (plan.nsegs == 0) { // all-head piece already copied into the buffer -> no disk reads
         L.ready = true;
         return true;
     }
-    for (const auto& s : plan.segs) {
+    for (const auto& s : plan.segments()) {
         // O_DIRECT (ADR-0011): read length must be a device-block multiple. Round up into the
         // (page-aligned, io_chunk-sized) buffer and serve only L.len bytes; offsets are already
         // 4 KiB-aligned (pieces start on 4 KiB boundaries, segments at stripe boundaries).
@@ -275,8 +390,11 @@ bool StreamLoop::plan_lane_read(Conn* c, int i) {
 void StreamLoop::pump_stream(Conn* c) {
     for (;;) {
         bool progress = false;
-        // Send the next piece in order, once its lane has finished reading and nothing else is sending.
-        if (c->send_lane < 0 && c->send_pos < c->get_size && c->lane[c->send_i].ready) {
+        const bool head_complete = c->state == St::get_stream;
+        // Send only after the header/resident head has completed. Reads are allowed to finish before
+        // that point, but their ready lanes remain parked so response byte order cannot change.
+        if (head_complete && c->send_lane < 0 && c->send_pos < c->get_size &&
+            c->lane[c->send_i].ready) {
             c->send_lane = c->send_i;
             c->lane[c->send_i].sent = 0;
             start_lane_send(c);
@@ -291,7 +409,8 @@ void StreamLoop::pump_stream(Conn* c) {
                 progress = true;
             }
         }
-        if (c->send_lane < 0 && c->read_lane < 0 && c->send_pos >= c->get_size) {
+        if (head_complete && c->send_lane < 0 && c->read_lane < 0 &&
+            c->send_pos >= c->get_size) {
             on_value_sent(c); // tail fully sent
             return;
         }
@@ -313,14 +432,17 @@ void StreamLoop::on_read(Conn* c, int res) {
         return;
     }
     c->lane[done].ready = true;
-    pump_stream(c); // piece ready -> may start its send and the next read-ahead
+    pump_stream(c); // may prefetch another lane; sends remain gated until the head completes
 }
 
 void StreamLoop::start_lane_send(Conn* c) {
     if (c->closing) return;
     Conn::Lane& L = c->lane[c->send_lane];
     const ByteView piece(L.buf.data() + L.sent, L.len - L.sent);
-    if (r_.submit_send(c->fd, piece, tag(c, kSend)))
+    // MORE only while more value bytes remain after this piece (not for protocol trailers —
+    // HTTP has none, and memcache END is a separate small send).
+    const int flags = (c->send_pos + L.len < c->get_size) ? MSG_MORE : 0;
+    if (r_.submit_send(c->fd, piece, tag(c, kSend), flags))
         ++c->inflight;
     else
         close_conn(c);
@@ -331,7 +453,9 @@ void StreamLoop::start_send_head(Conn* c) {
     const Size head_hi = std::min<Size>(c->head_pin.len, c->get_size); // head bytes within the range
     const ByteView head = tm_.pinned_bytes(c->head_pin); // zero-copy: straight from the head pool
     const ByteView rem(head.data() + c->head_sent, head_hi - c->head_sent);
-    if (r_.submit_send(c->fd, rem, tag(c, kSend)))
+    // MORE when a disk tail will follow the head slice.
+    const int flags = (head_hi < c->get_size) ? MSG_MORE : 0;
+    if (r_.submit_send(c->fd, rem, tag(c, kSend), flags))
         ++c->inflight;
     else
         close_conn(c);
@@ -378,6 +502,41 @@ void StreamLoop::on_send(Conn* c, int res) {
         }
         unpin_if_held(c);     // head slice fully sent -> release the pin
         c->get_pos = head_hi; // tail (if any) continues from the end of the head slice
+        // Whole value was the head (typical RAM-only / small object): skip the empty stream machine.
+        if (c->get_pos >= c->get_size) {
+            on_value_sent(c);
+            return;
+        }
+        enter_stream(c);
+        return;
+    }
+    // Coalesced header+head writev completion (state still get_header).
+    if (c->coalesced_send) {
+        c->coalesced_send = false;
+        const Size out_n = c->out.size();
+        const Size got = static_cast<Size>(res);
+        if (got < out_n) {
+            // Only part of the header went out; retry the remainder (no longer coalesced).
+            c->out_sent = static_cast<std::size_t>(got);
+            start_send(c);
+            return;
+        }
+        // Header fully sent; account head progress.
+        c->out.clear();
+        c->out_sent = 0;
+        c->head_sent = c->get_pos + (got - out_n);
+        const Size head_hi = std::min<Size>(c->head_pin.len, c->get_size);
+        if (c->head_sent < head_hi) {
+            c->state = St::get_send_head;
+            start_send_head(c);
+            return;
+        }
+        unpin_if_held(c);
+        c->get_pos = head_hi;
+        if (c->get_pos >= c->get_size) {
+            on_value_sent(c);
+            return;
+        }
         enter_stream(c);
         return;
     }
@@ -398,7 +557,11 @@ void StreamLoop::on_send(Conn* c, int res) {
             start_send_head(c);
         } else {
             unpin_if_held(c); // range is disk-only (or empty) -> drop the unused head pin
-            enter_stream(c);
+            if (c->get_pos >= c->get_size) {
+                on_value_sent(c);
+            } else {
+                enter_stream(c);
+            }
         }
     } else if (c->state == St::get_trailer)
         finish_get(c);
@@ -438,9 +601,8 @@ void StreamLoop::finish_get(Conn* c) {
 }
 
 void StreamLoop::abort_get(Conn* c) {
-    release_lanes(c);
-    unpin_if_held(c);
-    c->rs.reset();
+    // Reads and sends reference lane/head memory until their CQEs arrive. close_conn() stops new
+    // work; retire() releases every buffer, pin, and generation fd only after inflight reaches zero.
     close_conn(c);
 }
 

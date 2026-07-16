@@ -15,8 +15,8 @@ namespace {
 
 // Stream one file into the store through the chunked write path (bounded RAM = one `buf`).
 Status load_file(storage::TierManager& tm, const crypto::Digest& digest, const fs::path& path,
-                 Size size, std::span<std::byte> buf) {
-    auto h = tm.begin_store(digest, size); // startup is single-threaded, so the staging pool is free
+                 Size size, std::span<std::byte> buf, WriteMode write_mode) {
+    auto h = tm.begin_store(digest, size, write_mode); // startup: staging pool is uncontended
     if (!h) return std::unexpected(h.error());
     if (size > 0) {
         const int fd = ::open(path.c_str(), O_RDONLY);
@@ -33,13 +33,14 @@ Status load_file(storage::TierManager& tm, const crypto::Digest& digest, const f
         }
         ::close(fd);
     }
-    return h->commit(0);
+    if (auto st = h->commit(0); !st) return std::unexpected(st.error());
+    return {};
 }
 
 } // namespace
 
 std::size_t preload_sources(const std::vector<std::string>& dirs, const KeyOptions& opt,
-                            storage::TierManager& tm) {
+                            storage::TierManager& tm, WriteMode write_mode) {
     std::vector<std::byte> buf(256 * 1024); // shared read buffer, reused across files
     std::size_t loaded = 0;
     for (const auto& dir : dirs) {
@@ -59,7 +60,7 @@ std::size_t preload_sources(const std::vector<std::string>& dirs, const KeyOptio
             const std::string rel = fs::relative(p, root, ec).generic_string();
             if (ec || rel.empty()) { ec.clear(); continue; }
             const std::string key = derive_key_from_relpath(rel, opt);
-            if (auto st = load_file(tm, crypto::hash_key(key), p, size, buf); !st) {
+            if (auto st = load_file(tm, crypto::hash_key(key), p, size, buf, write_mode); !st) {
                 std::println(stderr, "source: {} — {}", p.string(), st.error().detail);
                 continue;
             }

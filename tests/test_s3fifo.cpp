@@ -62,3 +62,33 @@ TEST("s3fifo: remove drops an item without evicting it") {
     CHECK(v.has_value());
     CHECK(*v == k("b"));
 }
+
+TEST("s3fifo: stale resident node cannot match a reinserted digest") {
+    S3Fifo p(64);
+    p.insert(k("a"));
+    p.insert(k("b"));
+    p.remove(k("a"));
+    p.insert(k("a")); // a's new incarnation belongs behind b
+
+    CHECK(p.evict() == std::optional<Digest>(k("b")));
+    CHECK(p.evict() == std::optional<Digest>(k("a")));
+}
+
+TEST("s3fifo: stale ghost node cannot erase a newer ghost incarnation") {
+    S3Fifo p(2);
+    p.insert(k("x"));
+    CHECK(p.evict() == std::optional<Digest>(k("x"))); // ghost x, incarnation 1
+    p.insert(k("x"));                                // consume ghost; x enters main
+    CHECK(p.in_main(k("x")) == std::optional<bool>(true));
+
+    p.remove(k("x"));
+    p.insert(k("x"));
+    CHECK(p.evict() == std::optional<Digest>(k("x"))); // ghost x, incarnation 2
+
+    // Pushing a third ghost trims the old incarnation-1 deque node. It must not clear the current
+    // incarnation-2 ghost membership.
+    p.insert(k("a"));
+    CHECK(p.evict() == std::optional<Digest>(k("a")));
+    p.insert(k("x"));
+    CHECK(p.in_main(k("x")) == std::optional<bool>(true));
+}

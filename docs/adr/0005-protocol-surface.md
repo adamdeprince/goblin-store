@@ -1,6 +1,10 @@
-# ADR-0005: Protocol surface — memcache over TCP only, HTTP object path, no UDP, no auth
+# ADR-0005: Protocol surface — memcache over TCP and native RDMA, HTTP object path, no UDP, no auth
 
 **Status:** Accepted (2026-06-09). Supersedes the earlier memcache-UDP / kernel-bypass exploration.
+
+**Amended 2026-07-15:** native reliable-connected InfiniBand/RoCE is an additional memcache
+transport. It is not TCP over IPoIB; [ADR-0020](0020-native-rdma-bulk-windows.md) defines its
+control-ring and registered bulk-window data plane.
 
 ## Context
 The memcache **UDP** path is semantically wrong for large objects: its framing targets small
@@ -9,8 +13,10 @@ responses (request-id + datagram seq/count), there is no flow control and no ret
 **2026-06-09: drop UDP.**
 
 ## Decision
-- **memcache protocol over TCP ONLY.** Implemented subset (compatible for what we implement):
-  `get`, `gets`, `set`, `add`, `replace`, `delete`, `stats`, `version`, `quit`.
+- **memcache protocol over reliable streams only:** ordinary TCP, plus the optional native RDMA v3
+  endpoint. There is still no memcache UDP. The TCP endpoint implements classic and meta commands;
+  the initial native RDMA endpoint implements the classic subset:
+  `get`, `gets`, `set`, `add`, `replace`, `cas`, `delete`, `stats`, `version`, `quit`.
   **Not:** `incr`/`decr`, CAS-as-coordination, counter mutation, touch/gat, slab/LRU admin.
   The value block is length-prefixed, so we **stream it out** for fast time-to-first-byte.
 - **No ranged GET on the memcache port** — the protocol has no partial-get/resume. Range &
@@ -24,7 +30,8 @@ responses (request-id + datagram seq/count), there is no flow control and no ret
   network, public-edge use, or a reverse proxy (nginx/Envoy/HAProxy/Caddy) in front.
 
 ## Consequences
-- ➕ Big scope reduction: a single network substrate (TCP) for v1; DPDK/AF_XDP/recvmmsg no longer relevant.
+- ➕ The ordinary deployment retains one ubiquitous substrate (TCP); native RDMA is an explicit,
+  separately configured fast path rather than a compatibility requirement.
 - ➕ Clear contract: streaming + range on HTTP; simple key ops on memcache/TCP.
 - ➖ Clients that require memcache-UDP are unsupported — intended.
 
@@ -40,5 +47,5 @@ Config: independent `enable_http` (`--http-port`, default 8080) and `enable_http
 HTTPS may be off** — a **memcache-only** server is valid (the classic cache case; memcache/TCP
 serves reads too). The only rule: at least one listener overall (memcache, HTTP, or HTTPS). TLS
 stays transport-only (no auth). The keyless-identity hash
-([ADR-0014](0014-keyless-digest-identity.md)) is kept **independent of OpenSSL by choice** (a
-vendored SHA-256), so the storage engine doesn't link the TLS library.
+([ADR-0014](0014-keyless-digest-identity.md)) has vendored scalar and SHA-NI implementations;
+OpenSSL is used only where the runtime length/architecture policy selects its SHA-256 fallback.

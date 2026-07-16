@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <span>
+#include <sys/socket.h> // msghdr
 
 #ifndef GOBLIN_HAVE_URING
 #define GOBLIN_HAVE_URING 0
@@ -41,12 +42,20 @@ public:
     // Network ops on the same ring (ADR-0002). `user_data` is echoed in the Completion so the event
     // loop can dispatch on it. submit_accept's completion `res` is the new connection fd.
     bool submit_recv(int fd, MutBytes buf, std::uint64_t user_data);
-    bool submit_send(int fd, ByteView buf, std::uint64_t user_data);
+    // `flags` is OR'd with MSG_NOSIGNAL. Pass MSG_MORE for intermediate pieces so the stack can
+    // coalesce with the next send (header+head, mid-tail pieces).
+    bool submit_send(int fd, ByteView buf, std::uint64_t user_data, int flags = 0);
+    // Scatter-gather send. `msg` (and its iov) must remain valid until the next ring submit drains
+    // the SQE (caller typically owns them on Conn). CQE `res` is total bytes across iovecs.
+    bool submit_sendmsg(int fd, msghdr* msg, std::uint64_t user_data, int flags = 0);
     bool submit_accept(int listen_fd, std::uint64_t user_data);
     // One-shot readiness poll (POLLIN/POLLOUT): the Completion's `res` is the ready events. Used to
     // drive OpenSSL's non-blocking handshake/read on the loop (ADR-0005).
     bool submit_poll(int fd, unsigned poll_mask, std::uint64_t user_data);
 
+    // Remaining userspace SQ slots. A multi-segment operation can preflight the complete batch so
+    // it never half-queues buffers that must be consumed atomically by the caller's state machine.
+    unsigned submission_space() const noexcept;
     int submit();                          // flush queued SQEs; returns count submitted
     int submit_and_wait(unsigned min_complete); // flush + block until >= min_complete completions
     void submit_and_wait_timeout(unsigned timeout_ms); // flush + wait up to timeout for >=1 (then reap)

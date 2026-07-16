@@ -98,6 +98,25 @@ TEST("config: rejects when no listener at all is enabled") {
     CHECK(!validate(c).has_value());
 }
 
+TEST("config: native RDMA may be the only listener and validates v3 bulk geometry") {
+    auto c = good_2layer();
+    c.enable_memcache = false;
+    c.enable_http = false;
+    c.enable_https = false;
+    c.rdma.enabled = true;
+    c.rdma.address = "192.0.2.10";
+    CHECK(validate(c).has_value());
+
+    c.rdma.bulk_window_count = 1; // endpoint requires a second slot for first-head tail prefetch
+    CHECK(!validate(c).has_value());
+    c.rdma.bulk_window_count = 4;
+    c.rdma.bulk_window_bytes = 192 * KiB; // not a power of two
+    CHECK(!validate(c).has_value());
+    c.rdma.bulk_window_bytes = 256 * KiB;
+    c.rdma.address.clear();
+    CHECK(!validate(c).has_value());
+}
+
 TEST("config: --sub-memory requires an explicit --numa node") {
     auto c = good_2layer();
     c.memory.sub_bytes = 4 * GiB;
@@ -109,6 +128,56 @@ TEST("config: --sub-memory requires an explicit --numa node") {
 
     c.numa_node = 0;
     CHECK(validate(c).has_value());
+}
+
+TEST("config: --small-memory opts into a separate whole-block pool") {
+    auto c = good_2layer();
+    CHECK(!c.memory.split_pools());
+    CHECK_EQ(c.memory.small_arena_bytes(), Size(0));
+
+    c.memory.small_total_bytes = 256 * MiB;
+    CHECK(c.memory.split_pools());
+    CHECK_EQ(c.memory.small_arena_bytes(), Size(256 * MiB));
+    CHECK(validate(c).has_value());
+
+    c.memory.small_total_bytes = 256 * MiB + 4 * KiB;
+    auto invalid = validate(c);
+    CHECK(!invalid.has_value());
+    if (!invalid)
+        CHECK(invalid.error().detail.find("--small-memory") != std::string::npos);
+}
+
+TEST("config: --small-sub-memory requires the split pool and explicit --numa") {
+    auto c = good_2layer();
+    c.memory.small_sub_bytes = 4 * GiB;
+    auto no_split = validate(c);
+    CHECK(!no_split.has_value());
+    if (!no_split)
+        CHECK(no_split.error().detail.find("--small-sub-memory requires --small-memory") !=
+              std::string::npos);
+
+    c.memory.small_total_bytes = 4 * GiB;
+    auto no_node = validate(c);
+    CHECK(!no_node.has_value());
+    if (!no_node)
+        CHECK(no_node.error().detail.find("requires an explicit --numa") != std::string::npos);
+
+    c.numa_node = 0;
+    CHECK(validate(c).has_value());
+}
+
+TEST("config: --no-numa rejects remote small-object memory") {
+    auto c = good_2layer();
+    c.numa_enabled = false;
+    c.memory.small_total_bytes = 4 * GiB;
+    CHECK(validate(c).has_value());
+
+    c.memory.small_sub_bytes = 4 * GiB;
+    auto invalid = validate(c);
+    CHECK(!invalid.has_value());
+    if (!invalid)
+        CHECK(invalid.error().detail.find("--small-sub-memory cannot be used with --no-numa") !=
+              std::string::npos);
 }
 
 TEST("config: --no-numa rejects explicit NUMA placement") {

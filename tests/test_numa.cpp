@@ -74,6 +74,32 @@ TEST("Automatic NUMA selection accepts multiple addresses on one node") {
     if (node) CHECK_EQ(*node, 1u);
 }
 
+TEST("Native RDMA HCA locality participates in automatic NUMA selection") {
+    const std::array<unsigned, 4> online{0, 1, 2, 3};
+    const std::array<NicAddress, 1> listeners{{
+        {"ibp65s0", "10.88.88.1", 1}, // ARPHRD_INFINIBAND, selected by exact --rdma address
+    }};
+    auto node = select_numa_node(std::nullopt, listeners, online);
+    CHECK(node.has_value());
+    if (node) CHECK_EQ(*node, 1u);
+}
+
+TEST("Wildcard Ethernet and exact RDMA listeners on different nodes remain ambiguous") {
+    const std::array<unsigned, 4> online{0, 1, 2, 3};
+    const std::array<NicAddress, 2> listeners{{
+        {"enp1s0f0", "192.0.2.10", 0},
+        {"ibp65s0", "10.88.88.1", 1},
+    }};
+    auto node = select_numa_node(std::nullopt, listeners, online);
+    CHECK(!node.has_value());
+    if (!node) {
+        CHECK(node.error().detail.find("enp1s0f0 192.0.2.10 -> NUMA node 0") !=
+              std::string::npos);
+        CHECK(node.error().detail.find("ibp65s0 10.88.88.1 -> NUMA node 1") !=
+              std::string::npos);
+    }
+}
+
 TEST("Automatic NUMA ambiguity identifies every NIC, address, node, and override") {
     const std::array<unsigned, 2> online{0, 1};
     const std::array<NicAddress, 2> nics{{
@@ -172,6 +198,12 @@ TEST("Zero sub-memory produces only the local NUMA region") {
 TEST("Sub-memory rejects a single-node host and aggregate overflow") {
     const std::array<unsigned, 1> one_node{0};
     CHECK(!plan_numa_memory(0, one_node, 1 * GiB, 1 * GiB).has_value());
+
+    const auto small = plan_numa_memory(0, one_node, 1 * GiB, 1 * GiB,
+                                        "--small-memory", "--small-sub-memory");
+    CHECK(!small.has_value());
+    if (!small)
+        CHECK(small.error().detail.find("--small-sub-memory") != std::string::npos);
 
     const std::array<unsigned, 2> two_nodes{0, 1};
     CHECK(!plan_numa_memory(0, two_nodes, std::numeric_limits<Size>::max(), 1).has_value());

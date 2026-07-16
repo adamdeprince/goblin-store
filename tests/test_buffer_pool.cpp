@@ -184,6 +184,82 @@ TEST("buffer_pool: too-big alloc fails; exhaustion returns nullopt; free reuses 
     CHECK(pool.allocate(64 * KiB, 4 * KiB).has_value());   // reused
 }
 
+TEST("buffer_pool: reserved allocation classes share indexes but never borrow blocks") {
+    const std::array<BlockPoolRegion, 5> regions{{
+        {64 * KiB, std::nullopt, BufferPoolClass::fixed_head},   // block 0
+        {64 * KiB, std::nullopt, BufferPoolClass::small_object}, // block 1
+        {64 * KiB, std::nullopt, BufferPoolClass::fixed_head},   // block 2
+        {64 * KiB, std::nullopt, BufferPoolClass::small_object}, // block 3
+        {64 * KiB, std::nullopt},                                // block 4: legacy shared
+    }};
+    auto poolr = BufferPool::create_regions(regions, 64 * KiB, 4 * KiB, false,
+                                            /*try_hugetlb=*/false);
+    CHECK(poolr.has_value());
+    if (!poolr) return;
+    auto& pool = *poolr;
+
+    // The old two-argument API remains a shared-region allocation. It sees neither reservation,
+    // even while both are empty, and retains the one global block/address namespace.
+    const auto shared = pool.allocate(64 * KiB, 4 * KiB);
+    CHECK(shared.has_value());
+    if (!shared) return;
+    CHECK_EQ(shared->block, 4u);
+    CHECK(!pool.allocate(4 * KiB, 4 * KiB));
+
+    const auto head0 =
+        pool.allocate(64 * KiB, 4 * KiB, BufferPoolClass::fixed_head);
+    const auto head1 =
+        pool.allocate(64 * KiB, 4 * KiB, BufferPoolClass::fixed_head);
+    CHECK(head0 && head1);
+    if (!(head0 && head1)) return;
+    CHECK_EQ(head0->block, 0u);
+    CHECK_EQ(head1->block, 2u);
+    CHECK(!pool.allocate(4 * KiB, 4 * KiB, BufferPoolClass::fixed_head));
+
+    const auto small0 =
+        pool.allocate(64 * KiB, 16, BufferPoolClass::small_object);
+    const auto small1 =
+        pool.allocate(64 * KiB, 16, BufferPoolClass::small_object);
+    CHECK(small0 && small1);
+    if (!(small0 && small1)) return;
+    CHECK_EQ(small0->block, 1u);
+    CHECK_EQ(small1->block, 3u);
+    CHECK(!pool.allocate(16, 16, BufferPoolClass::small_object));
+
+    // Releasing a fixed-head block does not make it visible to the exhausted small-object class.
+    pool.deallocate(head0->block, head0->offset, head0->len);
+    CHECK(!pool.allocate(16, 16, BufferPoolClass::small_object));
+
+    CHECK_EQ(pool.region_allocation_class(0), BufferPoolClass::fixed_head);
+    CHECK_EQ(pool.region_allocation_class(1), BufferPoolClass::small_object);
+    CHECK_EQ(pool.region_allocation_class(4), BufferPoolClass::shared);
+    CHECK(pool.block_is_local(head0->block));
+    CHECK(!pool.block_is_local(head1->block));
+    CHECK(pool.block_is_local(small0->block));
+    CHECK(!pool.block_is_local(small1->block));
+    CHECK(pool.block_is_local(shared->block));
+    CHECK(head0->data != small0->data);
+    CHECK_EQ(pool.addr(head0->block, head0->offset), head0->data);
+    CHECK_EQ(pool.addr(small0->block, small0->offset), small0->data);
+}
+
+TEST("buffer_pool: block swaps cannot cross allocation-class reservations") {
+    const std::array<BlockPoolRegion, 2> regions{{
+        {64 * KiB, std::nullopt, BufferPoolClass::fixed_head},
+        {64 * KiB, std::nullopt, BufferPoolClass::shared},
+    }};
+    auto poolr = BufferPool::create_regions(regions, 64 * KiB, 4 * KiB, false,
+                                            /*try_hugetlb=*/false);
+    CHECK(poolr.has_value());
+    if (!poolr) return;
+    auto& pool = *poolr;
+    const auto head =
+        pool.allocate(64 * KiB, 4 * KiB, BufferPoolClass::fixed_head);
+    const auto shared = pool.allocate(64 * KiB, 4 * KiB);
+    CHECK(head && shared);
+    if (head && shared) CHECK(!pool.swap_blocks(head->block, shared->block));
+}
+
 TEST("buffer_pool: a freed local block wins over space in an existing foreign arena") {
     const std::array<BlockPoolRegion, 2> regions{{
         {64 * KiB, std::nullopt}, // one local block
