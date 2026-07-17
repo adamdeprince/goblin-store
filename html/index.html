@@ -118,6 +118,7 @@
     .hero-result:hover { color: var(--white); background: var(--cyan); box-shadow: 5px 5px 0 var(--acid); }
     .hero-result-kicker { color: var(--acid); font: 750 .64rem/1.25 var(--mono); text-transform: uppercase; }
     .hero-result-copy { font: 500 .88rem/1.38 var(--serif); }
+    .hero-result-copy span { display: block; }
     .hero-result-copy strong { font-family: var(--sans); font-weight: 850; }
     .hero-result-link { white-space: nowrap; font: 750 .7rem/1.25 var(--mono); }
     .hero-note { max-width: 650px; margin: 25px 0 0; color: var(--muted); font: .73rem/1.5 var(--mono); }
@@ -329,7 +330,10 @@
         </div>
         <a class="hero-result" href="docs/mirror-proxy-benchmark.html">
           <span class="hero-result-kicker">New · preliminary</span>
-          <span class="hero-result-copy"><strong>43× faster median first byte.</strong> 59% higher median request bandwidth on a 2.69 TB warm cache.</span>
+          <span class="hero-result-copy">
+            <span><strong>43× faster</strong> median first byte.</span>
+            <span><strong>59% higher</strong> median request bandwidth.</span>
+          </span>
           <span class="hero-result-link">Read the report →</span>
         </a>
         <p class="hero-note">Open source · Apache-2.0 · C++23 · NUMA-aware · HugeTLB · Linux io_uring · memcache/TCP · native InfiniBand/RoCE · HTTP/HTTPS</p>
