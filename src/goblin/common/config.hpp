@@ -102,7 +102,7 @@ struct MemoryConfig {                  // ADR-0008
 };
 
 enum class EvictionPolicyKind { sieve, s3fifo, tinylfu }; // selectable (ADR-0007)
-enum class NetMode { blocking, async };                   // --net (ADR-0018: async = io_uring loop)
+enum class NetMode { blocking, async, exasock };          // --net (ADR-0018)
 
 struct AccessScoreConfig {
     double decay = 0.5;     // once/minute multiplier; strictly between zero and one
@@ -131,6 +131,10 @@ struct RdmaConfig {
 };
 
 struct ServerConfig {
+    // Numeric IPv4 address shared by the TCP listeners.  The historical wildcard remains the
+    // default; ExaSock requires an exact SmartNIC address so acceleration and NUMA locality cannot
+    // silently resolve to the management interface.
+    std::string   listen_address = "0.0.0.0";
     std::uint16_t memcache_port = 11211;  // memcache over TCP only (ADR-0005)
     std::uint16_t http_port     = 8080;   // plaintext HTTP listener
     std::uint16_t https_port    = 8443;   // TLS listener (ADR-0005)
@@ -153,6 +157,9 @@ struct ServerConfig {
     bool          key_strip_slash = false; // path mode: drop the key's leading '/' (so `set foo` == GET /foo)
     std::string   http_index = "index.html"; // HTTP-only dir index for paths ending in '/'; empty = off
     std::vector<std::string> sources;     // --source dirs preloaded at startup
+    // Reverse-cache origin. Mirror mode has its own URI key derivation (including the query) and
+    // therefore cannot share virtual-host key space. Empty means the ordinary object endpoint.
+    std::optional<std::string> mirror_url; // --mirror URL; http[s]://host[/base/path]
 
     // Streaming I/O buffers (ADR-0017) — separate from the head pool. io_buffers applies per worker
     // to the read pool and (once) to the write-staging pool; each is io_chunk_bytes.

@@ -13,6 +13,30 @@ endif()
 
 option(GOBLIN_WERROR   "Treat warnings as errors"        ON)
 option(GOBLIN_SANITIZE "ASan/UBSan in Debug builds"      ON)
+option(GOBLIN_ENABLE_EXASOCK
+       "Build the explicitly selected ExaSock TCP network backend"
+       OFF)
+
+# ExaSock is an installed, preload-based Cisco/Exablaze userspace TCP stack.  Keep the
+# integration opt-in and consume only its public per-socket header; no ExaSock code is vendored or
+# linked into Goblin Store.  The installed `exasock` runner supplies the interposition library at
+# process startup.
+set(GOBLIN_HAVE_EXASOCK 0)
+if(GOBLIN_ENABLE_EXASOCK)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "goblin-store: ExaSock support is Linux-only")
+  endif()
+  find_path(GOBLIN_EXASOCK_INCLUDE_DIR NAMES exasock/socket.h)
+  find_program(GOBLIN_EXASOCK_RUNNER NAMES exasock)
+  if(NOT GOBLIN_EXASOCK_INCLUDE_DIR OR
+     NOT EXISTS "${GOBLIN_EXASOCK_INCLUDE_DIR}/exasock/extensions.h" OR
+     NOT GOBLIN_EXASOCK_RUNNER)
+    message(FATAL_ERROR
+      "goblin-store: GOBLIN_ENABLE_EXASOCK=ON requires an installed ExaSock public "
+      "API (exasock/socket.h and exasock/extensions.h) and the exasock runner")
+  endif()
+  set(GOBLIN_HAVE_EXASOCK 1)
+endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(_goblin_rdma_default ON)
@@ -57,6 +81,15 @@ if(OpenSSL_FOUND)
   set(GOBLIN_HAVE_TLS 1)
 endif()
 
+# ---- upstream HTTP(S) mirror client: optional at build time; --mirror diagnoses its absence. ----
+# Consume the system libcurl. It supplies DNS, TLS verification, proxy handling, and correct HTTP
+# transfer decoding; no HTTP client implementation is vendored into Goblin Store.
+set(GOBLIN_HAVE_CURL 0)
+find_package(CURL 7.68 QUIET)
+if(CURL_FOUND)
+  set(GOBLIN_HAVE_CURL 1)
+endif()
+
 # ---- core library (everything under src/goblin except main.cpp) ----
 # GLOB is used deliberately for a fast-moving scaffold (CONFIGURE_DEPENDS re-globs on build).
 file(GLOB_RECURSE GOBLIN_LIB_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/goblin/*.cpp")
@@ -77,6 +110,8 @@ target_compile_features(goblin_core PUBLIC cxx_std_23)
 target_compile_definitions(goblin_core PUBLIC GOBLIN_HAVE_URING=${GOBLIN_HAVE_URING})
 target_compile_definitions(goblin_core PUBLIC GOBLIN_HAVE_TLS=${GOBLIN_HAVE_TLS})
 target_compile_definitions(goblin_core PUBLIC GOBLIN_HAVE_RDMA=${GOBLIN_HAVE_RDMA})
+target_compile_definitions(goblin_core PUBLIC GOBLIN_HAVE_EXASOCK=${GOBLIN_HAVE_EXASOCK})
+target_compile_definitions(goblin_core PUBLIC GOBLIN_HAVE_CURL=${GOBLIN_HAVE_CURL})
 
 set(GOBLIN_WARNINGS -Wall -Wextra -Wpedantic)
 if(GOBLIN_WERROR)
@@ -93,6 +128,10 @@ if(GOBLIN_HAVE_TLS)
   target_link_libraries(goblin_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
+if(GOBLIN_HAVE_CURL)
+  target_link_libraries(goblin_core PUBLIC CURL::libcurl)
+endif()
+
 if(GOBLIN_HAVE_RDMA)
   target_include_directories(goblin_core SYSTEM PUBLIC
     "${GOBLIN_IBVERBS_INCLUDE_DIR}"
@@ -100,6 +139,13 @@ if(GOBLIN_HAVE_RDMA)
   target_link_libraries(goblin_core PUBLIC
     "${GOBLIN_IBVERBS_LIBRARY}"
     "${GOBLIN_RDMACM_LIBRARY}")
+endif()
+
+if(GOBLIN_HAVE_EXASOCK)
+  target_include_directories(goblin_core SYSTEM PRIVATE "${GOBLIN_EXASOCK_INCLUDE_DIR}")
+  # Extension symbols are supplied only by the exasock preloader.  Resolve them from the process
+  # at runtime; deliberately do not create a libexasock_ext DT_NEEDED dependency.
+  target_link_libraries(goblin_core PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
 if(GOBLIN_SANITIZE)
@@ -135,4 +181,4 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-message(STATUS "goblin-store ${PROJECT_VERSION}  io_uring=${GOBLIN_HAVE_URING}  rdma=${GOBLIN_HAVE_RDMA}  build=${CMAKE_BUILD_TYPE}  werror=${GOBLIN_WERROR}")
+message(STATUS "goblin-store ${PROJECT_VERSION}  io_uring=${GOBLIN_HAVE_URING}  rdma=${GOBLIN_HAVE_RDMA}  exasock=${GOBLIN_HAVE_EXASOCK}  mirror=${GOBLIN_HAVE_CURL}  build=${CMAKE_BUILD_TYPE}  werror=${GOBLIN_WERROR}")

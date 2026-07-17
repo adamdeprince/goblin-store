@@ -11,6 +11,8 @@ else()
   set(_rdma_default OFF)
 endif()
 option(GOBLIN_STORE_CLIENT_ENABLE_RDMA "Build the native libibverbs/librdmacm transport" ${_rdma_default})
+option(GOBLIN_STORE_CLIENT_ENABLE_EXASOCK
+  "Build the system ExaSock-accelerated TCP transport (never downloaded or vendored)" OFF)
 option(GOBLIN_STORE_CLIENT_INSTALL "Install the C++ library, headers, and package metadata" ${PROJECT_IS_TOP_LEVEL})
 option(GOBLIN_STORE_CLIENT_BUILD_TESTS "Build hardware-free C++ client tests" ${PROJECT_IS_TOP_LEVEL})
 option(GOBLIN_STORE_CLIENT_BUILD_BENCHMARKS "Build the native RDMA benchmark tools" ${PROJECT_IS_TOP_LEVEL})
@@ -33,6 +35,29 @@ if(GOBLIN_STORE_CLIENT_ENABLE_RDMA)
   list(APPEND _client_sources src/rdma_transport.cpp)
 else()
   list(APPEND _client_sources src/rdma_unavailable.cpp)
+endif()
+
+if(GOBLIN_STORE_CLIENT_ENABLE_EXASOCK)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "Goblin Store's ExaSock transport is Linux-only")
+  endif()
+  # ExaSock is intentionally a system-only dependency. Do not add a download,
+  # submodule, FetchContent declaration, or installed copy to this project.
+  find_path(GOBLIN_EXASOCK_INCLUDE_DIR NAMES exasock/extensions.h)
+  find_program(GOBLIN_EXASOCK_RUNNER NAMES exasock)
+  if(NOT GOBLIN_EXASOCK_INCLUDE_DIR OR
+     NOT EXISTS "${GOBLIN_EXASOCK_INCLUDE_DIR}/exasock/socket.h" OR
+     NOT GOBLIN_EXASOCK_RUNNER)
+    message(FATAL_ERROR
+      "ExaSock support was explicitly requested, but the system ExaSock SDK "
+      "was not found. Install exasock/extensions.h, exasock/socket.h, and the "
+      "exasock launcher, or configure with "
+      "-DGOBLIN_STORE_CLIENT_ENABLE_EXASOCK=OFF. Goblin Store never downloads "
+      "or vendors ExaSock.")
+  endif()
+  list(APPEND _client_sources src/exasock_transport.cpp)
+else()
+  list(APPEND _client_sources src/exasock_unavailable.cpp)
 endif()
 
 add_library(goblin_memcache_client ${_client_sources})
@@ -60,6 +85,14 @@ if(GOBLIN_STORE_CLIENT_ENABLE_RDMA)
     $<INSTALL_INTERFACE:ibverbs>
     $<INSTALL_INTERFACE:rdmacm>)
 endif()
+if(GOBLIN_STORE_CLIENT_ENABLE_EXASOCK)
+  target_include_directories(goblin_memcache_client SYSTEM PRIVATE
+    ${GOBLIN_EXASOCK_INCLUDE_DIR})
+  # The preload library publishes its extension functions into the process.
+  # Discover them through RTLD_DEFAULT so no Goblin artifact links, embeds, or
+  # exports a dependency on an ExaSock library.
+  target_link_libraries(goblin_memcache_client PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 if(GOBLIN_STORE_CLIENT_BUILD_TESTS)
   enable_testing()
@@ -70,6 +103,25 @@ if(GOBLIN_STORE_CLIENT_BUILD_TESTS)
   add_executable(goblin_store_rdma_wire_tests tests/test_rdma_wire.cpp)
   target_link_libraries(goblin_store_rdma_wire_tests PRIVATE GoblinStoreClient::client)
   add_test(NAME goblin_store_rdma_wire_tests COMMAND goblin_store_rdma_wire_tests)
+
+  if(GOBLIN_STORE_CLIENT_ENABLE_EXASOCK)
+    # Compile a second, test-only copy of the transport with private
+    # connected-fd/error-classification seams.  The installable library stays
+    # production-identical even when its tests are enabled.
+    add_executable(goblin_store_exasock_transport_tests
+      tests/test_exasock_transport.cpp
+      src/exasock_transport.cpp)
+    target_compile_definitions(goblin_store_exasock_transport_tests PRIVATE
+      GOBLIN_STORE_CLIENT_TESTING=1)
+    target_include_directories(goblin_store_exasock_transport_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${GOBLIN_EXASOCK_INCLUDE_DIR})
+    target_link_libraries(goblin_store_exasock_transport_tests PRIVATE
+      GoblinStoreClient::client
+      ${CMAKE_DL_LIBS})
+    add_test(NAME goblin_store_exasock_transport_tests
+      COMMAND goblin_store_exasock_transport_tests)
+  endif()
 endif()
 
 if(GOBLIN_STORE_CLIENT_BUILD_BENCHMARKS)
@@ -108,6 +160,10 @@ if(GOBLIN_STORE_CLIENT_INSTALL)
   else()
     set(GOBLIN_STORE_CLIENT_PC_REQUIRES "")
   endif()
+  set(GOBLIN_STORE_CLIENT_PC_PRIVATE_LIBS "-pthread")
+  if(GOBLIN_STORE_CLIENT_ENABLE_EXASOCK AND CMAKE_DL_LIBS)
+    string(APPEND GOBLIN_STORE_CLIENT_PC_PRIVATE_LIBS " -l${CMAKE_DL_LIBS}")
+  endif()
   set(GOBLIN_STORE_CLIENT_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
   if(NOT IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
     file(RELATIVE_PATH GOBLIN_STORE_CLIENT_PC_PREFIX_FROM_PCFILEDIR
@@ -131,4 +187,6 @@ if(GOBLIN_STORE_CLIENT_INSTALL)
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 endif()
 
-message(STATUS "GoblinStoreClient ${PROJECT_VERSION}: native RDMA=${GOBLIN_STORE_CLIENT_ENABLE_RDMA}")
+message(STATUS
+  "GoblinStoreClient ${PROJECT_VERSION}: native RDMA=${GOBLIN_STORE_CLIENT_ENABLE_RDMA} "
+  "ExaSock=${GOBLIN_STORE_CLIENT_ENABLE_EXASOCK}")

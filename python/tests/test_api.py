@@ -28,7 +28,11 @@ def test_key_and_value_validation_happens_before_connecting():
 
 
 def test_extension_reports_native_rdma():
-    assert goblin_store.rdma_available() is True
+    assert isinstance(goblin_store.rdma_available(), bool)
+    assert isinstance(goblin_store.exasock_available(), bool)
+    assert isinstance(goblin_store.exasock_active(), bool)
+    if goblin_store.exasock_active():
+        assert goblin_store.exasock_available() is True
 
 
 def test_native_failures_share_the_public_error_base():
@@ -64,7 +68,47 @@ def test_bulk_window_options_are_forwarded_to_native_client(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0][0:3] == ("192.0.2.7", 12000, 32768)
-    assert calls[0][-2:] == (1024 * 1024, 8)
+    assert calls[0][-3:-1] == (1024 * 1024, 8)
+    assert calls[0][-1] == "rdma"
+
+
+def test_exasock_transport_is_explicitly_forwarded(monkeypatch):
+    calls = []
+
+    class FakeNativeClient:
+        def __init__(self, *args):
+            calls.append(args)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(goblin_store._goblin_store, "_Client", FakeNativeClient)
+    client = goblin_store.Client("192.0.2.8", transport="exasock")
+    assert "transport='exasock'" in repr(client)
+    client.close()
+
+    assert len(calls) == 1
+    assert calls[0][-1] == "exasock"
+
+
+def test_exasock_rejects_rdma_only_options_before_connecting(monkeypatch):
+    class UnexpectedNativeClient:
+        def __init__(self, *args):
+            raise AssertionError("RDMA-only options reached the native client")
+
+    monkeypatch.setattr(goblin_store._goblin_store, "_Client", UnexpectedNativeClient)
+    with pytest.raises(ValueError, match="only to RDMA"):
+        goblin_store.Client("192.0.2.8", transport="exasock", ring_bytes=4096)
+
+
+def test_unknown_transport_is_rejected_before_connecting(monkeypatch):
+    class UnexpectedNativeClient:
+        def __init__(self, *args):
+            raise AssertionError("unknown transport reached the native client")
+
+    monkeypatch.setattr(goblin_store._goblin_store, "_Client", UnexpectedNativeClient)
+    with pytest.raises(ValueError, match="rdma.*exasock"):
+        goblin_store.Client("192.0.2.8", transport="tcp")
 
 
 @pytest.mark.parametrize(
@@ -107,6 +151,15 @@ def test_native_bulk_window_geometry_is_validated_before_rdma_connect(
             connect_timeout_ms=0,
             bulk_window_bytes=window_bytes,
             bulk_window_count=window_count,
+        )
+
+
+def test_native_exasock_rejects_rdma_only_options():
+    with pytest.raises(ValueError, match="only to RDMA"):
+        goblin_store._goblin_store._Client(
+            "192.0.2.8",
+            ring_bytes=4096,
+            transport="exasock",
         )
 
 

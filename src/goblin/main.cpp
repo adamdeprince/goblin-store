@@ -89,6 +89,7 @@ void print_help() {
         "  --io-chunk SIZE     streaming I/O chunk size              [default 256K]\n"
         "  --io-buffers N      streaming I/O buffers per worker      [default 64]\n"
         "  --io-timeout MS     drop a stalled transfer (slow client) [default 30000, 0=off]\n"
+        "  --listen-address A  numeric IPv4 address for TCP listeners [default 0.0.0.0]\n"
         "  --memcache-port N   memcache/TCP port                     [default 11211]\n"
         "  --rdma ADDRESS      native RDMA memcache bind address      [disabled]\n"
         "  --rdma-port N       native RDMA memcache port              [default 11211]\n"
@@ -104,7 +105,9 @@ void print_help() {
         "  --increment FLOAT   score added per successful key read   [default 1.0]\n"
         "  --decay FLOAT       per-minute score multiplier, 0 < d < 1 [default 0.5]\n"
         "  --source DIR        preload a directory tree at startup (repeatable)\n"
+        "  --mirror URL        cache misses from an HTTP(S) origin/base path\n"
         "  --http-vhost        HTTP key = Host + URI (default: key = URI path)\n"
+        "  --virtual-host      alias for --http-vhost\n"
         "  --key-on-query      include the query string in the key (default: strip)\n"
         "  --key-strip-slash   drop the leading '/' from path-mode keys (memcache 'set foo' == GET /foo)\n"
         "  --http-index NAME   index file for HTTP paths ending in '/'  [default index.html]\n"
@@ -115,7 +118,7 @@ void print_help() {
         "  --no-read-ahead     disable double-buffered GET read-ahead (serial; for A/B benchmarking)\n"
         "  --eviction NAME     head-cache eviction policy: s3fifo (only one implemented yet)\n"
         "  --max-objects N     cap disk-backed objects (0 = unbounded); evicts whole objects over it\n"
-        "  --net MODE          network: async (default, io_uring loop) | blocking\n"
+        "  --net MODE          network: async (default) | blocking | exasock\n"
         "  --tls-cert FILE     PEM cert chain; enables HTTPS. Repeat per domain — SNI selects\n"
         "  --tls-key FILE      PEM private key, paired with the preceding --tls-cert\n"
         "  --https-port N      TLS listener port                     [default 8443]\n"
@@ -147,12 +150,20 @@ int main(int argc, char** argv) {
         else if (a == "--ssd-dir") { auto v = take(a); if (!v) return 2; cfg.ssd.dirs.emplace_back(*v); }
         else if (a == "--hdd-dir") { auto v = take(a); if (!v) return 2; cfg.hdd.dirs.emplace_back(*v); }
         else if (a == "--source")  { auto v = take(a); if (!v) return 2; cfg.sources.emplace_back(*v); }
+        else if (a == "--mirror") {
+            auto v = take(a); if (!v) return 2;
+            cfg.mirror_url = std::string(*v);
+        }
+        else if (a == "--listen-address") {
+            auto v = take(a); if (!v) return 2;
+            cfg.listen_address = std::string(*v);
+        }
         else if (a == "--rdma") {
             auto v = take(a); if (!v) return 2;
             cfg.rdma.enabled = true;
             cfg.rdma.address = std::string(*v);
         }
-        else if (a == "--http-vhost")     { cfg.http_vhost = true; }
+        else if (a == "--http-vhost" || a == "--virtual-host") { cfg.http_vhost = true; }
         else if (a == "--key-on-query")   { cfg.key_on_query = true; }
         else if (a == "--key-strip-slash") { cfg.key_strip_slash = true; }
         else if (a == "--http-index")     { auto v = take(a); if (!v) return 2; cfg.http_index = std::string(*v); }
@@ -231,6 +242,7 @@ int main(int argc, char** argv) {
             auto v = take(a); if (!v) return 2;
             if (*v == "blocking") cfg.net = NetMode::blocking;
             else if (*v == "async") cfg.net = NetMode::async;
+            else if (*v == "exasock") cfg.net = NetMode::exasock;
             else { bad("net mode", *v); return 2; }
         }
         else if (a == "--io-buffers") {
@@ -263,6 +275,21 @@ int main(int argc, char** argv) {
                      "libibverbs/librdmacm support");
         return 1;
     }
+#if !GOBLIN_HAVE_EXASOCK
+    if (cfg.net == NetMode::exasock) {
+        std::println(stderr,
+                     "config error: --net exasock requested, but this build was not configured "
+                     "with -DGOBLIN_ENABLE_EXASOCK=ON");
+        return 1;
+    }
+#endif
+#if !GOBLIN_HAVE_CURL
+    if (cfg.mirror_url) {
+        std::println(stderr,
+                     "config error: --mirror requested, but this build has no libcurl support");
+        return 1;
+    }
+#endif
 
     // Bind before allocating any pools. Local transient pools first-touch on this node; the head
     // arena receives explicit per-range NUMA policies below. Protocol workers inherit this node;
@@ -271,8 +298,11 @@ int main(int argc, char** argv) {
     if (cfg.numa_enabled) {
         std::vector<std::string> exact_listener_addresses;
         if (cfg.rdma.enabled) exact_listener_addresses.push_back(cfg.rdma.address);
+        const bool tcp_listener = cfg.enable_memcache || cfg.enable_http || cfg.enable_https;
+        if (tcp_listener && cfg.listen_address != "0.0.0.0")
+            exact_listener_addresses.push_back(cfg.listen_address);
         const bool wildcard_ethernet_listener =
-            cfg.enable_memcache || cfg.enable_http || cfg.enable_https;
+            tcp_listener && cfg.listen_address == "0.0.0.0";
         auto configured = net::configure_numa(cfg.numa_node, cfg.numa_perverse,
                                               exact_listener_addresses,
                                               wildcard_ethernet_listener);
@@ -375,25 +405,28 @@ int main(int argc, char** argv) {
     std::println("│ ssd_prefix  : {} MiB / object", cfg.tiers.ssd_prefix / MiB);
     std::println("│ ssd pool    : {} drive(s), stripe {} KiB", cfg.ssd.dirs.size(), cfg.ssd.stripe_unit / KiB);
     std::println("│ hdd pool    : {} drive(s), stripe {} KiB", cfg.hdd.dirs.size(), cfg.hdd.stripe_unit / KiB);
-    std::println("│ memcache    : {}", cfg.enable_memcache ? ":" + std::to_string(cfg.memcache_port)
+    std::println("│ memcache    : {}", cfg.enable_memcache ? cfg.listen_address + ":" + std::to_string(cfg.memcache_port)
                                                             : std::string("off"));
     std::println("│ rdma cache  : {}", cfg.rdma.enabled
                      ? cfg.rdma.address + ":" + std::to_string(cfg.rdma.port) + " (v3, " +
                            format_size(cfg.rdma.bulk_window_bytes) + " x " +
                            std::to_string(cfg.rdma.bulk_window_count) + "/direction)"
                      : std::string("off"));
-    std::println("│ http        : {}", cfg.enable_http ? ":" + std::to_string(cfg.http_port)
+    std::println("│ http        : {}", cfg.enable_http ? cfg.listen_address + ":" + std::to_string(cfg.http_port)
                                                         : std::string("off"));
-    std::println("│ https       : {}", cfg.enable_https ? ":" + std::to_string(cfg.https_port)
+    std::println("│ https       : {}", cfg.enable_https ? cfg.listen_address + ":" + std::to_string(cfg.https_port)
                                                          : std::string("off"));
+    std::println("│ mirror      : {}", cfg.mirror_url.value_or("off"));
     std::println("│ io backend  : {}", GOBLIN_HAVE_URING ? "io_uring (available)" : "stub (no liburing)");
     const std::string worker_count = cfg.cores
         ? std::to_string(cfg.cores)
         : (numa ? std::to_string(cfg.numa_cpus.size()) + " (node CPUs)"
                 : std::string("host CPU count"));
-    std::println("│ net         : {}, {} workers/protocol",
-                 cfg.net == NetMode::async ? "async (io_uring loop)" : "blocking (thread-per-core)",
-                 worker_count);
+    const std::string_view net_mode = cfg.net == NetMode::async
+        ? "async (io_uring loop)"
+        : (cfg.net == NetMode::blocking ? "blocking (thread-per-core)"
+                                        : "ExaSock (readiness loop; plaintext TCP)");
+    std::println("│ net         : {}, {} workers/protocol", net_mode, worker_count);
     if (numa)
         std::println("│ numa        : serving node {} ({}), CPUs {}, promotion={}, perverse={}", numa->node,
                      numa->automatic ? "automatic" : "explicit --numa",
@@ -455,11 +488,17 @@ int main(int argc, char** argv) {
     }
 
     std::string listening = "listening:";
-    if (cfg.enable_memcache) listening += " memcache/tcp :" + std::to_string(cfg.memcache_port);
+    if (cfg.enable_memcache)
+        listening += " memcache/tcp " + cfg.listen_address + ":" +
+                     std::to_string(cfg.memcache_port);
     if (cfg.rdma.enabled)
         listening += " memcache/rdma " + cfg.rdma.address + ":" + std::to_string(cfg.rdma.port);
-    if (cfg.enable_http) listening += " http/tcp :" + std::to_string(cfg.http_port);
-    if (cfg.enable_https) listening += " https/tcp :" + std::to_string(cfg.https_port);
+    if (cfg.enable_http)
+        listening += " http/tcp " + cfg.listen_address + ":" +
+                     std::to_string(cfg.http_port);
+    if (cfg.enable_https)
+        listening += " https/tcp " + cfg.listen_address + ":" +
+                     std::to_string(cfg.https_port);
     std::println("{}  (Ctrl-C to stop)", listening);
     if (auto st = memcache::serve(cfg, *tm, index, g_shutdown); !st) {
         std::println(stderr, "serve: {}", st.error().detail);

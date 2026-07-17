@@ -447,7 +447,7 @@ std::size_t TierManager::reap_expired() {
 Result<TierManager::StoreHandle> TierManager::begin_store(const Digest& digest, Size size,
                                                           WriteMode write_mode) try {
     if (size > kMaxObjectSize)
-        return err(Errc::too_large, "object exceeds the configured 1 GiB maximum");
+        return err(Errc::too_large, "object exceeds the configured 4 GiB maximum");
     const ObjectLayout layout = compute_layout(size, tiers_, three_layer());
     const bool ram_only = layout.ssd_bytes == 0 && layout.hdd_bytes == 0;
 
@@ -762,6 +762,19 @@ Status TierManager::StoreHandle::write(ByteView chunk) {
     return {};
 }
 
+Status TierManager::StoreHandle::flush_available() {
+    if (committed_ || !tm_)
+        return err(Errc::invalid_argument, "flush on a completed store handle");
+    if (layout_.ssd_bytes == 0 && layout_.hdd_bytes == 0) return {};
+    const Size complete = stage_fill_ - (stage_fill_ % kDeviceBlock);
+    if (complete == 0) return {};
+    const Size tail = stage_fill_ - complete;
+    if (auto status = flush_block(complete); !status) return status;
+    if (tail > 0) std::memmove(stage_.data(), stage_.data() + complete, tail);
+    stage_fill_ = tail;
+    return {};
+}
+
 // Write the staged block [0, n) (n device-block-aligned) at disk offset flushed_, split across the
 // SSD prefix and HDD tail. Aligned source/offset/length keep O_DIRECT happy. The SSD file is padded
 // to a 4 KiB boundary only when it holds the object's tail (no HDD); with an HDD tail the prefix
@@ -823,7 +836,8 @@ Status TierManager::StoreHandle::flush_block(Size n) {
 }
 
 Result<std::uint64_t> TierManager::StoreHandle::commit(std::uint32_t flags, std::uint32_t expiry,
-                                                       std::uint64_t cas_expected) {
+                                                       std::uint64_t cas_expected,
+                                                       std::shared_ptr<const HttpCacheMetadata> http) {
     if (committed_ || !tm_)
         return err(Errc::invalid_argument, "commit on a completed store handle");
     if (off_ != layout_.size)
@@ -906,7 +920,8 @@ Result<std::uint64_t> TierManager::StoreHandle::commit(std::uint32_t flags, std:
     try {
         tm_->index_->set_with_score(
             digest_, meta,
-            tm_->fixed_score_owner(meta) ? std::nullopt : std::optional<double>(logical_score));
+            tm_->fixed_score_owner(meta) ? std::nullopt : std::optional<double>(logical_score),
+            std::move(http));
     } catch (const std::bad_alloc&) {
         if (pin_inserted)
             tm_->pins_.erase(region_id(meta.head.block, meta.head.offset));
@@ -1700,15 +1715,27 @@ void TierManager::compact_small() {
 
 std::optional<TierManager::Snapshot> TierManager::open_snapshot(const Digest& digest,
                                                                 bool record_access,
-                                                                std::uint32_t now) {
+                                                                std::uint32_t now,
+                                                                bool include_http_metadata) {
     if (now == 0) now = now_unix();
 
     // Prefer a shared lock: pin refcounts are atomic, score increments are atomic, and S3-FIFO
     // touch only sets a visited bit. Map insert for a missing pin slot still needs exclusive —
     // that is the cold path (pre-registered at commit for newly stored heads).
     auto fill = [&](bool create_pin) -> std::optional<Snapshot> {
-        const auto m = index_->lookup(digest);
-        if (!m) return std::nullopt;
+        ObjectMeta value;
+        std::shared_ptr<const HttpCacheMetadata> http;
+        if (include_http_metadata) {
+            const auto record = index_->lookup_with_http(digest);
+            if (!record) return std::nullopt;
+            value = record->meta;
+            http = record->http;
+        } else {
+            const auto m = index_->lookup(digest);
+            if (!m) return std::nullopt;
+            value = *m;
+        }
+        const ObjectMeta* m = &value;
         if (is_expired(*m, now)) return std::nullopt; // TTL passed -> lazy miss (reaper reclaims)
         // Score update is atomic (no exclusive needed). Eviction policy touch is deferred to
         // begin_get via touch() after the snapshot returns — keeps openat off the policy path and
@@ -1718,6 +1745,7 @@ std::optional<TierManager::Snapshot> TierManager::open_snapshot(const Digest& di
 
         Snapshot snap;
         snap.meta = *m;
+        snap.http = std::move(http);
         // Open the disk files first (under the lock), so an open failure needs no pin rollback.
         if (m->size > head_len) {
             const ObjectLayout layout = compute_layout(m->size, tiers_, three_layer());

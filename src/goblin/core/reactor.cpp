@@ -103,6 +103,25 @@ unsigned Reactor::reap(std::span<Completion> out) {
     return n;
 }
 
+Status Reactor::register_completion_eventfd(int event_fd) {
+    if (event_fd < 0)
+        return err(Errc::invalid_argument, "completion eventfd is invalid");
+    if (completion_eventfd_registered_)
+        return err(Errc::invalid_argument, "a completion eventfd is already registered");
+    const int r = io_uring_register_eventfd(ring_.get(), event_fd);
+    if (r < 0)
+        return err(Errc::io_error,
+                   std::string("io_uring_register_eventfd: ") + std::strerror(-r));
+    completion_eventfd_registered_ = true;
+    return {};
+}
+
+void Reactor::unregister_completion_eventfd() noexcept {
+    if (!completion_eventfd_registered_) return;
+    (void)io_uring_unregister_eventfd(ring_.get());
+    completion_eventfd_registered_ = false;
+}
+
 Result<std::size_t> Reactor::read_sync(int fd, std::uint64_t offset, MutBytes buf) {
     if (!submit_read(fd, offset, buf, 0)) return err(Errc::io_error, "submission queue full");
     const int s = io_uring_submit(ring_.get());
@@ -137,6 +156,10 @@ int Reactor::submit() { return 0; }
 int Reactor::submit_and_wait(unsigned) { return 0; }
 void Reactor::submit_and_wait_timeout(unsigned) {}
 unsigned Reactor::reap(std::span<Completion>) { return 0; }
+Status Reactor::register_completion_eventfd(int) {
+    return err(Errc::unsupported, "built without liburing");
+}
+void Reactor::unregister_completion_eventfd() noexcept {}
 Result<std::size_t> Reactor::read_sync(int, std::uint64_t, MutBytes) {
     return err(Errc::unsupported, "built without liburing");
 }

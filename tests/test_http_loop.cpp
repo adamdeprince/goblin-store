@@ -9,6 +9,7 @@
 #include "goblin/storage/tier_manager.hpp"
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cstddef>
@@ -433,4 +434,105 @@ TEST("http loop: Range -> 206 (head / disk / spanning / suffix / open-ended) and
     ::close(lfd);
     fs::remove_all(base);
     CHECK(ok);
+}
+
+TEST("http mirror: misses stream from the base path, query variants separate, and repeats hit disk cache") {
+    if (!Reactor::available() || !http::MirrorService::available()) {
+        std::println("    (skipped: io_uring or libcurl unavailable)");
+        return;
+    }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("mirror");
+    Index index;
+    auto tm = open_tm(base, index);
+    auto io = IoBufferPool::create(128 * KiB, 8, false);
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+
+    auto [origin_fd, origin_port] = make_loopback_listener();
+    CHECK(origin_fd >= 0);
+    if (origin_fd < 0) { fs::remove_all(base); return; }
+    std::atomic<bool> shutdown{false};
+    auto mirror = http::MirrorService::create(
+        "http://127.0.0.1:" + std::to_string(origin_port) + "/z", *tm, index, &shutdown, 1);
+    CHECK(mirror.has_value());
+    if (!mirror) { ::close(origin_fd); fs::remove_all(base); return; }
+
+    const std::string body_one = pattern(31, 50 * 1024);
+    const std::string body_two = pattern(32, 50 * 1024);
+    std::vector<std::string> origin_targets;
+    std::thread origin([&] {
+        for (unsigned request_number = 0; request_number < 2; ++request_number) {
+            const int fd = ::accept(origin_fd, nullptr, nullptr);
+            if (fd < 0) return;
+            std::string request;
+            char buffer[4096];
+            while (request.find("\r\n\r\n") == std::string::npos) {
+                const ssize_t got = ::recv(fd, buffer, sizeof buffer, 0);
+                if (got <= 0) break;
+                request.append(buffer, static_cast<std::size_t>(got));
+            }
+            const auto first_space = request.find(' ');
+            const auto second_space = first_space == std::string::npos
+                ? std::string::npos : request.find(' ', first_space + 1);
+            const std::string target = second_space == std::string::npos
+                ? std::string{} : request.substr(first_space + 1, second_space - first_space - 1);
+            origin_targets.push_back(target);
+            const std::string& body = target.find("q=2") == std::string::npos ? body_one : body_two;
+            const std::string head =
+                "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+                "\r\nCache-Control: public, max-age=600\r\n"
+                "Content-Type: application/x-goblin-mirror\r\nETag: \"origin-tag\"\r\n"
+                "Connection: close\r\n\r\n";
+            (void)write_all(fd, head);
+            (void)write_all(fd, std::string_view(body).substr(0, body.size() / 2));
+            (void)write_all(fd, std::string_view(body).substr(body.size() / 2));
+            ::close(fd);
+        }
+    });
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) {
+        ::close(origin_fd);
+        origin.join();
+        fs::remove_all(base);
+        return;
+    }
+    KeyOptions key_options;
+    HttpLoop loop(*rc, lfd, *tm, index, *io, key_options, 0, nullptr, mirror->get());
+    std::thread server([&] { loop.run(); });
+
+    auto get = [&](std::string_view target) -> std::optional<HttpResp> {
+        const int fd = client_connect(port);
+        if (fd < 0) return std::nullopt;
+        std::string request = "GET ";
+        request += target;
+        request += " HTTP/1.1\r\nHost: cache.test\r\nConnection: close\r\n\r\n";
+        auto response = http_req(fd, request);
+        ::close(fd);
+        return response;
+    };
+    const auto first = get("/a.bin?q=1");
+    const auto cached = get("/a.bin?q=1");
+    const auto variant = get("/a.bin?q=2");
+
+    loop.stop();
+    server.join();
+    origin.join();
+    ::close(lfd);
+    ::close(origin_fd);
+    mirror->reset();
+    fs::remove_all(base);
+
+    CHECK(first && first->status == 200 && first->body == body_one);
+    CHECK(cached && cached->status == 200 && cached->body == body_one);
+    CHECK(variant && variant->status == 200 && variant->body == body_two);
+    CHECK(cached && cached->headers.find("Age: ") != std::string::npos);
+    CHECK_EQ(origin_targets.size(), std::size_t(2));
+    if (origin_targets.size() == 2) {
+        CHECK_EQ(origin_targets[0], "/z/a.bin?q=1");
+        CHECK_EQ(origin_targets[1], "/z/a.bin?q=2");
+    }
 }

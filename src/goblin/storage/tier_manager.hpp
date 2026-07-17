@@ -115,12 +115,18 @@ public:
         ~StoreHandle();
 
         Status write(ByteView chunk);       // append the next bytes (sequential, from offset 0)
+        // Persist every complete device block currently staged, retaining only the unavoidable
+        // sub-block tail. Mirror mode calls this at each network rendezvous so the client and disk
+        // cannot build up a full io_chunk of skew. Ordinary SETs keep the throughput-oriented
+        // full-staging-buffer policy in write().
+        Status flush_available();
         // publish to the index + cache the head. expiry is an absolute Unix time (0 = never, ADR-0007).
         // cas_expected != 0 -> compare-and-swap: publish only if the live object's etag matches, else
         // return Errc::cas_mismatch (checked under the publish lock; the scratch files just abort).
         // On success returns the new CAS/etag (store generation) so callers need not re-lookup.
         Result<std::uint64_t> commit(std::uint32_t flags, std::uint32_t expiry = 0,
-                                     std::uint64_t cas_expected = 0);
+                                     std::uint64_t cas_expected = 0,
+                                     std::shared_ptr<const HttpCacheMetadata> http = {});
 
     private:
         friend class TierManager;
@@ -244,6 +250,7 @@ public:
     // copy-on-write replace can't split head from body. The open fds pin the old inodes.
     struct Snapshot {
         ObjectMeta meta;
+        std::shared_ptr<const HttpCacheMetadata> http; // requested only by the mirror HTTP path
         HeadPin pin;                  // pin.valid == false when the head isn't resident
         std::optional<ReadStream> rs; // present iff size > head_len (a disk tail to stream)
     };
@@ -251,7 +258,8 @@ public:
     // one logical request must not gain score repeatedly while it waits for an I/O buffer.
     // `now` is absolute Unix seconds for the lazy-TTL check; pass 0 to sample system_clock once.
     std::optional<Snapshot> open_snapshot(const Digest&, bool record_access = true,
-                                          std::uint32_t now = 0);
+                                          std::uint32_t now = 0,
+                                          bool include_http_metadata = false);
 
 private:
     struct ScoreMaintenanceGate {

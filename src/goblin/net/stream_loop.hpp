@@ -8,9 +8,9 @@
 #pragma once
 
 #include "goblin/core/buffer_pool.hpp"
-#include "goblin/core/reactor.hpp"
 #include "goblin/core/stats.hpp"
 #include "goblin/crypto/sha256.hpp"
+#include "goblin/net/stream_io.hpp"
 #include "goblin/storage/index.hpp"
 #include "goblin/storage/tier_manager.hpp"
 
@@ -33,7 +33,13 @@ class StreamLoop {
 public:
     StreamLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm, storage::Index& index,
                core::IoBufferPool& iobufs, unsigned io_timeout_ms = 0,
-               core::StatsRegistry* reg = nullptr, WriteMode write_mode = WriteMode::evict);
+               core::StatsRegistry* reg = nullptr, WriteMode write_mode = WriteMode::evict,
+               bool include_http_metadata = false);
+    StreamLoop(StreamIo& stream_io, int listen_fd, storage::TierManager& tm,
+               storage::Index& index, core::IoBufferPool& iobufs,
+               unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr,
+               WriteMode write_mode = WriteMode::evict,
+               bool include_http_metadata = false);
     virtual ~StreamLoop();
 
     void run();           // arm accept, then loop until stop()
@@ -47,7 +53,10 @@ public:
     }
 
 protected:
-    enum class St { idle, set_body, set_wait, get_wait, get_header, get_send_head, get_stream, get_trailer };
+    enum class St {
+        idle, set_body, set_wait, get_wait, get_header, get_send_head, get_stream, get_trailer,
+        mirror_wait, mirror_header, mirror_body
+    };
 
     struct Conn {
         int fd = -1;
@@ -86,6 +95,7 @@ protected:
         Size get_pos = 0;           // head/header-phase cursor; tail start handed to send_pos/plan_pos
         storage::TierManager::HeadPin head_pin; // pinned RAM head for the zero-copy send (ADR-0018)
         std::size_t head_sent = 0;              // partial-send progress into the head
+        std::shared_ptr<const storage::HttpCacheMetadata> http_meta; // --mirror only
 
         // Disk-tail streaming with double-buffered read-ahead (ADR-0011): up to 2 lanes. Lane 0's
         // buffer is mandatory; lane 1 is acquired opportunistically to pipeline -- read piece N+1 while
@@ -131,6 +141,10 @@ protected:
     // Append only the after-value framing into `out` (memcache CRLF+END; HTTP nothing). Used by the
     // small-object inline path that already copied the body into `out` for a single send.
     virtual void append_value_trailer(Conn*) = 0;
+    virtual bool accept_get_snapshot(Conn*, std::string_view,
+                                     const storage::ObjectMeta&) { return true; }
+    virtual bool on_custom_send(Conn*, int /*result*/) { return false; }
+    virtual void on_external(Conn* c, int /*result*/) { close_conn(c); }
 
     // ---- optional seams (default to plaintext); HTTPS overrides them to drive the TLS handshake/read ----
     virtual void on_connection(Conn* c) { start_recv(c); } // first action after accept (TLS: handshake)
@@ -164,10 +178,13 @@ protected:
         }
     }
 
-    enum Op : unsigned { kRecv = 1, kSend = 2, kRead = 3, kPoll = 4 }; // user_data low 3 bits
+    enum Op : unsigned { kRecv = 1, kSend = 2, kRead = 3, kPoll = 4, kExternal = 5 }; // low 3 bits
     static std::uint64_t tag(Conn* c, unsigned op) { return reinterpret_cast<std::uint64_t>(c) | op; }
 
-    core::Reactor& r_;
+    // Existing callers may supply a Reactor directly; that constructor owns this lightweight
+    // adapter. ExaSock workers supply their readiness adapter explicitly.
+    std::unique_ptr<StreamIo> owned_io_;
+    StreamIo& io_;
     storage::TierManager& tm_;
     storage::Index& index_;
     core::IoBufferPool& iobufs_;
@@ -175,6 +192,7 @@ protected:
     core::StatsRegistry* reg_ = nullptr; // registry to aggregate on `stats` (memcache only); may be null
     WriteMode write_mode_ = WriteMode::evict; // protocol-specific disk-full admission policy
     bool read_ahead_ = true;             // acquire a 2nd read lane for pipelining in begin_get (A/B knob)
+    bool include_http_metadata_ = false; // avoid shared_ptr traffic on ordinary GETs
     std::deque<Conn*> set_waiters_; // writes parked on staging exhaustion (ADR-0011 backpressure)
     std::deque<Conn*> get_waiters_; // GETs parked on read I/O-pool exhaustion (per-loop; queue, never shed)
 

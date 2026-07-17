@@ -33,6 +33,14 @@ std::optional<ObjectMeta> Index::lookup(const Digest& d) const {
     return it->second.meta;
 }
 
+std::optional<ObjectRecord> Index::lookup_with_http(const Digest& d) const {
+    const Shard& s = shard_for(d);
+    std::shared_lock lk(s.mu);
+    const auto it = s.map.find(d);
+    if (it == s.map.end()) return std::nullopt;
+    return ObjectRecord{it->second.meta, it->second.http};
+}
+
 bool Index::contains(const Digest& d) const {
     const Shard& s = shard_for(d);
     std::shared_lock lk(s.mu);
@@ -43,12 +51,15 @@ void Index::set(const Digest& d, const ObjectMeta& m) {
     Shard& s = shard_for(d);
     std::unique_lock lk(s.mu);
     const auto [it, inserted] = s.map.try_emplace(d, m);
-    if (!inserted)
+    if (!inserted) {
         it->second.meta = m; // replacing a value does not erase the key's accumulated heat
+        it->second.http.reset();
+    }
 }
 
 void Index::set_with_score(const Digest& d, const ObjectMeta& m,
-                           std::optional<double> local_score) {
+                           std::optional<double> local_score,
+                           std::shared_ptr<const HttpCacheMetadata> http) {
     if (local_score && (std::isnan(*local_score) || *local_score < 0.0)) {
         assert(false && "a numeric index score must be nonnegative and not NaN");
         return;
@@ -58,6 +69,7 @@ void Index::set_with_score(const Digest& d, const ObjectMeta& m,
     std::unique_lock lk(s.mu);
     const auto [it, inserted] = s.map.try_emplace(d, m);
     if (!inserted) it->second.meta = m;
+    it->second.http = std::move(http);
     it->second.score.store(local_score.value_or(external_score_marker()),
                            std::memory_order_relaxed);
 }
@@ -74,6 +86,7 @@ bool Index::replace(const Digest& d, const ObjectMeta& m) {
     const auto it = s.map.find(d);
     if (it == s.map.end()) return false;
     it->second.meta = m;
+    it->second.http.reset();
     return true;
 }
 
@@ -98,6 +111,16 @@ bool Index::update_expiry(const Digest& d, std::uint32_t expiry) {
     const auto it = s.map.find(d);
     if (it == s.map.end()) return false;
     it->second.meta.expiry = expiry;
+    return true;
+}
+
+bool Index::update_http_if_etag(const Digest& d, std::uint64_t etag,
+                                std::shared_ptr<const HttpCacheMetadata> http) {
+    Shard& s = shard_for(d);
+    std::unique_lock lk(s.mu);
+    const auto it = s.map.find(d);
+    if (it == s.map.end() || it->second.meta.etag != etag) return false;
+    it->second.http = std::move(http);
     return true;
 }
 

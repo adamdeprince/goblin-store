@@ -1,7 +1,7 @@
 # Goblin Store C++ client library
 
-This directory is a standalone C++20 project. It installs the native
-InfiniBand memcache client without Python or nanobind.
+This directory is a standalone C++20 project. It installs Goblin Store's native
+RDMA and optional ExaSock memcache client without Python or nanobind.
 
 ## Build and install
 
@@ -16,6 +16,21 @@ cmake --build build/goblin-store-client
 ctest --test-dir build/goblin-store-client --output-on-failure
 sudo cmake --install build/goblin-store-client
 ```
+
+ExaSock is an explicit, system-only optional dependency:
+
+```sh
+cmake -S python/cpp -B build/goblin-store-client-exasock -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGOBLIN_STORE_CLIENT_ENABLE_EXASOCK=ON \
+    -DGOBLIN_STORE_CLIENT_ENABLE_RDMA=OFF
+```
+
+That configuration fails unless the installed public ExaSock headers and
+`exasock` launcher are found. Goblin Store never downloads or vendors ExaSock,
+never installs its headers or libraries, and does not emit a transitive ExaSock
+link dependency. The runtime verification functions are discovered from the
+active preload library with `dlsym`.
 
 Use `-DBUILD_SHARED_LIBS=OFF` for a static library. Installation provides:
 
@@ -50,8 +65,10 @@ int main() {
 }
 ```
 
-`Options::address` must be a numeric IPv4 or IPv6 address, not a hostname.
-Avoiding DNS ensures that `connect_timeout` bounds the complete RDMA-CM setup.
+`Options` for native RDMA requires a numeric IPv4 or IPv6 address.
+`ExasockOptions` requires numeric IPv4 because the accelerated TCP extension
+verifies AF_INET sockets. Neither transport performs hostname lookup, ensuring
+that `connect_timeout` bounds the complete transport setup.
 
 Mutation timeouts are ambiguous by nature: if `set()`, `add()`, `replace()`,
 `compare_exchange()`, or `erase()` throws after transmission starts, the server
@@ -61,7 +78,7 @@ make a blind retry unsafe.
 
 `get_to()` accepts a callback for bounded-memory retrieval. The callback must
 not start another transaction on the same `Client`. A `Client` serializes
-complete transactions on its one ordered queue pair; independent clients
+complete transactions on its one ordered connection; independent clients
 provide parallelism.
 
 Commands and trailers use the inline control ring. Value bodies use registered
@@ -79,6 +96,32 @@ The public transport injection seam permits deterministic tests without
 duplicating memcache framing and parsing. Incoming inline and bulk fragments
 are exposed as one ordered byte stream, while outbound tests can verify that no
 value byte enters the control ring.
+
+## ExaSock C++ connection
+
+ExaSock accelerates ordinary TCP; it does not use the Goblin RDMA wire format.
+The server may be an ExaSock-launched Goblin Store process or any compatible
+unaccelerated memcache TCP endpoint.
+
+```cpp
+goblin::client::ExasockOptions options;
+options.address = "192.0.2.20";
+options.port = 11211;
+
+auto client = goblin::client::Client::connect_exasock(options);
+client.set("key", "value");
+```
+
+Run the application through the separately installed launcher:
+
+```sh
+exasock --no-auto ./my_program
+```
+
+`connect_exasock()` checks both that ExaSock is loaded and that the connected
+socket maps to an accelerated SmartNIC device. Failure is explicit; it never
+falls back to kernel TCP. `exasock_available()` reports compiled support and
+`exasock_active()` reports whether the current process is under ExaSock.
 
 ## Native RDMA benchmark
 

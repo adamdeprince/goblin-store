@@ -3,8 +3,8 @@ project(goblin_store_python VERSION 0.1.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR
-    "goblin-store-client is a native InfiniBand package and builds only on Linux. "
-    "Install on Linux after: apt install libibverbs-dev librdmacm-dev python3-dev")
+    "goblin-store-client's native network transports build only on Linux. "
+    "Install the requested system transport SDKs and python3-dev first.")
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -27,7 +27,8 @@ find_package(nanobind CONFIG REQUIRED)
 # The wheel embeds the standalone client library into the extension. Its own
 # install/export rules remain available when configuring python/cpp directly.
 set(BUILD_SHARED_LIBS OFF)
-set(GOBLIN_STORE_CLIENT_ENABLE_RDMA ON CACHE BOOL "" FORCE)
+# python/cpp supplies the platform defaults. Explicit command-line choices for
+# RDMA and ExaSock must remain effective, including ExaSock-only local wheels.
 set(GOBLIN_STORE_CLIENT_INSTALL OFF CACHE BOOL "" FORCE)
 set(GOBLIN_STORE_CLIENT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(cpp)

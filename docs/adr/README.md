@@ -26,5 +26,6 @@ these are decisions of record, not laws.
 | [0018](0018-concurrency-model.md) | Concurrency: thread-per-core network, shared locked storage | Accepted |
 | [0019](0019-access-score-numa-promotion.md) | Decayed per-key access scores and hot full-block NUMA promotion | Accepted |
 | [0020](0020-native-rdma-bulk-windows.md) | Native RDMA: inline control ring plus registered, credit-controlled bulk windows | Accepted |
+| [0021](0021-http-mirror-cache.md) | HTTP mirror mode: bounded lockstep origin streaming and shared-cache semantics | Accepted |
 
 See [the project README](../../README.md) for the readable overview that ties these together.

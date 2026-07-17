@@ -109,6 +109,17 @@
     .button.secondary:hover { color: var(--cyan); background: var(--white); }
     .button.bug-button { background: var(--acid); box-shadow: 4px 4px 0 var(--ink); }
     .button.bug-button:hover { color: var(--white); background: var(--orange); }
+    .hero-result {
+      display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 13px 18px;
+      width: 100%; max-width: 650px; margin-top: 25px; padding: 14px 16px; color: var(--white);
+      background: var(--dark); border: 1px solid var(--ink); box-shadow: 5px 5px 0 var(--cyan);
+      text-decoration: none;
+    }
+    .hero-result:hover { color: var(--white); background: var(--cyan); box-shadow: 5px 5px 0 var(--acid); }
+    .hero-result-kicker { color: var(--acid); font: 750 .64rem/1.25 var(--mono); text-transform: uppercase; }
+    .hero-result-copy { font: 500 .88rem/1.38 var(--serif); }
+    .hero-result-copy strong { font-family: var(--sans); font-weight: 850; }
+    .hero-result-link { white-space: nowrap; font: 750 .7rem/1.25 var(--mono); }
     .hero-note { max-width: 650px; margin: 25px 0 0; color: var(--muted); font: .73rem/1.5 var(--mono); }
     .hero-note::before { content: "✓ "; color: var(--acid-dark); font-weight: 900; }
 
@@ -264,6 +275,8 @@
       .hero h1 { font-size: clamp(3.35rem, 15vw, 4.7rem); }
       .hero-copy { font-size: 1.05rem; }
       .hero-actions { align-items: flex-start; }
+      .hero-result { grid-template-columns: 1fr; gap: 5px; }
+      .hero-result-link { margin-top: 3px; }
       .hero-goblin { right: -115px; bottom: -48px; width: 110vw; height: 50%; }
       .section { padding-top: 78px; padding-bottom: 78px; }
       h2 { font-size: clamp(2.2rem, 12vw, 3.7rem); }
@@ -314,6 +327,11 @@
           <a class="button secondary" href="BENCHMARKS.html">Read the full benchmarks</a>
           <a class="button bug-button" href="https://buymeacoffee.com/goblinreactor" aria-label="Support Goblin Reactor on Buy Me a Coffee">Feed the goblin bugs →</a>
         </div>
+        <a class="hero-result" href="docs/mirror-proxy-benchmark.html">
+          <span class="hero-result-kicker">New · preliminary</span>
+          <span class="hero-result-copy"><strong>43× faster median first byte.</strong> 59% higher median request bandwidth on a 2.69 TB warm cache.</span>
+          <span class="hero-result-link">Read the report →</span>
+        </a>
         <p class="hero-note">Open source · Apache-2.0 · C++23 · NUMA-aware · HugeTLB · Linux io_uring · memcache/TCP · native InfiniBand/RoCE · HTTP/HTTPS</p>
       </div>
     </section>
@@ -531,7 +549,7 @@
           <article class="feature">
             <span class="feature-num">01 / protocol</span>
             <h3>TCP and native RDMA</h3>
-            <p>Classic memcache over TCP, plus a native InfiniBand/RoCE v3 path: small commands stay inline while object bodies use registered, credit-controlled bulk windows. HTTP/1.1 adds <code>GET</code>, <code>HEAD</code>, ranges, ETags, and optional HTTPS.</p>
+            <p>Classic memcache over TCP, plus a native InfiniBand/RoCE v3 path: small commands stay inline while object bodies use registered, credit-controlled bulk windows. HTTP/1.1 adds <code>GET</code>, <code>HEAD</code>, ranges, ETags, optional HTTPS, and a query-aware streaming origin cache with <code>--mirror</code>.</p>
           </article>
           <article class="feature">
             <span class="feature-num">02 / runtime</span>
@@ -559,6 +577,7 @@
             <span>CMake ≥ 3.28</span>
             <span>liburing</span>
             <span>OpenSSL</span>
+            <span>libcurl (--mirror)</span>
             <span>libibverbs + librdmacm (optional)</span>
           </div>
         </div>
@@ -574,10 +593,15 @@
 <span class="comment"># Serve memcache on 11211 and HTTP on 8080</span>
 <span class="command">./build/goblin-store</span> --memory 4G \
   --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool \
-  --memcache-port 11211 --http-port 8080</code></pre>
+  --memcache-port 11211 --http-port 8080
+
+<span class="comment"># Or fill HTTP misses from an origin while streaming them</span>
+<span class="command">./build/goblin-store</span> --memory 4G --ssd-dir /mnt/ssd/pool \
+  --mirror https://origin.example --http-port 8080</code></pre>
           <div class="quick-links">
             <a href="README.html">Complete README →</a>
-            <a href="docs/adr/README.html">20 architecture decisions →</a>
+            <a href="docs/adr/README.html">21 architecture decisions →</a>
+            <a href="docs/adr/0021-http-mirror-cache.html">HTTP mirror-cache design →</a>
             <a href="docs/adr/0020-native-rdma-bulk-windows.html">Native RDMA bulk-window design →</a>
             <a href="docs/native-rdma-256k-performance.html">Native InfiniBand performance report →</a>
             <a href="docs/numa-interconnect-bandwidth.html">NUMA interconnect-bandwidth report →</a>

@@ -10,6 +10,7 @@
 #include <optional>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace goblin::http {
 
@@ -18,6 +19,10 @@ enum class Method { get, head, other };
 using RangeSpec = ByteRange; // RFC 7233 single byte-range (defined in common/types.hpp)
 
 struct Request {
+    struct Header {
+        std::string_view name;
+        std::string_view value;
+    };
     Method method = Method::other;
     std::string_view target;        // request-target, origin-form "/path?query" (views into the buffer)
     std::string_view host;          // raw Host header (may include :port); empty if absent
@@ -25,6 +30,10 @@ struct Request {
     std::string_view if_none_match; // raw If-None-Match header (conditional GET); empty if absent
     bool keep_alive = true;         // HTTP/1.1 default; false on "Connection: close"
     int minor_version = 1;          // HTTP/1.<minor>
+    // Populated only when parse_request(..., capture_headers=true). Views have the same lifetime as
+    // target/host and let mirror mode apply forwarding, Vary, and request cache-control rules without
+    // imposing allocations on the ordinary object-serving hot path.
+    std::vector<Header> headers;
 };
 
 enum class ParseStatus { ok, partial, bad };
@@ -37,7 +46,8 @@ struct ParseResult {
 
 // Parse one request head from the front of `buf`. `prev_len` is the buffer length at the previous
 // call for this connection (picohttpparser resumes its scan there); pass 0 the first time.
-ParseResult parse_request(std::string_view buf, std::size_t prev_len = 0);
+ParseResult parse_request(std::string_view buf, std::size_t prev_len = 0,
+                          bool capture_headers = false);
 
 // Parse a Range header value: "bytes=a-b" / "bytes=a-" / "bytes=-n". nullopt if it's not a single
 // bytes range (multi-range, non-bytes unit, or malformed). Exposed for testing.

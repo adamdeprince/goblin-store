@@ -71,6 +71,18 @@ bool is_server_error(std::string_view line) {
            line.starts_with("SERVER_ERROR ");
 }
 
+void validate_endpoint(std::string_view transport, const std::string& address,
+                       std::uint16_t port,
+                       std::chrono::milliseconds connect_timeout,
+                       std::chrono::milliseconds operation_timeout) {
+    if (address.empty())
+        throw std::invalid_argument(std::string(transport) + " address must not be empty");
+    if (port == 0)
+        throw std::invalid_argument(std::string(transport) + " port must not be zero");
+    if (connect_timeout.count() < 0 || operation_timeout.count() < 0)
+        throw std::invalid_argument("timeouts must not be negative");
+}
+
 } // namespace
 
 struct Client::Impl {
@@ -125,7 +137,7 @@ struct Client::Impl {
 
     [[noreturn]] void fail_connection(std::string_view phase) {
         std::string message(phase);
-        message += ": RDMA connection failed";
+        message += ": transport connection failed";
         if (!transport->error().empty()) {
             message += ": ";
             message += transport->error();
@@ -195,7 +207,7 @@ struct Client::Impl {
         for (;;) {
             check_progress(until, phase);
             if (auto fragment = transport->peek()) {
-                if (fragment->empty()) fail_protocol("RDMA transport returned an empty fragment");
+                if (fragment->empty()) fail_protocol("transport returned an empty fragment");
                 try {
                     input.append(fragment->data(), fragment->size());
                 } catch (...) {
@@ -348,8 +360,8 @@ struct Client::Impl {
 };
 
 Client Client::connect(const Options& options) {
-    if (options.address.empty()) throw std::invalid_argument("RDMA address must not be empty");
-    if (options.port == 0) throw std::invalid_argument("RDMA port must not be zero");
+    validate_endpoint("RDMA", options.address, options.port, options.connect_timeout,
+                      options.operation_timeout);
     if (!goblin::store::rdma_wire::valid_bulk_geometry(options.bulk_window_bytes,
                                                         options.bulk_window_count)) {
         throw std::invalid_argument(
@@ -357,9 +369,14 @@ Client Client::connect(const Options& options) {
             "with 1 to 65535 windows and less than 4 GiB of combined receive "
             "and staging memory");
     }
-    if (options.connect_timeout.count() < 0 || options.operation_timeout.count() < 0)
-        throw std::invalid_argument("timeouts must not be negative");
     return Client(connect_rdma(options), options.operation_timeout, options.max_value_bytes);
+}
+
+Client Client::connect_exasock(const ExasockOptions& options) {
+    validate_endpoint("ExaSock", options.address, options.port, options.connect_timeout,
+                      options.operation_timeout);
+    return Client(goblin::client::connect_exasock(options), options.operation_timeout,
+                  options.max_value_bytes);
 }
 
 Client::Client(std::unique_ptr<Transport> transport,

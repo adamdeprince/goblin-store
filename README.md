@@ -17,7 +17,8 @@ each object down a RAM → SSD → HDD price pyramid.
 
 goblin-store speaks the memcache text and meta protocols, making it a
 drop-in replacement for memcached. It also serves read-only HTTP/1.1
-for edge/CDN use.
+for edge/CDN use, either from explicitly inserted objects or as a
+streaming reverse cache for an HTTP(S) origin.
 
 
 ## Benchmarks — the short version
@@ -37,6 +38,11 @@ We set up a 2-core server running goblin-store and pitted it against a
 The win is large objects: a hot **RAM head** + **SSD prefix** hide the ~5 ms HDD seek that extstore
 pays in full on every cold GET, while a read-ahead pipeline keeps the cheap-tier bulk flowing near
 spindle throughput.
+
+The preliminary HDD-only mirror-cache comparison with Vinyl Cache reduced median time to first byte
+from 14.865 ms to 345.890 µs and raised median request bandwidth from 453.411 MB/s to 722.241 MB/s.
+The four-socket NUMA, RAID, IPoIB, HugeTLB, IRQ-affinity, monitoring setup, and full results are in
+[`docs/mirror-proxy-benchmark.md`](docs/mirror-proxy-benchmark.md); concurrent I/O tests are underway.
 
 ## How it works
 
@@ -78,13 +84,15 @@ copy-on-write publish** (readers never see a torn value, [ADR-0018](docs/adr/001
 digest identity** ([ADR-0014](docs/adr/0014-keyless-digest-identity.md)), and **bounded,
 mlock-able data pools** ([ADR-0016](docs/adr/0016-bounded-locked-memory.md)).
 
-Start at **[`docs/adr/README.md`](docs/adr/README.md)** — 20 ADRs covering the full design.
+Start at **[`docs/adr/README.md`](docs/adr/README.md)** — 21 ADRs covering the full design.
 For a focused explanation of the NUMA-aware head cache, HugeTLB geometry, and the two-R820
 interconnect test, read **[NUMA-local RAM heads and interconnect bandwidth](docs/numa-interconnect-bandwidth.md)**.
 The longer direct-link experiment—including nanosecond traces, tail percentiles, and probability of
 superiority—is **[Looking for NUMA latency below the network noise floor](docs/numa-first-byte-latency.md)**.
 The native data path's direct 40 Gbit/s InfiniBand measurements are in
 **[Native RDMA over InfiniBand: 256 KiB latency and throughput](docs/native-rdma-256k-performance.md)**.
+For the optional userspace TCP path—including ordinary memcache/HTTP wire compatibility and the
+separately installable C++/Python memcache clients—see **[ExaSock transport](docs/exasock.md)**.
 The small-object channel and short-key hashing results are summarized in
 **[Small-object channel and short-key SHA-256 performance](docs/small-object-channel-performance.md)**.
 For the storage-full path, including per-admission EVICT/BLOCK policy, exact shard reservation,
@@ -104,12 +112,22 @@ filesystem-local reclaim, and immutable publication, read
   TCP/HTTP retain their core-local multiplexed loops. See
   [ADR-0020](docs/adr/0020-native-rdma-bulk-windows.md) and the separately installable
   [C++/Python client](python/README.md).
+- **memcache + HTTP (ExaSock-accelerated TCP):** optional, explicitly selected userspace TCP on a
+  supported ExaNIC. The wire protocols do not change: ordinary memcache clients, browsers, and
+  Ethernet peers still see standard TCP services. The standalone C++ library and its nanobind
+  Python package provide a fail-closed ExaSock memcache client. ExaSock remains an external,
+  system-installed dependency and is never vendored; see [the build and deployment guide](docs/exasock.md).
 - **HTTP/1.1 (read-only):** `GET`/`HEAD`, byte ranges, conditional GET (ETag / `If-None-Match` → 304),
   `Content-Type`, `Accept-Ranges`. **No write surface by design** (edge-cache role; put a writer in
   front). **HTTPS** via OpenSSL + **kTLS** with SNI cert selection.
+- **HTTP/HTTPS mirror cache (`--mirror URL`):** query-aware shared-cache keys, origin cache-control
+  and validator handling, same-key miss coalescing, and one-chunk lockstep streaming to the client
+  and RAM/SSD/HDD. A disk failure abandons only that fill; a client disconnect does not. Cached hits
+  return through the ordinary head-first/disk-prefetch path. See
+  [ADR-0021](docs/adr/0021-http-mirror-cache.md).
 
 > **Status:** working memcache + HTTP/HTTPS server on io_uring + O_DIRECT — 3-tier store, atomic
-> publish, RAM-head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **213 unit-test
+> publish, RAM-head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **231 unit-test
 > cases, with Release, ASan/UBSan, and TSan coverage.** macOS is a non-goal (no io_uring / O_DIRECT
 > analog); FreeBSD (kqueue/aio) is a planned port.
 
@@ -118,14 +136,18 @@ filesystem-local reclaim, and immutable publication, read
 **Build:** **C++23** compiler (GCC ≥ 14, developed on GCC 16; or Clang ≥ 18), **CMake ≥ 3.28** +
 **Ninja**, **OpenSSL** (`libssl-dev`, for HTTPS and the long-input SHA-256 fallback where selected;
 short-key and hardware SHA implementations are vendored, [ADR-0014](docs/adr/0014-keyless-digest-identity.md)), **liburing** (`liburing-dev`, the io_uring
-backend — without it the logic layers still compile but the server cannot serve). Native RDMA is
+backend — without it the logic layers still compile but the server cannot serve), and **libcurl**
+(`libcurl4-openssl-dev`, optional unless `--mirror` is used). Native RDMA is
 optional and is built when **libibverbs** and **librdmacm** development headers are present.
+ExaSock is a separate Linux-only opt-in (`GOBLIN_ENABLE_EXASOCK` for the server and
+`GOBLIN_STORE_CLIENT_ENABLE_EXASOCK` for the client); it must already be installed under its own
+license, and default builds do not discover or link it.
 
 **Runtime:** Linux kernel ≥ 5.19 (project io_uring support floor).
 
 ```sh
 sudo apt-get install -y build-essential cmake ninja-build libssl-dev liburing-dev \
-    libibverbs-dev librdmacm-dev
+    libcurl4-openssl-dev libibverbs-dev librdmacm-dev
 ```
 
 ## Build & run
@@ -160,6 +182,11 @@ ctest --test-dir build --output-on-failure
 # Native RDMA-only memcache. Without an explicit --numa, the exact address selects its HCA node.
 ./build/goblin-store --no-memcache --no-http --rdma 10.88.88.1 \
     --memory 4G --ssd-dir /mnt/ssd/pool
+
+# Reverse HTTP cache. /a/b.html?v=2 misses to
+# https://origin.example/z/a/b.html?v=2 and later hits use the normal RAM-head pipeline.
+./build/goblin-store --mirror https://origin.example/z \
+    --memory 4G --ssd-dir /mnt/ssd/pool --http-port 8080
 ```
 
 Key knobs (see `--help`): `--ram-head` (power-of-two per-object resident head, default 256 KiB),
@@ -167,7 +194,8 @@ Key knobs (see `--help`): `--ram-head` (power-of-two per-object resident head, d
 2 MiB on x86 and 32 MiB on Arm/LoongArch), `--io-buffers` /
 `--io-chunk` (bounded streaming RAM), `--eviction`, `--max-objects`, `--no-mlock` (dev), `--tls-cert`/
 `--tls-key` (HTTPS), `--source` (preload a directory tree), `--numa NODE` (explicit NUMA
-placement), `--memory SIZE` / `--sub-memory SIZE` (fixed-head RAM on the local / each non-local
+placement), `--mirror URL` (streaming HTTP(S) reverse-cache origin; incompatible with virtual-host
+mode), `--memory SIZE` / `--sub-memory SIZE` (fixed-head RAM on the local / each non-local
 NUMA node), `--small-memory SIZE` / `--small-sub-memory SIZE` (packed-small-object RAM on the local /
 each non-local node), `--increment FLOAT` (score added per successful key read), `--decay FLOAT`
 (per-minute score multiplier in `(0, 1)`), and `--perverse` (benchmark-only inversion of preferred

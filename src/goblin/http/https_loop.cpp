@@ -69,7 +69,7 @@ void HttpsLoop::start_recv(Conn* c) { ssl_read_step(c); } // RX = SSL_read; TX s
 
 void HttpsLoop::arm_poll(Conn* c, unsigned events) {
     if (c->closing) return;
-    if (r_.submit_poll(c->fd, events, tag(c, kPoll)))
+    if (io_.submit_poll(c->fd, events, tag(c, kPoll)))
         ++c->inflight;
     else
         close_conn(c);
@@ -90,6 +90,7 @@ void HttpsLoop::on_destroy(Conn* c) {
         SSL_free(it->second.ssl); // BIO_NOCLOSE -> does not touch the (already-closed) fd
         tls_.erase(it);
     }
+    HttpLoop::on_destroy(c);
 }
 
 } // namespace goblin::http

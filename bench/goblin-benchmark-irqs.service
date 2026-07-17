@@ -1,0 +1,15 @@
+[Unit]
+Description=Pin Goblin benchmark storage and network IRQs to NUMA node 0
+Wants=systemd-udev-settle.service
+After=systemd-udev-settle.service
+ConditionPathExists=/sys/bus/pci/devices/0000:02:00.0
+ConditionPathExists=/sys/bus/pci/devices/0000:03:00.0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pin-pci-irqs-to-numa 0000:02:00.0 0
+ExecStart=/usr/local/sbin/pin-pci-irqs-to-numa 0000:03:00.0 0
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

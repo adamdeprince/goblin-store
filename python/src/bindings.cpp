@@ -18,6 +18,7 @@ namespace {
 
 using goblin::client::Client;
 using goblin::client::DeleteResult;
+using goblin::client::ExasockOptions;
 using goblin::client::Item;
 using goblin::client::ItemInfo;
 using goblin::client::Options;
@@ -97,19 +98,38 @@ public:
     PythonClient(const std::string& address, std::uint16_t port, std::uint64_t ring_bytes,
                  long connect_timeout_ms, long operation_timeout_ms,
                  std::uint64_t max_value_bytes, std::uint32_t bulk_window_bytes,
-                 std::uint16_t bulk_window_count) {
+                 std::uint16_t bulk_window_count, const std::string& transport) {
         if (connect_timeout_ms < 0 || operation_timeout_ms < 0)
             throw std::invalid_argument("timeouts must not be negative");
-        Options options;
-        options.address = address;
-        options.port = port;
-        options.ring_bytes = ring_bytes;
-        options.bulk_window_bytes = bulk_window_bytes;
-        options.bulk_window_count = bulk_window_count;
-        options.connect_timeout = std::chrono::milliseconds(connect_timeout_ms);
-        options.operation_timeout = std::chrono::milliseconds(operation_timeout_ms);
-        options.max_value_bytes = max_value_bytes;
-        client_ = std::make_unique<Client>(Client::connect(options));
+        if (transport == "rdma") {
+            Options options;
+            options.address = address;
+            options.port = port;
+            options.ring_bytes = ring_bytes;
+            options.bulk_window_bytes = bulk_window_bytes;
+            options.bulk_window_count = bulk_window_count;
+            options.connect_timeout = std::chrono::milliseconds(connect_timeout_ms);
+            options.operation_timeout = std::chrono::milliseconds(operation_timeout_ms);
+            options.max_value_bytes = max_value_bytes;
+            client_ = std::make_unique<Client>(Client::connect(options));
+            return;
+        }
+        if (transport == "exasock") {
+            if (ring_bytes != 64 * 1024 || bulk_window_bytes != 256 * 1024 ||
+                bulk_window_count != 4) {
+                throw std::invalid_argument(
+                    "ring_bytes and bulk-window options apply only to RDMA");
+            }
+            ExasockOptions options;
+            options.address = address;
+            options.port = port;
+            options.connect_timeout = std::chrono::milliseconds(connect_timeout_ms);
+            options.operation_timeout = std::chrono::milliseconds(operation_timeout_ms);
+            options.max_value_bytes = max_value_bytes;
+            client_ = std::make_unique<Client>(Client::connect_exasock(options));
+            return;
+        }
+        throw std::invalid_argument("transport must be 'rdma' or 'exasock'");
     }
 
     nb::object get(const nb::bytes& key) {
@@ -237,7 +257,7 @@ private:
 } // namespace
 
 NB_MODULE(_goblin_store, module) {
-    module.doc() = "Native InfiniBand memcache client for Goblin Store";
+    module.doc() = "Native RDMA and ExaSock memcache client for Goblin Store";
 
     auto error = nb::exception<goblin::client::Error>(module, "Error");
     nb::exception<goblin::client::ConnectionError>(module, "ConnectionError", error);
@@ -257,7 +277,8 @@ NB_MODULE(_goblin_store, module) {
 
     nb::class_<PythonClient>(module, "_Client")
         .def(nb::init<const std::string&, std::uint16_t, std::uint64_t, long, long,
-                      std::uint64_t, std::uint32_t, std::uint16_t>(),
+                      std::uint64_t, std::uint32_t, std::uint16_t,
+                      const std::string&>(),
              nb::arg("address"), nb::arg("port") = 11211,
              nb::arg("ring_bytes") = 64 * 1024,
              nb::arg("connect_timeout_ms") = 5000,
@@ -265,6 +286,7 @@ NB_MODULE(_goblin_store, module) {
              nb::arg("max_value_bytes") = 0,
              nb::arg("bulk_window_bytes") = 256 * 1024,
              nb::arg("bulk_window_count") = 4,
+             nb::arg("transport") = "rdma",
              nb::call_guard<nb::gil_scoped_release>())
         .def("get", &PythonClient::get, nb::arg("key"))
         .def("gets", &PythonClient::gets, nb::arg("key"))
@@ -285,4 +307,6 @@ NB_MODULE(_goblin_store, module) {
         .def("close", &PythonClient::close);
 
     module.def("rdma_available", &goblin::client::rdma_available);
+    module.def("exasock_available", &goblin::client::exasock_available);
+    module.def("exasock_active", &goblin::client::exasock_active);
 }

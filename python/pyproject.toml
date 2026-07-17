@@ -15,12 +15,12 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "goblin-store-client"
 version = "0.1.0"
-description = "Native InfiniBand memcache client for Goblin Store"
+description = "Native RDMA and opt-in ExaSock memcache client for Goblin Store"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [{ name = "Goblin Reactor" }]
-keywords = ["memcache", "infiniband", "rdma", "object-cache", "nanobind"]
+keywords = ["memcache", "infiniband", "rdma", "exasock", "object-cache", "nanobind"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -53,6 +53,7 @@ sdist.include = [
   "cpp/cmake/*.in",
   "cpp/include/**/*.hpp",
   "cpp/src/*.cpp",
+  "cpp/src/*.hpp",
   "cpp/tests/*.cpp",
   "cpp/tests/consumer/*",
   "goblin_store/*.py",

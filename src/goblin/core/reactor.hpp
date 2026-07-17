@@ -61,6 +61,13 @@ public:
     void submit_and_wait_timeout(unsigned timeout_ms); // flush + wait up to timeout for >=1 (then reap)
     unsigned reap(std::span<Completion> out); // drain ready completions; returns count written
 
+    // Let a foreign readiness loop wait for disk CQ activity without polling the ring.  The caller
+    // owns `event_fd`, keeps it alive until unregister_completion_eventfd(), and drains it before
+    // reaping the CQ.  Used by the ExaSock/epoll stream backend; ordinary io_uring workers do not
+    // pay for eventfd notifications.
+    Status register_completion_eventfd(int event_fd);
+    void unregister_completion_eventfd() noexcept;
+
     // Bootstrap/test helper: one read, submit, wait, return bytes read.
     Result<std::size_t> read_sync(int fd, std::uint64_t offset, MutBytes buf);
 
@@ -76,6 +83,7 @@ private:
     using RingPtr = std::unique_ptr<io_uring, RingDeleter>;
     explicit Reactor(RingPtr ring) : ring_(std::move(ring)) {}
     RingPtr ring_;
+    bool completion_eventfd_registered_ = false;
 #else
     Reactor() = default;
 #endif

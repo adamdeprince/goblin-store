@@ -45,6 +45,20 @@ struct Options {
     std::uint64_t max_value_bytes = 0;
 };
 
+// ExaSock accelerates an ordinary TCP socket, so its peer can be Goblin Store,
+// memcached, or any other compatible unaccelerated memcache endpoint. Building
+// this backend and selecting it at runtime are both explicit; it never falls
+// back silently to kernel TCP when ExaSock is not active on the local socket.
+struct ExasockOptions {
+    // Numeric IPv4 address. ExaSock's accelerated TCP extension verifies
+    // AF_INET sockets; hostnames and IPv6 are rejected before connection.
+    std::string address;
+    std::uint16_t port = 11211;
+    std::chrono::milliseconds connect_timeout{5000};
+    std::chrono::milliseconds operation_timeout{30000};
+    std::uint64_t max_value_bytes = 0;
+};
+
 struct ItemInfo {
     std::uint32_t flags = 0;
     std::uint64_t size = 0;
@@ -58,15 +72,16 @@ struct Item : ItemInfo {
 enum class StoreResult { stored, not_stored, exists, not_found };
 enum class DeleteResult { deleted, not_found };
 
-// Native InfiniBand memcache client. The transport is the Goblin/Packrat
-// one-sided RC ring; memcache remains its ordinary binary-safe text stream.
-// Calls on one Client are safe from multiple threads but execute in order on
-// one QP. Use one Client per thread when parallelism is desired.
+// Binary-safe memcache client over either the native Goblin RDMA transport or
+// an explicitly selected ExaSock TCP transport. Calls on one Client are safe
+// from multiple threads but execute in order on one connection. Use one Client
+// per thread when parallelism is desired.
 class Client {
 public:
     using Sink = std::function<void(std::string_view)>;
 
     [[nodiscard]] static Client connect(const Options& options);
+    [[nodiscard]] static Client connect_exasock(const ExasockOptions& options);
 
     // Injection seam for deterministic tests and alternate byte transports.
     // The same incremental parser and framing are used in either case.
@@ -114,5 +129,12 @@ private:
 
 [[nodiscard]] bool rdma_available() noexcept;
 [[nodiscard]] std::unique_ptr<Transport> connect_rdma(const Options& options);
+
+// available() reports compile-time support. active() reports whether the
+// process is currently running with the ExaSock interception library loaded.
+[[nodiscard]] bool exasock_available() noexcept;
+[[nodiscard]] bool exasock_active() noexcept;
+[[nodiscard]] std::unique_ptr<Transport> connect_exasock(
+    const ExasockOptions& options);
 
 } // namespace goblin::client

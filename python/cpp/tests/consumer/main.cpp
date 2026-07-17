@@ -25,8 +25,9 @@ public:
 
 int main() {
     goblin::client::Options options;
+    goblin::client::ExasockOptions exasock_options;
     options.address = "127.0.0.1";
     goblin::client::Client client(std::make_unique<NullTransport>());
     client.close();
-    return options.port == 11211 ? 0 : 1;
+    return options.port == 11211 && exasock_options.port == 11211 ? 0 : 1;
 }

@@ -154,7 +154,7 @@ std::string_view content_type_for(std::string_view key) {
     return "application/octet-stream";
 }
 
-ParseResult parse_request(std::string_view buf, std::size_t prev_len) {
+ParseResult parse_request(std::string_view buf, std::size_t prev_len, bool capture_headers) {
     const char* method = nullptr;
     const char* path = nullptr;
     std::size_t method_len = 0, path_len = 0;
@@ -175,12 +175,14 @@ ParseResult parse_request(std::string_view buf, std::size_t prev_len) {
     req.target = std::string_view(path, path_len);
     req.minor_version = minor;
     req.keep_alive = minor >= 1; // HTTP/1.1 keep-alive by default; HTTP/1.0 closes unless told otherwise
+    if (capture_headers) req.headers.reserve(num_headers);
 
     // Size-first match: only the four headers Goblin cares about. Unknown names exit after one
     // integer compare; known ones compare against a lowercase literal (no dual-tolower).
     for (std::size_t i = 0; i < num_headers; ++i) {
         const std::string_view name(headers[i].name, headers[i].name_len);
         const std::string_view value(headers[i].value, headers[i].value_len);
+        if (capture_headers) req.headers.push_back({name, trim(value)});
         switch (name.size()) {
             case 4:
                 if (ieq_lit(name, "host")) req.host = trim(value);

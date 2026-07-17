@@ -4,9 +4,9 @@ libdir=@GOBLIN_STORE_CLIENT_PC_LIBDIR@
 includedir=@GOBLIN_STORE_CLIENT_PC_INCLUDEDIR@
 
 Name: goblin-store-client
-Description: Native InfiniBand memcache client for Goblin Store
+Description: Native RDMA and optional ExaSock memcache client for Goblin Store
 Version: @PROJECT_VERSION@
 Requires.private: @GOBLIN_STORE_CLIENT_PC_REQUIRES@
 Libs: -L${libdir} -lgoblin-store-client
-Libs.private: -pthread
+Libs.private: @GOBLIN_STORE_CLIENT_PC_PRIVATE_LIBS@
 Cflags: -I${includedir} -pthread

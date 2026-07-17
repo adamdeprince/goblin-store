@@ -35,6 +35,33 @@ TEST("index: set / lookup roundtrip") {
     CHECK_EQ(ix.size(), std::size_t(1));
 }
 
+TEST("index: mirror metadata is paired with an object generation and cleared by ordinary replace") {
+    Index index;
+    const auto key = hash_key("mirror");
+    ObjectMeta first;
+    first.size = 10;
+    first.etag = 7;
+    auto http = std::make_shared<HttpCacheMetadata>();
+    http->status = 200;
+    http->etag = "\"origin\"";
+    index.set_with_score(key, first, 0.0, http);
+
+    const auto record = index.lookup_with_http(key);
+    CHECK(record && record->meta.etag == 7 && record->http &&
+          record->http->etag == "\"origin\"");
+
+    auto refreshed = std::make_shared<HttpCacheMetadata>(*http);
+    refreshed->freshness_lifetime = 60;
+    CHECK(!index.update_http_if_etag(key, 6, refreshed));
+    CHECK(index.update_http_if_etag(key, 7, refreshed));
+    CHECK(index.lookup_with_http(key)->http->freshness_lifetime == 60);
+
+    ObjectMeta second = first;
+    second.etag = 8;
+    index.set(key, second);
+    CHECK(index.lookup_with_http(key) && !index.lookup_with_http(key)->http);
+}
+
 TEST("index: add only-if-absent, replace only-if-present (memcache semantics)") {
     Index ix;
     const auto k = hash_key("/b");

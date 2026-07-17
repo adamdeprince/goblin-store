@@ -20,8 +20,9 @@ inline constexpr Size KiB = 1024;
 inline constexpr Size MiB = 1024 * KiB;
 inline constexpr Size GiB = 1024 * MiB;
 
-// Largest object we serve (project target: up to ~1 GiB).
-inline constexpr Size kMaxObjectSize = 1 * GiB;
+// Largest object we serve. Size and Offset are 64-bit; this guard bounds admission and catches
+// unreasonable protocol lengths before any filesystem work begins.
+inline constexpr Size kMaxObjectSize = 4 * GiB;
 // Device-block / O_DIRECT alignment (ADR-0011) and arena alignment floor (ADR-0008).
 inline constexpr Size kDeviceBlock = 4 * KiB;
 

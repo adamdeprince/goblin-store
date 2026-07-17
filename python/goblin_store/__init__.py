@@ -1,4 +1,4 @@
-"""Native InfiniBand client for Goblin Store's memcache protocol."""
+"""Native RDMA and opt-in ExaSock client for the memcache protocol."""
 
 from __future__ import annotations
 
@@ -31,6 +31,8 @@ __all__ = [
     "ServerError",
     "ValueTooLargeError",
     "rdma_available",
+    "exasock_available",
+    "exasock_active",
 ]
 
 Key = Union[str, bytes, bytearray, memoryview]
@@ -86,11 +88,23 @@ def rdma_available() -> bool:
     return bool(_goblin_store.rdma_available())
 
 
-class Client:
-    """One ordered memcache connection over a native one-sided RDMA ring.
+def exasock_available() -> bool:
+    """Return whether this extension was explicitly built with ExaSock support."""
+    return bool(_goblin_store.exasock_available())
 
-    Calls are serialized per instance. Use one Client per worker/thread when
-    concurrent requests should occupy independent queue pairs.
+
+def exasock_active() -> bool:
+    """Return whether the process is currently running under ExaSock."""
+    return bool(_goblin_store.exasock_active())
+
+
+class Client:
+    """One ordered native memcache connection.
+
+    ``transport="rdma"`` uses Goblin's one-sided RDMA protocol.
+    ``transport="exasock"`` uses an ordinary memcache TCP stream accelerated
+    locally by ExaSock. Calls are serialized per instance; use one Client per
+    worker/thread for concurrent connections.
     """
 
     def __init__(
@@ -104,12 +118,20 @@ class Client:
         max_value_bytes: int = 0,
         bulk_window_bytes: int = 256 * 1024,
         bulk_window_count: int = 4,
+        transport: str = "rdma",
     ) -> None:
         if connect_timeout < 0 or timeout < 0:
             raise ValueError("timeouts must not be negative")
-        _validate_bulk_geometry(bulk_window_bytes, bulk_window_count)
+        if transport not in ("rdma", "exasock"):
+            raise ValueError("transport must be 'rdma' or 'exasock'")
+        if transport == "rdma":
+            _validate_bulk_geometry(bulk_window_bytes, bulk_window_count)
+        elif (ring_bytes != 64 * 1024 or bulk_window_bytes != 256 * 1024 or
+              bulk_window_count != 4):
+            raise ValueError("ring_bytes and bulk-window options apply only to RDMA")
         self._address = address
         self._port = port
+        self._transport = transport
         self._client = _goblin_store._Client(
             address,
             port,
@@ -119,10 +141,12 @@ class Client:
             max_value_bytes,
             bulk_window_bytes,
             bulk_window_count,
+            transport,
         )
 
     def __repr__(self) -> str:
-        return f"Client(address={self._address!r}, port={self._port})"
+        return (f"Client(address={self._address!r}, port={self._port}, "
+                f"transport={self._transport!r})")
 
     def get(self, key: Key) -> bytes | None:
         return self._client.get(_key(key))

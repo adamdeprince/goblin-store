@@ -2,6 +2,7 @@
 
 #include "goblin/store/rdma_wire.hpp"
 
+#include <arpa/inet.h>
 #include <cmath>
 #include <limits>
 #include <netdb.h>
@@ -17,6 +18,30 @@ bool numeric_network_address(const std::string& address) {
     const int status = ::getaddrinfo(address.c_str(), nullptr, &hints, &result);
     if (result) ::freeaddrinfo(result);
     return status == 0;
+}
+
+bool numeric_ipv4_address(const std::string& address) {
+    in_addr parsed{};
+    return ::inet_pton(AF_INET, address.c_str(), &parsed) == 1;
+}
+
+bool wildcard_ipv4_address(const std::string& address) {
+    in_addr parsed{};
+    return ::inet_pton(AF_INET, address.c_str(), &parsed) == 1 &&
+           parsed.s_addr == htonl(INADDR_ANY);
+}
+
+bool plausible_mirror_url(const std::string& url) {
+    const std::string_view value(url);
+    const std::string_view scheme = value.starts_with("http://")
+        ? std::string_view("http://")
+        : (value.starts_with("https://") ? std::string_view("https://") : std::string_view{});
+    if (scheme.empty()) return false;
+    const std::string_view authority_and_path = value.substr(scheme.size());
+    const std::size_t authority_end = authority_and_path.find_first_of("/?#");
+    const std::string_view authority = authority_and_path.substr(0, authority_end);
+    return !authority.empty() && authority.find_first_of("\r\n") == std::string_view::npos &&
+           value.find('#') == std::string_view::npos && value.find('?') == std::string_view::npos;
 }
 
 } // namespace
@@ -92,6 +117,30 @@ Status validate(const ServerConfig& c) {
         return err(Errc::invalid_argument, "io_chunk_bytes must be a power of two >= 4 KiB");
     if (c.io_buffers == 0)
         return err(Errc::invalid_argument, "io_buffers must be >= 1");
+
+    if (c.listen_address.empty() || !numeric_ipv4_address(c.listen_address))
+        return err(Errc::invalid_argument,
+                   "--listen-address needs a numeric IPv4 address");
+    if (c.net == NetMode::exasock) {
+        if (wildcard_ipv4_address(c.listen_address))
+            return err(Errc::invalid_argument,
+                       "--net exasock requires an exact, non-wildcard --listen-address");
+        if (!c.enable_memcache && !c.enable_http)
+            return err(Errc::invalid_argument,
+                       "--net exasock requires memcache and/or plaintext HTTP");
+    }
+
+    if (c.mirror_url) {
+        if (c.http_vhost)
+            return err(Errc::invalid_argument,
+                       "--mirror and --http-vhost/--virtual-host are mutually exclusive");
+        if (!c.enable_http && !c.enable_https)
+            return err(Errc::invalid_argument,
+                       "--mirror requires the HTTP and/or HTTPS listener");
+        if (!plausible_mirror_url(*c.mirror_url))
+            return err(Errc::invalid_argument,
+                       "--mirror needs an absolute http:// or https:// URL without a query or fragment");
+    }
 
     if (c.rdma.enabled) {
         namespace wire = store::rdma_wire;

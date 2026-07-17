@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -43,6 +44,33 @@ struct ObjectMeta {
     // eviction bookkeeping (SIEVE visited bit, etc.) lands with the eviction module (ADR-0012)
 };
 
+// End-to-end response metadata for an object populated by --mirror. It lives beside (not inside)
+// ObjectMeta so ordinary memcache/HTTP lookups remain a small trivially-copyable metadata copy. The
+// immutable shared object is replaced atomically with the corresponding object incarnation.
+struct HttpResponseHeader {
+    std::string name;  // normalized lowercase field name
+    std::string value; // field value with surrounding OWS removed
+};
+
+struct HttpCacheMetadata {
+    std::uint16_t status = 200;
+    std::string reason = "OK";
+    std::vector<HttpResponseHeader> headers; // hop-by-hop/framing fields already removed
+    std::uint64_t response_time = 0;         // Unix seconds when the origin response completed
+    std::uint64_t corrected_initial_age = 0;
+    std::uint64_t freshness_lifetime = 0;
+    std::uint64_t stale_if_error = 0;
+    bool revalidate_always = false; // response Cache-Control: no-cache
+    bool must_revalidate = false;
+    std::string etag;          // origin validator, including quotes
+    std::string last_modified; // origin validator, HTTP-date
+};
+
+struct ObjectRecord {
+    ObjectMeta meta;
+    std::shared_ptr<const HttpCacheMetadata> http;
+};
+
 struct DigestHash {
     std::size_t operator()(const Digest& d) const noexcept {
         return static_cast<std::size_t>(d.bucket()); // low 64 bits; map buckets on top (ADR-0014)
@@ -64,6 +92,7 @@ public:
     explicit Index(unsigned shard_bits = 8); // 2^shard_bits shards
 
     std::optional<ObjectMeta> lookup(const Digest& d) const;
+    std::optional<ObjectRecord> lookup_with_http(const Digest& d) const;
     bool contains(const Digest& d) const;
 
     // Low-level metadata mutations. They preserve the current score representation and therefore
@@ -72,13 +101,18 @@ public:
     // Insert or replace metadata while explicitly selecting index-local (numeric) or external
     // (nullopt) score ownership. Numeric NaN is invalid because NaN is the ownership marker.
     void set_with_score(const Digest& d, const ObjectMeta& m,
-                        std::optional<double> local_score);
+                        std::optional<double> local_score,
+                        std::shared_ptr<const HttpCacheMetadata> http = {});
     bool add(const Digest& d, const ObjectMeta& m);     // memcache ADD (only if absent)
     bool replace(const Digest& d, const ObjectMeta& m); // memcache REPLACE (only if present)
     bool erase(const Digest& d);                        // memcache DELETE
 
     bool set_head(const Digest& d, HeadLoc loc);        // metadata only; false if absent
     bool update_expiry(const Digest& d, std::uint32_t expiry); // overwrite the TTL (meta T); false if absent
+    // Replace mirror metadata only if the body incarnation is still `etag`. Used by a 304
+    // revalidation so a late origin reply cannot attach headers to a concurrently replaced body.
+    bool update_http_if_etag(const Digest& d, std::uint64_t etag,
+                             std::shared_ptr<const HttpCacheMetadata> http);
 
     // Fractional and headless-object scores live in the index. A canonical NaN marks a score whose
     // ownership has moved to the dense NUMA head array; score() then returns nullopt and index-side
@@ -110,6 +144,7 @@ private:
         explicit Entry(const ObjectMeta& value) : meta(value), score(0.0) {}
         ObjectMeta meta;
         std::atomic<double> score;
+        std::shared_ptr<const HttpCacheMetadata> http;
     };
     struct Shard {
         mutable std::shared_mutex mu;

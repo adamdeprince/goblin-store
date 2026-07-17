@@ -20,6 +20,7 @@ namespace {
 using goblin::client::Client;
 using goblin::client::ConnectionError;
 using goblin::client::DeleteResult;
+using goblin::client::ExasockOptions;
 using goblin::client::ProtocolError;
 using goblin::client::ServerError;
 using goblin::client::StoreResult;
@@ -494,6 +495,18 @@ void test_concurrent_calls_are_serialized() {
     check(owner_runs == threads, "one client's concurrent calls were not transaction-serialized");
 }
 
+void test_exasock_build_boundary() {
+    if (goblin::client::exasock_available()) return;
+    check(!goblin::client::exasock_active(),
+          "disabled ExaSock backend reported an active preload library");
+    ExasockOptions options;
+    options.address = "192.0.2.1";
+    options.connect_timeout = std::chrono::milliseconds{0};
+    check_throws<ConnectionError>(
+        [&] { (void)Client::connect_exasock(options); },
+        "disabled ExaSock backend did not fail explicitly");
+}
+
 } // namespace
 
 int main() {
@@ -509,5 +522,6 @@ int main() {
     test_reentrancy_rejection_and_recovery();
     test_maximum_line_fragmentation();
     test_concurrent_calls_are_serialized();
+    test_exasock_build_boundary();
     std::cout << "goblin_store_client_tests: all tests passed\n";
 }

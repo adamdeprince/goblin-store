@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <utility>
 #include <unistd.h>
 
 // Linux coalesces with MSG_MORE; macOS/BSD lack it — soft-disable (still zero-cost flags=0).
@@ -22,9 +23,23 @@ constexpr auto rlx = std::memory_order_relaxed;
 
 StreamLoop::StreamLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm,
                        storage::Index& index, core::IoBufferPool& iobufs, unsigned io_timeout_ms,
-                       core::StatsRegistry* reg, WriteMode write_mode)
-    : r_(reactor), tm_(tm), index_(index), iobufs_(iobufs), reg_(reg),
-      write_mode_(write_mode), lfd_(listen_fd), io_timeout_ms_(io_timeout_ms),
+                       core::StatsRegistry* reg, WriteMode write_mode,
+                       bool include_http_metadata)
+    : owned_io_(std::make_unique<UringStreamIo>(reactor)), io_(*owned_io_), tm_(tm),
+      index_(index), iobufs_(iobufs), reg_(reg),
+      write_mode_(write_mode), include_http_metadata_(include_http_metadata), lfd_(listen_fd),
+      io_timeout_ms_(io_timeout_ms),
+      last_sweep_(std::chrono::steady_clock::now()) {
+    if (reg_) reg_->add(&stats_);
+}
+
+StreamLoop::StreamLoop(StreamIo& stream_io, int listen_fd, storage::TierManager& tm,
+                       storage::Index& index, core::IoBufferPool& iobufs,
+                       unsigned io_timeout_ms, core::StatsRegistry* reg, WriteMode write_mode,
+                       bool include_http_metadata)
+    : io_(stream_io), tm_(tm), index_(index), iobufs_(iobufs), reg_(reg),
+      write_mode_(write_mode), include_http_metadata_(include_http_metadata), lfd_(listen_fd),
+      io_timeout_ms_(io_timeout_ms),
       last_sweep_(std::chrono::steady_clock::now()) {
     if (reg_) reg_->add(&stats_);
 }
@@ -41,7 +56,13 @@ void StreamLoop::run() {
         if (shutdown_ && shutdown_->load(std::memory_order_relaxed)) { drain(); break; }
         run_once();
     }
-    for (auto& [c, up] : conns_) ::close(c->fd); // hard-close anything left after the drain / on stop()
+    for (auto& [c, up] : conns_) {
+        const int fd = std::exchange(c->fd, -1);
+        if (fd >= 0) io_.close_fd(fd); // hard-close anything left after the drain / on stop()
+        release_lanes(c);
+        unpin_if_held(c);
+        on_destroy(c);
+    }
     conns_.clear();
 }
 
@@ -56,17 +77,18 @@ void StreamLoop::drain() {
         std::chrono::steady_clock::now() + std::chrono::milliseconds(shutdown_grace_ms_);
     while (!conns_.empty() && std::chrono::steady_clock::now() < deadline) {
         for (auto& [c, up] : conns_)
-            if (!c->closing && c->state == St::idle && c->out.empty()) // active conns finish on their own
+            if (!c->closing && c->fd >= 0 && c->state == St::idle && c->out.empty())
+                // active conns finish on their own
                 ::shutdown(c->fd, SHUT_RDWR);
         run_once(); // dispatch completions; active conns advance, half-closed idle ones retire
     }
 }
 
 void StreamLoop::run_once() {
-    r_.submit_and_wait_timeout(200);
+    io_.submit_and_wait_timeout(200);
     const auto now = std::chrono::steady_clock::now();
     std::array<core::Completion, 256> cqes{};
-    const unsigned n = r_.reap(cqes);
+    const unsigned n = io_.reap(cqes);
     for (unsigned i = 0; i < n; ++i) {
         const std::uint64_t ud = cqes[i].user_data;
         const int res = cqes[i].res;
@@ -86,6 +108,8 @@ void StreamLoop::run_once() {
             on_read(c, res);
         else if (op == kPoll)
             on_poll(c, res);
+        else if (op == kExternal)
+            on_external(c, res);
         retire(c);
     }
     // After dispatch (incl. any write commits / GET completions that freed buffers this tick), wake
@@ -104,7 +128,7 @@ void StreamLoop::run_once() {
     }
 }
 
-void StreamLoop::arm_accept() { r_.submit_accept(lfd_, kAccept); }
+void StreamLoop::arm_accept() { io_.submit_accept(lfd_, kAccept); }
 
 void StreamLoop::on_accept(int res) {
     if (!draining_) arm_accept();            // once draining, stop accepting new connections
@@ -121,11 +145,14 @@ void StreamLoop::on_accept(int res) {
     stats_.conns.fetch_add(1, rlx);
     stats_.curr_conns.fetch_add(1, rlx);
     on_connection(c); // plaintext: start_recv; HTTPS: begin the TLS handshake
+    // A backend can fail its first recv/poll submission synchronously (for example epoll_ctl
+    // exhaustion). close_conn() then has no completion to trigger normal retirement.
+    retire(c);
 }
 
 void StreamLoop::start_recv(Conn* c) {
     if (c->closing) return;
-    if (r_.submit_recv(c->fd, MutBytes(c->rbuf.data(), c->rbuf.size()), tag(c, kRecv)))
+    if (io_.submit_recv(c->fd, MutBytes(c->rbuf.data(), c->rbuf.size()), tag(c, kRecv)))
         ++c->inflight;
     else
         close_conn(c);
@@ -150,7 +177,7 @@ void StreamLoop::start_send(Conn* c) {
             c->send_msg.msg_iovlen = 2;
             // MORE when a disk tail (or further stream) follows the head slice.
             const int flags = (c->get_size > head_hi) ? MSG_MORE : 0;
-            if (r_.submit_sendmsg(c->fd, &c->send_msg, tag(c, kSend), flags)) {
+            if (io_.submit_sendmsg(c->fd, &c->send_msg, tag(c, kSend), flags)) {
                 c->coalesced_send = true;
                 c->coalesced_head_len = head_n;
                 ++c->inflight;
@@ -168,7 +195,7 @@ void StreamLoop::start_send(Conn* c) {
         const Size head_hi = c->head_pin.valid ? std::min<Size>(c->head_pin.len, c->get_size) : 0;
         if (c->get_pos < head_hi || c->get_pos < c->get_size) flags = MSG_MORE;
     }
-    if (r_.submit_send(c->fd, ByteView(p, c->out.size() - c->out_sent), tag(c, kSend), flags)) {
+    if (io_.submit_send(c->fd, ByteView(p, c->out.size() - c->out_sent), tag(c, kSend), flags)) {
         ++c->inflight;
         prime_tail_read(c);
     } else {
@@ -202,8 +229,19 @@ bool StreamLoop::begin_get(Conn* c, std::string_view key, bool record_access, st
 
 bool StreamLoop::begin_get(Conn* c, std::string_view key, const crypto::Digest& digest,
                            bool record_access, std::uint32_t now) {
-    auto snap = tm_.open_snapshot(digest, record_access, now);
+    c->get_key.assign(key.data(), key.size());
+    c->get_digest = digest;
+    c->http_meta.reset();
+    auto snap = tm_.open_snapshot(digest, record_access, now, include_http_metadata_);
     if (!snap) {
+        stats_.get_misses.fetch_add(1, rlx);
+        frame_get_miss(c);
+        return true;
+    }
+    c->http_meta = snap->http;
+    if (!accept_get_snapshot(c, key, snap->meta)) {
+        if (snap->pin.valid) tm_.unpin_head(snap->pin);
+        c->http_meta.reset();
         stats_.get_misses.fetch_add(1, rlx);
         frame_get_miss(c);
         return true;
@@ -354,9 +392,9 @@ bool StreamLoop::plan_lane_read(Conn* c, int i) {
         const Size rlen = std::min<Size>(align_up(s.len, kDeviceBlock), L.buf.size() - s.out_off);
         if (rlen < s.len || !is_aligned(rlen, kDeviceBlock)) return false;
     }
-    if (plan.nsegs > r_.submission_space()) {
-        (void)r_.submit(); // flush already-queued sends/reads, then recheck the now-drained SQ
-        if (plan.nsegs > r_.submission_space()) return false;
+    if (plan.nsegs > io_.submission_space()) {
+        (void)io_.submit(); // flush already-queued sends/reads, then recheck the now-drained SQ
+        if (plan.nsegs > io_.submission_space()) return false;
     }
 
     L.len = plan.total;
@@ -375,7 +413,7 @@ bool StreamLoop::plan_lane_read(Conn* c, int i) {
         // (page-aligned, io_chunk-sized) buffer and serve only L.len bytes; offsets are already
         // 4 KiB-aligned (pieces start on 4 KiB boundaries, segments at stripe boundaries).
         const Size rlen = std::min<Size>(align_up(s.len, kDeviceBlock), L.buf.size() - s.out_off);
-        if (!r_.submit_read(s.fd, s.file_off, L.buf.subspan(s.out_off, rlen), tag(c, kRead)))
+        if (!io_.submit_read(s.fd, s.file_off, L.buf.subspan(s.out_off, rlen), tag(c, kRead)))
             return false;
         ++c->inflight;
         ++L.reads;
@@ -442,7 +480,7 @@ void StreamLoop::start_lane_send(Conn* c) {
     // MORE only while more value bytes remain after this piece (not for protocol trailers —
     // HTTP has none, and memcache END is a separate small send).
     const int flags = (c->send_pos + L.len < c->get_size) ? MSG_MORE : 0;
-    if (r_.submit_send(c->fd, piece, tag(c, kSend), flags))
+    if (io_.submit_send(c->fd, piece, tag(c, kSend), flags))
         ++c->inflight;
     else
         close_conn(c);
@@ -455,13 +493,15 @@ void StreamLoop::start_send_head(Conn* c) {
     const ByteView rem(head.data() + c->head_sent, head_hi - c->head_sent);
     // MORE when a disk tail will follow the head slice.
     const int flags = (head_hi < c->get_size) ? MSG_MORE : 0;
-    if (r_.submit_send(c->fd, rem, tag(c, kSend), flags))
+    if (io_.submit_send(c->fd, rem, tag(c, kSend), flags))
         ++c->inflight;
     else
         close_conn(c);
 }
 
 void StreamLoop::on_send(Conn* c, int res) {
+    if (res > 0) stats_.bytes_served.fetch_add(static_cast<std::uint64_t>(res), rlx);
+    if (on_custom_send(c, res)) return;
     if (res < 0) {
         if (res == -EAGAIN || res == -EWOULDBLOCK) { // non-blocking fd (kTLS/HTTPS): buffer full -> retry
             if (c->state == St::get_stream) start_lane_send(c);
@@ -476,7 +516,6 @@ void StreamLoop::on_send(Conn* c, int res) {
         close_conn(c);
         return;
     }
-    stats_.bytes_served.fetch_add(static_cast<std::uint64_t>(res), rlx); // header/head/piece/trailer
     if (c->state == St::get_stream) {
         Conn::Lane& L = c->lane[c->send_lane];
         L.sent += static_cast<std::size_t>(res);
@@ -609,7 +648,8 @@ void StreamLoop::abort_get(Conn* c) {
 void StreamLoop::close_conn(Conn* c) {
     if (c->closing) return;
     c->closing = true;
-    ::close(c->fd);
+    const int fd = std::exchange(c->fd, -1);
+    if (fd >= 0) io_.close_fd(fd);
 }
 
 void StreamLoop::retire(Conn* c) {
@@ -630,7 +670,7 @@ void StreamLoop::abort_conn(Conn* c) {
     if (c->closing) return;
     stats_.slow_drops.fetch_add(1, rlx);
     const linger lo{1, 0};
-    ::setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &lo, sizeof lo);
+    if (c->fd >= 0) ::setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &lo, sizeof lo);
     close_conn(c);
 }
 
@@ -642,7 +682,8 @@ void StreamLoop::sweep_stalled(std::chrono::steady_clock::time_point now) {
     const auto deadline = std::chrono::milliseconds(io_timeout_ms_);
     for (auto& [c, up] : conns_) {
         if (c->closing) continue;
-        const bool holds_buffer = c->n_lanes > 0 || c->head_pin.valid || c->sh.has_value();
+        const bool holds_buffer = c->n_lanes > 0 || c->head_pin.valid || c->sh.has_value() ||
+                                  c->state == St::mirror_body;
         if (holds_buffer && now - c->last_progress >= deadline) abort_conn(c);
     }
 }
