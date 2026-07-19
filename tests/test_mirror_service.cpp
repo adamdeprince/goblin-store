@@ -1,6 +1,7 @@
 #include "mini_test.hpp"
 
 #include "goblin/crypto/sha256.hpp"
+#include "goblin/core/reactor.hpp"
 #include "goblin/http/mirror.hpp"
 
 #include <arpa/inet.h>
@@ -91,7 +92,161 @@ Result<TierManager> mirror_tm(const std::string& root, Index& index) {
                              64 * KiB, 2, false);
 }
 
+struct DrainedFetch {
+    std::string body;
+    std::string error;
+    bool headers = false;
+    bool done = false;
+    bool failed = false;
+};
+
+DrainedFetch drain_fetch(const std::shared_ptr<MirrorFetch>& fetch) {
+    DrainedFetch result;
+    std::uint64_t last_sequence = 0;
+    for (unsigned iteration = 0; iteration < 100 && !result.done; ++iteration) {
+        pollfd descriptor{fetch->notification_fd(), POLLIN, 0};
+        if (::poll(&descriptor, 1, 1000) <= 0) continue;
+        fetch->drain_notification();
+        const auto view = fetch->view();
+        if (view.headers_published && !result.headers) {
+            result.headers = true;
+            fetch->acknowledge_headers();
+        }
+        if (view.chunk && view.chunk_sequence != last_sequence) {
+            result.body.append(reinterpret_cast<const char*>(view.chunk->data()),
+                               view.chunk->size());
+            last_sequence = view.chunk_sequence;
+            fetch->acknowledge_chunk(view.chunk_sequence);
+        }
+        result.done = view.done;
+        result.failed = view.failed;
+        result.error = view.error;
+    }
+    return result;
+}
+
 } // namespace
+
+TEST("native mirror client: reuses one persistent HTTP/1.1 origin connection") {
+    if (!core::Reactor::available() || !MirrorService::available()) return;
+    const Listener listener = loopback_listener();
+    if (listener.fd < 0) return;
+    const std::array<std::string, 2> bodies = {
+        std::string(32 * KiB, 'a'), std::string(48 * KiB, 'b')};
+    std::atomic<unsigned> accepts{0};
+    std::atomic<unsigned> requests{0};
+    std::thread origin([&] {
+        const int client = ::accept(listener.fd, nullptr, nullptr);
+        if (client < 0) return;
+        accepts.fetch_add(1, std::memory_order_relaxed);
+        for (const auto& body : bodies) {
+            if (read_request_head(client).empty()) break;
+            requests.fetch_add(1, std::memory_order_relaxed);
+            const std::string head =
+                "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+                "\r\nCache-Control: public, max-age=60\r\nConnection: keep-alive\r\n\r\n";
+            if (!send_all(client, head) || !send_all(client, body)) break;
+        }
+        ::close(client);
+    });
+
+    const std::string root = (fs::temp_directory_path() /
+        ("goblin-native-persistent-" + std::to_string(::getpid()))).string();
+    Index index;
+    auto tm = mirror_tm(root, index);
+    CHECK(tm.has_value());
+    std::atomic<bool> shutdown{false};
+    auto service = tm ? MirrorService::create(
+        "http://127.0.0.1:" + std::to_string(listener.port), *tm, index, &shutdown, 1,
+        MirrorClient::uring) : Result<std::unique_ptr<MirrorService>>(
+            err(Errc::io_error, "tier manager unavailable"));
+    CHECK(service.has_value());
+    for (std::size_t i = 0; service && i < bodies.size(); ++i) {
+        MirrorRequest request;
+        request.target = "/object-" + std::to_string(i);
+        request.digest = crypto::hash_key("native-persistent-" + std::to_string(i));
+        auto fetch = (*service)->fetch(std::move(request));
+        CHECK(fetch.has_value());
+        if (!fetch) continue;
+        const DrainedFetch drained = drain_fetch(*fetch);
+        CHECK(drained.done);
+        CHECK(!drained.failed);
+        CHECK(drained.headers);
+        CHECK_EQ(drained.body, bodies[i]);
+    }
+    if (service) service->reset();
+    origin.join();
+    ::close(listener.fd);
+    CHECK_EQ(accepts.load(std::memory_order_relaxed), 1u);
+    CHECK_EQ(requests.load(std::memory_order_relaxed), 2u);
+    fs::remove_all(root);
+}
+
+TEST("native mirror client: accepts valid chunked framing and rejects close-delimited bodies") {
+    if (!core::Reactor::available() || !MirrorService::available()) return;
+    const Listener listener = loopback_listener();
+    if (listener.fd < 0) return;
+    std::thread origin([&] {
+        for (unsigned response = 0; response < 2; ++response) {
+            const int client = ::accept(listener.fd, nullptr, nullptr);
+            if (client < 0) return;
+            (void)read_request_head(client);
+            if (response == 0) {
+                (void)send_all(client,
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                    "Cache-Control: public, max-age=60\r\nConnection: keep-alive\r\n\r\n"
+                    "6;bug=yes\r\ngoblin\r\n5\r\n eats\r\n5\r\n bugs\r\n"
+                    "0\r\nX-Origin-Trailer: sane\r\n\r\n");
+            } else {
+                (void)send_all(client,
+                    "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=60\r\n\r\nclown");
+            }
+            ::close(client);
+        }
+    });
+
+    const std::string root = (fs::temp_directory_path() /
+        ("goblin-native-framing-" + std::to_string(::getpid()))).string();
+    Index index;
+    auto tm = mirror_tm(root, index);
+    CHECK(tm.has_value());
+    std::atomic<bool> shutdown{false};
+    auto service = tm ? MirrorService::create(
+        "http://127.0.0.1:" + std::to_string(listener.port), *tm, index, &shutdown, 1,
+        MirrorClient::uring) : Result<std::unique_ptr<MirrorService>>(
+            err(Errc::io_error, "tier manager unavailable"));
+    CHECK(service.has_value());
+
+    if (service) {
+        MirrorRequest chunked;
+        chunked.target = "/chunked";
+        chunked.digest = crypto::hash_key("native-chunked");
+        auto fetch = (*service)->fetch(std::move(chunked));
+        CHECK(fetch.has_value());
+        if (fetch) {
+            const DrainedFetch result = drain_fetch(*fetch);
+            CHECK(result.done);
+            CHECK(!result.failed);
+            CHECK_EQ(result.body, "goblin eats bugs");
+        }
+
+        MirrorRequest invalid;
+        invalid.target = "/close-delimited";
+        invalid.digest = crypto::hash_key("native-invalid-framing");
+        fetch = (*service)->fetch(std::move(invalid));
+        CHECK(fetch.has_value());
+        if (fetch) {
+            const DrainedFetch result = drain_fetch(*fetch);
+            CHECK(result.done);
+            CHECK(result.failed);
+            CHECK(result.error.find("neither Content-Length nor chunked") != std::string::npos);
+        }
+        service->reset();
+    }
+    origin.join();
+    ::close(listener.fd);
+    fs::remove_all(root);
+}
 
 TEST("mirror service: miss streams one chunk at a time and publishes body plus HTTP metadata") {
     if (!MirrorService::available()) return;

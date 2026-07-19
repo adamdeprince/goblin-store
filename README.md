@@ -123,11 +123,13 @@ filesystem-local reclaim, and immutable publication, read
 - **HTTP/HTTPS mirror cache (`--mirror URL`):** query-aware shared-cache keys, origin cache-control
   and validator handling, same-key miss coalescing, and one-chunk lockstep streaming to the client
   and RAM/SSD/HDD. A disk failure abandons only that fill; a client disconnect does not. Cached hits
-  return through the ordinary head-first/disk-prefetch path. See
+  return through the ordinary head-first/disk-prefetch path. The default libcurl origin client
+  supports HTTP(S); `--mirror-client uring` selects a strict persistent-HTTP/1.1 fast path for
+  well-behaved plaintext origins. See
   [ADR-0021](docs/adr/0021-http-mirror-cache.md).
 
 > **Status:** working memcache + HTTP/HTTPS server on io_uring + O_DIRECT — 3-tier store, atomic
-> publish, RAM-head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **231 unit-test
+> publish, RAM-head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **237 unit-test
 > cases, with Release, ASan/UBSan, and TSan coverage.** macOS is a non-goal (no io_uring / O_DIRECT
 > analog); FreeBSD (kqueue/aio) is a planned port.
 
@@ -187,15 +189,20 @@ ctest --test-dir build --output-on-failure
 # https://origin.example/z/a/b.html?v=2 and later hits use the normal RAM-head pipeline.
 ./build/goblin-store --mirror https://origin.example/z \
     --memory 4G --ssd-dir /mnt/ssd/pool --http-port 8080
+
+# Linux native-origin fast path: strict HTTP/1.1, persistent connections, Content-Length/chunked.
+./build/goblin-store --mirror http://origin.example/z --mirror-client uring \
+    --memory 4G --ssd-dir /mnt/ssd/pool --http-port 8080
 ```
 
 Key knobs (see `--help`): `--ram-head` (power-of-two per-object resident head, default 256 KiB),
 `--ssd-prefix` (positional tier size), `--block` (power-of-two allocation/promotion block, default
 2 MiB on x86 and 32 MiB on Arm/LoongArch), `--io-buffers` /
-`--io-chunk` (bounded streaming RAM), `--eviction`, `--max-objects`, `--no-mlock` (dev), `--tls-cert`/
+`--io-chunk` (warmed-read quantum), `--write-io-chunk` (admission/write quantum), `--eviction`,
+`--max-objects`, `--no-mlock` (dev), `--tls-cert`/
 `--tls-key` (HTTPS), `--source` (preload a directory tree), `--numa NODE` (explicit NUMA
 placement), `--mirror URL` (streaming HTTP(S) reverse-cache origin; incompatible with virtual-host
-mode), `--memory SIZE` / `--sub-memory SIZE` (fixed-head RAM on the local / each non-local
+mode), `--mirror-client curl|uring`, `--memory SIZE` / `--sub-memory SIZE` (fixed-head RAM on the local / each non-local
 NUMA node), `--small-memory SIZE` / `--small-sub-memory SIZE` (packed-small-object RAM on the local /
 each non-local node), `--increment FLOAT` (score added per successful key read), `--decay FLOAT`
 (per-minute score multiplier in `(0, 1)`), and `--perverse` (benchmark-only inversion of preferred

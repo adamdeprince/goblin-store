@@ -1,6 +1,7 @@
 #pragma once
 
 #include "goblin/common/error.hpp"
+#include "goblin/common/config.hpp"
 #include "goblin/crypto/sha256.hpp"
 #include "goblin/http/mirror_cache.hpp"
 #include "goblin/storage/index.hpp"
@@ -20,6 +21,28 @@
 
 namespace goblin::http {
 
+// One origin body rendezvous. Storage is intentionally uninitialized so the native io_uring
+// client can receive directly into the same bytes consumed by the cache writer and downstream
+// send, without a receive-buffer-to-vector copy or a redundant zero fill.
+class MirrorChunk {
+public:
+    explicit MirrorChunk(std::size_t capacity)
+        : bytes_(capacity ? new std::byte[capacity] : nullptr), capacity_(capacity) {}
+    MirrorChunk(const MirrorChunk&) = delete;
+    MirrorChunk& operator=(const MirrorChunk&) = delete;
+
+    std::byte* mutable_data() noexcept { return bytes_.get(); }
+    const std::byte* data() const noexcept { return bytes_.get(); }
+    std::size_t size() const noexcept { return size_; }
+    std::size_t capacity() const noexcept { return capacity_; }
+    void set_size(std::size_t size) noexcept { size_ = size <= capacity_ ? size : capacity_; }
+
+private:
+    std::unique_ptr<std::byte[]> bytes_;
+    std::size_t capacity_ = 0;
+    std::size_t size_ = 0;
+};
+
 struct MirrorRequest {
     std::string target; // origin-form, query included
     std::vector<OwnedHeader> headers;
@@ -37,7 +60,7 @@ class MirrorFetch {
 public:
     struct View {
         std::shared_ptr<const OriginResponseHead> response;
-        std::shared_ptr<const std::vector<std::byte>> chunk;
+        std::shared_ptr<const MirrorChunk> chunk;
         std::uint64_t chunk_sequence = 0;
         bool cache_ready = false;
         bool done = false;
@@ -63,7 +86,7 @@ public:
     bool cancelled() const;
     void publish_headers(std::shared_ptr<const OriginResponseHead>);
     bool wait_for_header_ack();
-    std::uint64_t publish_chunk(std::shared_ptr<const std::vector<std::byte>>);
+    std::uint64_t publish_chunk(std::shared_ptr<const MirrorChunk>);
     bool wait_for_chunk_ack(std::uint64_t sequence);
 
 private:
@@ -82,13 +105,15 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::shared_ptr<const OriginResponseHead> response_;
-    std::shared_ptr<const std::vector<std::byte>> chunk_;
+    std::shared_ptr<const MirrorChunk> chunk_;
     std::uint64_t chunk_sequence_ = 0;
     std::uint64_t acknowledged_sequence_ = 0;
     bool headers_published_ = false;
-    bool headers_acknowledged_ = false;
-    bool client_attached_ = true;
-    bool cancelled_ = false;
+    // Hot flags are atomic so the origin write callback can poll cancel/detach without taking
+    // mu_ on every libcurl body chunk (the mutex still guards the shared_ptr payload).
+    std::atomic<bool> headers_acknowledged_{false};
+    std::atomic<bool> client_attached_{true};
+    std::atomic<bool> cancelled_{false};
     bool cache_ready_ = false;
     bool done_ = false;
     bool failed_ = false;
@@ -99,13 +124,20 @@ class MirrorService {
 public:
     static Result<std::unique_ptr<MirrorService>> create(
         std::string base_url, storage::TierManager& tm, storage::Index& index,
-        const std::atomic<bool>* shutdown, unsigned workers);
+        const std::atomic<bool>* shutdown, unsigned workers,
+        MirrorClient client = MirrorClient::curl);
     ~MirrorService();
     MirrorService(const MirrorService&) = delete;
     MirrorService& operator=(const MirrorService&) = delete;
 
     Result<std::shared_ptr<MirrorFetch>> fetch(MirrorRequest request);
     storage::TierManager& tier_manager() noexcept { return tm_; } // origin worker's tentative fill
+    storage::Index& index() noexcept { return index_; }
+    void finish_origin_fetch(const std::shared_ptr<MirrorFetch>& fetch,
+                             bool cache_ready = false) {
+        fetch->finish(cache_ready);
+    }
+    void fail_origin_fetch(const std::shared_ptr<MirrorFetch>& fetch, std::string detail);
     bool should_stop() const noexcept {
         return shutdown_ && shutdown_->load(std::memory_order_relaxed);
     }
@@ -126,8 +158,9 @@ private:
         std::deque<Task> followers;
     };
     MirrorService(std::string base_url, storage::TierManager& tm, storage::Index& index,
-                  const std::atomic<bool>* shutdown)
-        : base_url_(std::move(base_url)), tm_(tm), index_(index), shutdown_(shutdown) {}
+                  const std::atomic<bool>* shutdown, MirrorClient client)
+        : base_url_(std::move(base_url)), tm_(tm), index_(index), shutdown_(shutdown),
+          client_(client) {}
     void worker();
     void perform(Task&);
     bool cache_ready_for(const MirrorRequest&) const;
@@ -138,6 +171,7 @@ private:
     storage::TierManager& tm_;
     storage::Index& index_;
     const std::atomic<bool>* shutdown_;
+    [[maybe_unused]] MirrorClient client_;
     std::mutex mu_;
     std::condition_variable cv_;
     std::deque<Task> queue_;

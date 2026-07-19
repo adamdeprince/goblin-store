@@ -10,10 +10,15 @@ the cold tail, cost less per stored GB. These are the measurements behind that c
 | **memory-sized** (set fits RAM) | memcached | same latency, **7.4× less RAM** → ~6–7× cheaper |
 | **disk-sized** (set ≫ RAM) | memcached + extstore | **+68% throughput, ~25% cheaper** on the same HDD; goblin-store holds 100% of the set, extstore **sheds 41%** |
 | **small objects** (sub-2 KB) | memcached | **memcached wins** (~12× less RAM, ~2× faster) — small values are not goblin-store's game |
+| **small files on Optane** (mean 175 KiB) | Vinyl Cache | **+7.9% warm bandwidth, 64.7% less resident object data** with 256 KiB heads; 64 KiB heads cut mean TTFB 14.8% |
 | **native RDMA, 256 KiB values** | nominal 40 Gbit/s InfiniBand | **38.232 Gbit/s payload** (95.58% of link rate); 7.659 us median response-header TTFB |
 
 The win is large objects, and the mechanism is the tiering: a hot **RAM head** + **SSD prefix** answer
 instantly while a **read-ahead pipeline** hides the ~5 ms HDD seek that extstore eats whole on every cold GET.
+
+The current Optane small-file comparison—including the fixed 373,165-object corpus, NUMA placement,
+cache population rate, head-size sweep, resident-memory calculation, CPU load, and warm-cache
+latency—is in **[Small-object HTTP caching on Optane](docs/optane-small-object-benchmark.md)**.
 
 ## The rig
 

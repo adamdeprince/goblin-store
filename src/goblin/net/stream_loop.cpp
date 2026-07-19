@@ -6,6 +6,7 @@
 #include <cstring>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <utility>
 #include <unistd.h>
@@ -33,6 +34,18 @@ StreamLoop::StreamLoop(core::Reactor& reactor, int listen_fd, storage::TierManag
     if (reg_) reg_->add(&stats_);
 }
 
+StreamLoop::StreamLoop(core::Reactor& reactor, ConnectionInbox& inbox,
+                       storage::TierManager& tm, storage::Index& index,
+                       core::IoBufferPool& iobufs, unsigned io_timeout_ms,
+                       core::StatsRegistry* reg, WriteMode write_mode,
+                       bool include_http_metadata)
+    : owned_io_(std::make_unique<UringStreamIo>(reactor)), io_(*owned_io_), tm_(tm),
+      index_(index), iobufs_(iobufs), reg_(reg), write_mode_(write_mode),
+      include_http_metadata_(include_http_metadata), inbox_(&inbox),
+      io_timeout_ms_(io_timeout_ms), last_sweep_(std::chrono::steady_clock::now()) {
+    if (reg_) reg_->add(&stats_);
+}
+
 StreamLoop::StreamLoop(StreamIo& stream_io, int listen_fd, storage::TierManager& tm,
                        storage::Index& index, core::IoBufferPool& iobufs,
                        unsigned io_timeout_ms, core::StatsRegistry* reg, WriteMode write_mode,
@@ -44,6 +57,17 @@ StreamLoop::StreamLoop(StreamIo& stream_io, int listen_fd, storage::TierManager&
     if (reg_) reg_->add(&stats_);
 }
 
+StreamLoop::StreamLoop(StreamIo& stream_io, ConnectionInbox& inbox,
+                       storage::TierManager& tm, storage::Index& index,
+                       core::IoBufferPool& iobufs, unsigned io_timeout_ms,
+                       core::StatsRegistry* reg, WriteMode write_mode,
+                       bool include_http_metadata)
+    : io_(stream_io), tm_(tm), index_(index), iobufs_(iobufs), reg_(reg),
+      write_mode_(write_mode), include_http_metadata_(include_http_metadata), inbox_(&inbox),
+      io_timeout_ms_(io_timeout_ms), last_sweep_(std::chrono::steady_clock::now()) {
+    if (reg_) reg_->add(&stats_);
+}
+
 StreamLoop::~StreamLoop() {
     if (reg_) reg_->remove(&stats_);
 }
@@ -51,7 +75,10 @@ StreamLoop::~StreamLoop() {
 void StreamLoop::stop() noexcept { stop_.store(true, std::memory_order_relaxed); }
 
 void StreamLoop::run() {
-    arm_accept();
+    if (inbox_)
+        arm_inbox();
+    else
+        arm_accept();
     while (!stop_.load(std::memory_order_relaxed)) {
         if (shutdown_ && shutdown_->load(std::memory_order_relaxed)) { drain(); break; }
         run_once();
@@ -62,8 +89,11 @@ void StreamLoop::run() {
         release_lanes(c);
         unpin_if_held(c);
         on_destroy(c);
+        stats_.curr_conns.fetch_sub(1, rlx);
+        if (inbox_) inbox_->release_connection();
     }
     conns_.clear();
+    reject_queued_connections();
 }
 
 // Graceful shutdown: stop accepting, let in-flight transfers (GET streams / SET ingests) finish, and
@@ -94,6 +124,10 @@ void StreamLoop::run_once() {
         const int res = cqes[i].res;
         if (ud == kAccept) {
             on_accept(res);
+            continue;
+        }
+        if (ud == kInbox) {
+            on_inbox(res);
             continue;
         }
         auto* c = reinterpret_cast<Conn*>(ud & ~std::uint64_t{7});
@@ -130,13 +164,50 @@ void StreamLoop::run_once() {
 
 void StreamLoop::arm_accept() { io_.submit_accept(lfd_, kAccept); }
 
+void StreamLoop::arm_inbox() {
+    if (inbox_) (void)io_.submit_poll(inbox_->notification_fd(), POLLIN, kInbox);
+}
+
 void StreamLoop::on_accept(int res) {
     if (!draining_) arm_accept();            // once draining, stop accepting new connections
     if (res < 0) return;
-    if (draining_) { ::close(res); return; } // reject a connection that slipped in during the drain
+    adopt_connection(res);
+}
+
+void StreamLoop::on_inbox(int res) {
+    if (!inbox_) return;
+    auto accepted = inbox_->take_connections();
+    if (!draining_ && res >= 0) arm_inbox();
+    for (const int fd : accepted) {
+        if (draining_ || res < 0) {
+            ::close(fd);
+            inbox_->release_connection();
+            continue;
+        }
+        // A large SYN burst can hand one loop more fds than fit in one SQ. Flush queued recv/poll
+        // operations without waiting so every accepted connection receives a live first operation.
+        if (io_.submission_space() == 0) (void)io_.submit();
+        adopt_connection(fd);
+    }
+}
+
+void StreamLoop::adopt_connection(int res) {
+    if (draining_) {
+        ::close(res);
+        if (inbox_) inbox_->release_connection();
+        return;
+    }
     const int one = 1;
     ::setsockopt(res, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); // no Nagle: small replies must not
                                                                   // wait on the peer's delayed ACK (~40ms)
+    // Mirror miss streaming is bandwidth-bound on high-speed TCP (Ethernet and IPoIB): give the
+    // client socket a high-BDP send/recv window. Ordinary memcache/object connections stay on the
+    // kernel default so huge idle fan-in does not charge multi-MiB buffers per fd.
+    if (include_http_metadata_) {
+        const int buf = static_cast<int>(kHighBdpSocketBuffer);
+        (void)::setsockopt(res, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
+        (void)::setsockopt(res, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf);
+    }
     auto up = std::make_unique<Conn>();
     up->fd = res;
     up->last_progress = std::chrono::steady_clock::now();
@@ -229,11 +300,15 @@ bool StreamLoop::begin_get(Conn* c, std::string_view key, bool record_access, st
 
 bool StreamLoop::begin_get(Conn* c, std::string_view key, const crypto::Digest& digest,
                            bool record_access, std::uint32_t now) {
-    c->get_key.assign(key.data(), key.size());
-    c->get_digest = digest;
     c->http_meta.reset();
     auto snap = tm_.open_snapshot(digest, record_access, now, include_http_metadata_);
     if (!snap) {
+        // Mirror fills resume asynchronously after this call returns. Preserve their identity only
+        // on the miss path; ordinary and warmed-cache hits avoid both string and digest copies.
+        if (include_http_metadata_) {
+            c->get_key.assign(key.data(), key.size());
+            c->get_digest = digest;
+        }
         stats_.get_misses.fetch_add(1, rlx);
         frame_get_miss(c);
         return true;
@@ -242,6 +317,10 @@ bool StreamLoop::begin_get(Conn* c, std::string_view key, const crypto::Digest& 
     if (!accept_get_snapshot(c, key, snap->meta)) {
         if (snap->pin.valid) tm_.unpin_head(snap->pin);
         c->http_meta.reset();
+        if (include_http_metadata_) {
+            c->get_key.assign(key.data(), key.size());
+            c->get_digest = digest;
+        }
         stats_.get_misses.fetch_add(1, rlx);
         frame_get_miss(c);
         return true;
@@ -277,7 +356,7 @@ bool StreamLoop::begin_get(Conn* c, std::string_view key, const crypto::Digest& 
     c->head_sent = 0;
     stats_.get_hits.fetch_add(1, rlx);
     // Eviction visited bits outside the snapshot critical section (scores already updated there).
-    if (record_access) tm_.touch_policies(digest, c->head_pin.valid);
+    if (record_access) tm_.touch_policies(digest, snap->meta.size, c->head_pin.valid);
     frame_get_hit(c, key, snap->meta); // protocol header + get_pos/get_size
 
     // The protocol hook has now resolved the requested byte range. Start the tail after whichever
@@ -658,7 +737,17 @@ void StreamLoop::retire(Conn* c) {
         unpin_if_held(c);  // release the head pin if a send was interrupted
         on_destroy(c);     // free any per-conn TLS state before the Conn goes away
         stats_.curr_conns.fetch_sub(1, rlx);
+        if (inbox_) inbox_->release_connection();
         conns_.erase(c);
+    }
+}
+
+void StreamLoop::reject_queued_connections() {
+    if (!inbox_) return;
+    auto pending = inbox_->take_connections();
+    for (const int fd : pending) {
+        ::close(fd);
+        inbox_->release_connection();
     }
 }
 

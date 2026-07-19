@@ -11,6 +11,7 @@
 #include "goblin/storage/eviction.hpp" // EvictionPolicy
 #include "goblin/storage/index.hpp"    // Digest, DigestHash
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -40,8 +41,13 @@ private:
     };
     struct Entry {
         Q q;
-        bool visited;
+        std::atomic<bool> visited;
         std::uint64_t ticket;
+
+        Entry(Q queue, bool was_visited, std::uint64_t identity) noexcept
+            : q(queue), visited(was_visited), ticket(identity) {}
+        Entry(const Entry&) = delete;
+        Entry& operator=(const Entry&) = delete;
     };
     std::optional<Digest> pop_front_resident(std::deque<QueueNode>& q, Q which);
     void ghost_push(const Digest&, std::uint64_t ticket);

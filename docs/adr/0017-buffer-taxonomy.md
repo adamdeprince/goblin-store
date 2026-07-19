@@ -32,8 +32,9 @@ and treating them the same is what makes the current GET allocate (and copy) a w
   every foreign NUMA node. `--small-memory` opts into a dedicated local packed-small-object budget,
   with `--small-sub-memory` optionally adding the same-sized role on each foreign node. The two
   resident pools do not borrow; without `--small-memory`, both classes retain the legacy shared
-  behavior. Small I/O pools are separately bounded by `--io-chunk × --io-buffers` per worker (plus
-  one write-staging pool). On Linux all fixed pools first attempt explicit HugeTLB backing at the
+  behavior. Read I/O pools are separately bounded by `--io-chunk × --io-buffers` per worker; the
+  shared write-staging pool is bounded by `--write-io-chunk × --io-buffers`. On Linux all fixed
+  pools first attempt explicit HugeTLB backing at the
   platform page order; `--block` is the common logical allocation unit and the fixed-head promotion
   unit, and may span multiple huge pages. Every resident budget is a whole `--block` multiple.
   Ordinary fallback memory is `mlock`'d unless `--no-mlock` is selected

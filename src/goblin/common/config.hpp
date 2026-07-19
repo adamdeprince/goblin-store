@@ -103,6 +103,7 @@ struct MemoryConfig {                  // ADR-0008
 
 enum class EvictionPolicyKind { sieve, s3fifo, tinylfu }; // selectable (ADR-0007)
 enum class NetMode { blocking, async, exasock };          // --net (ADR-0018)
+enum class MirrorClient { curl, uring };                   // --mirror-client upstream transport
 
 struct AccessScoreConfig {
     double decay = 0.5;     // once/minute multiplier; strictly between zero and one
@@ -160,10 +161,12 @@ struct ServerConfig {
     // Reverse-cache origin. Mirror mode has its own URI key derivation (including the query) and
     // therefore cannot share virtual-host key space. Empty means the ordinary object endpoint.
     std::optional<std::string> mirror_url; // --mirror URL; http[s]://host[/base/path]
+    MirrorClient  mirror_client = MirrorClient::curl;
 
-    // Streaming I/O buffers (ADR-0017) — separate from the head pool. io_buffers applies per worker
-    // to the read pool and (once) to the write-staging pool; each is io_chunk_bytes.
-    Size          io_chunk_bytes = 256 * KiB; // per-chunk streaming buffer size
+    // Streaming I/O buffers (ADR-0017) — separate from the head pool. Read and write quanta are
+    // deliberately independent: large mirror admission writes must not inflate warmed-tail reads.
+    Size          io_chunk_bytes = 256 * KiB; // cache-hit/read streaming chunk size
+    Size          write_io_chunk_bytes = 256 * KiB; // SET/mirror write-staging chunk size
     unsigned      io_buffers     = 64;         // streaming chunk buffers (read pool/worker; write staging)
     unsigned      io_timeout_ms  = 30000;      // drop a stalled in-flight transfer (slow client); 0 = off
     unsigned      ttl_reap_ms    = 1000;       // TTL reaper sweep period (ms); 0 = off (lazy-skip only)

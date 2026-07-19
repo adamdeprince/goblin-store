@@ -10,6 +10,7 @@
 #include "goblin/core/buffer_pool.hpp"
 #include "goblin/core/stats.hpp"
 #include "goblin/crypto/sha256.hpp"
+#include "goblin/net/connection_dispatcher.hpp"
 #include "goblin/net/stream_io.hpp"
 #include "goblin/storage/index.hpp"
 #include "goblin/storage/tier_manager.hpp"
@@ -35,7 +36,17 @@ public:
                core::IoBufferPool& iobufs, unsigned io_timeout_ms = 0,
                core::StatsRegistry* reg = nullptr, WriteMode write_mode = WriteMode::evict,
                bool include_http_metadata = false);
+    StreamLoop(core::Reactor& reactor, ConnectionInbox& inbox, storage::TierManager& tm,
+               storage::Index& index, core::IoBufferPool& iobufs,
+               unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr,
+               WriteMode write_mode = WriteMode::evict,
+               bool include_http_metadata = false);
     StreamLoop(StreamIo& stream_io, int listen_fd, storage::TierManager& tm,
+               storage::Index& index, core::IoBufferPool& iobufs,
+               unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr,
+               WriteMode write_mode = WriteMode::evict,
+               bool include_http_metadata = false);
+    StreamLoop(StreamIo& stream_io, ConnectionInbox& inbox, storage::TierManager& tm,
                storage::Index& index, core::IoBufferPool& iobufs,
                unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr,
                WriteMode write_mode = WriteMode::evict,
@@ -79,8 +90,8 @@ protected:
         std::string sni;          // TLS SNI, set after the handshake (empty = plaintext); HTTPS enforces Host==sni
 
         // GET streaming state:
-        std::string get_key;        // final (post-derivation) key, kept to re-open_snapshot when parked
-        crypto::Digest get_digest{}; // hashed key for park/retry (avoid re-SHA-256 on drain)
+        std::string get_key;        // final key, retained only for backpressure or async mirror fill
+        crypto::Digest get_digest{}; // hashed key for retry/fill resume (avoid a second SHA-256)
         std::optional<ByteRange> req_range; // requested sub-range (HTTP Range), resolved in frame_get_hit
         std::string inm;            // HTTP If-None-Match (conditional GET), used in frame_get_hit; empty=absent
         bool get_with_cas = false;  // memcache `gets`: emit the CAS in the VALUE header
@@ -198,9 +209,14 @@ protected:
 
 private:
     static constexpr std::uint64_t kAccept = 0; // user_data for the listener accept (no Conn)
+    static constexpr std::uint64_t kInbox = 6;  // eventfd readiness (no Conn; pointer tags use 1..5)
 
     void arm_accept();
+    void arm_inbox();
     void on_accept(int res);
+    void on_inbox(int res);
+    void adopt_connection(int fd);
+    void reject_queued_connections();
     void on_recv(Conn*, int res);
     void on_send(Conn*, int res);
     void on_read(Conn*, int res);
@@ -220,7 +236,8 @@ private:
     void release_lanes(Conn*); // release all held read buffers + reset lane state
     void retire(Conn*);
 
-    int lfd_;
+    int lfd_ = -1;
+    ConnectionInbox* inbox_ = nullptr;
     unsigned io_timeout_ms_; // drop a stalled in-flight transfer after this many ms (0 = off, ADR-0011)
     std::chrono::steady_clock::time_point last_sweep_{}; // last stall sweep, to bound sweep frequency
     std::atomic<bool> stop_{false};

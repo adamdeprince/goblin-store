@@ -4,6 +4,8 @@
 #include "goblin/crypto/sha256.hpp"
 #include "goblin/http/http_loop.hpp"
 #include "goblin/http/https_loop.hpp"
+#include "goblin/net/connection_dispatcher.hpp"
+#include "goblin/net/numa.hpp"
 #include "goblin/net/rdma_server.hpp"
 #include "goblin/net/stream_io.hpp"
 #include "goblin/protocol/memcache/event_loop.hpp"
@@ -21,6 +23,9 @@
 #include <print>
 #include <future>
 #include <fcntl.h>
+#include <latch>
+#include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
@@ -208,7 +213,7 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
                     break;
                 }
                 HeadPinGuard pin_guard(tm, snapshot->pin);
-                tm.touch_policies(digest, snapshot->pin.valid);
+                tm.touch_policies(digest, snapshot->meta.size, snapshot->pin.valid);
                 if (!send_all(fd, cmd->verb == Verb::gets
                                       ? value_header_cas(cmd->key, snapshot->meta.flags,
                                                          snapshot->meta.size, snapshot->meta.etag)
@@ -238,8 +243,8 @@ void handle_conn(int fd, storage::TierManager& tm, storage::Index& index, core::
     }
 }
 
-Result<int> make_listener(std::string_view address, std::uint16_t port, bool reuseport = false,
-                          bool exasock = false) {
+Result<int> make_listener(std::string_view address, std::uint16_t port, bool exasock = false,
+                          bool nonblocking = false) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return err(Errc::io_error, "socket");
     if (exasock) {
@@ -250,7 +255,6 @@ Result<int> make_listener(std::string_view address, std::uint16_t port, bool reu
     }
     int one = 1;
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    if (reuseport) ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one); // async per-core
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     if (::inet_pton(AF_INET, std::string(address).c_str(), &addr.sin_addr) != 1) {
@@ -262,25 +266,31 @@ Result<int> make_listener(std::string_view address, std::uint16_t port, bool reu
         ::close(fd);
         return err(Errc::io_error, "bind");
     }
-    if (::listen(fd, 128) < 0) {
+    if (::listen(fd, SOMAXCONN) < 0) {
         ::close(fd);
         return err(Errc::io_error, "listen");
     }
-    if (exasock) {
+    if (nonblocking) {
         const int flags = ::fcntl(fd, F_GETFL, 0);
         if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
             ::close(fd);
-            return err(Errc::io_error, "make ExaSock listener nonblocking");
+            return err(Errc::io_error, "make listener nonblocking");
         }
     }
     return fd;
 }
 
-// One worker per core (ADR-0001/0018): its own io_uring reactor + I/O-buffer pool, all accepting
-// from one shared listen socket so the kernel hands each new connection to a free worker (no
-// hash-collision starvation under the blocking one-connection-per-worker model). The index + tier
-// manager are shared and thread-safe. (SO_REUSEPORT per-core listeners return with the io_uring
-// multishot-accept async loop, where a worker multiplexes many connections.)
+using StartGate = std::shared_ptr<std::latch>;
+
+Status bind_protocol_worker(const ServerConfig& cfg, const net::ConnectionInbox& inbox) {
+    if (!cfg.numa_enabled || !cfg.numa_node || inbox.worker_cpu() < 0) return {};
+    const unsigned cpu = static_cast<unsigned>(inbox.worker_cpu());
+    return net::bind_numa_worker(*cfg.numa_node, std::span<const unsigned>(&cpu, 1));
+}
+
+// Blocking-mode workers retain the original shared listener. The async default instead uses the
+// application-owned dispatcher below; blocking accept cannot use that handoff without changing the
+// fallback's one-connection-at-a-time semantics.
 void worker_loop(int lfd, const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
                  const std::atomic<bool>& shutdown, unsigned id,
                  std::promise<Status> startup) {
@@ -322,12 +332,16 @@ void worker_loop(int lfd, const ServerConfig& cfg, storage::TierManager& tm, sto
     }
 }
 
-// Async worker (ADR-0002): its own io_uring ring + I/O pool + SO_REUSEPORT listener; the EventLoop
-// multiplexes many connections on the one ring (accept / recv+parse / GET stream / SET ingest / send).
+// Async worker (ADR-0002): its own io_uring ring + I/O pool. A NAPI-aware coordinator assigns a
+// connection once, after which this EventLoop owns recv/parse/stream/send for its whole lifetime.
 void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-                  core::StatsRegistry& reg, const std::atomic<bool>& shutdown, unsigned id,
+                  core::StatsRegistry& reg, const std::atomic<bool>& shutdown,
+                  net::ConnectionInbox& inbox, StartGate start_gate,
                   std::promise<Status> startup) {
-    (void)id;
+    if (auto bound = bind_protocol_worker(cfg, inbox); !bound) {
+        startup.set_value(std::unexpected(bound.error()));
+        return;
+    }
     auto reactor = core::Reactor::create();
     if (!reactor) {
         startup.set_value(std::unexpected(reactor.error()));
@@ -340,27 +354,26 @@ void async_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
         startup.set_value(std::unexpected(iobufs.error()));
         return;
     }
-    auto lfd = make_listener(cfg.listen_address, cfg.memcache_port, /*reuseport=*/true);
-    if (!lfd) {
-        startup.set_value(std::unexpected(lfd.error()));
-        return;
-    }
-    EventLoop loop(*reactor, *lfd, tm, index, *iobufs, cfg.io_timeout_ms, &reg,
+    EventLoop loop(*reactor, inbox, tm, index, *iobufs, cfg.io_timeout_ms, &reg,
                    cfg.memcache_write_mode);
     loop.set_read_ahead(cfg.read_ahead);
     loop.set_shutdown(&shutdown, cfg.shutdown_grace_ms);
     startup.set_value(Status{});
+    start_gate->wait();
     loop.run();
-    ::close(*lfd);
 }
 
 // ExaSock worker: socket operations go through standard nonblocking calls in the readiness adapter
 // so the preload library can accelerate them. Disk reads remain on this worker's io_uring reactor.
 void exasock_memcache_worker(const ServerConfig& cfg, storage::TierManager& tm,
                              storage::Index& index, core::StatsRegistry& reg,
-                             const std::atomic<bool>& shutdown, unsigned id,
+                             const std::atomic<bool>& shutdown,
+                             net::ConnectionInbox& inbox, StartGate start_gate,
                              std::promise<Status> startup) {
-    (void)id;
+    if (auto bound = bind_protocol_worker(cfg, inbox); !bound) {
+        startup.set_value(std::unexpected(bound.error()));
+        return;
+    }
     auto reactor = core::Reactor::create();
     if (!reactor) {
         startup.set_value(std::unexpected(reactor.error()));
@@ -379,27 +392,25 @@ void exasock_memcache_worker(const ServerConfig& cfg, storage::TierManager& tm,
         startup.set_value(std::unexpected(iobufs.error()));
         return;
     }
-    auto lfd = make_listener(cfg.listen_address, cfg.memcache_port, /*reuseport=*/true,
-                             /*exasock=*/true);
-    if (!lfd) {
-        startup.set_value(std::unexpected(lfd.error()));
-        return;
-    }
-    EventLoop loop(**stream_io, *lfd, tm, index, *iobufs, cfg.io_timeout_ms, &reg,
+    EventLoop loop(**stream_io, inbox, tm, index, *iobufs, cfg.io_timeout_ms, &reg,
                    cfg.memcache_write_mode);
     loop.set_read_ahead(cfg.read_ahead);
     loop.set_shutdown(&shutdown, cfg.shutdown_grace_ms);
     startup.set_value(Status{});
+    start_gate->wait();
     loop.run();
-    (*stream_io)->close_fd(*lfd);
 }
 
-// HTTP object server (ADR-0005/0015): its own io_uring ring + read pool + SO_REUSEPORT listener on
-// the HTTP port, so slow HTTP downloads draw from a separate buffer budget and can't starve memcache.
+// HTTP object server (ADR-0005/0015): its own io_uring ring + read pool. HTTP retains a separate
+// dispatcher and buffer budget so slow downloads cannot starve memcache.
 void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
-                 core::StatsRegistry& reg, const std::atomic<bool>& shutdown, unsigned id,
+                 core::StatsRegistry& reg, const std::atomic<bool>& shutdown,
+                 net::ConnectionInbox& inbox, StartGate start_gate,
                  http::MirrorService* mirror, std::promise<Status> startup) {
-    (void)id;
+    if (auto bound = bind_protocol_worker(cfg, inbox); !bound) {
+        startup.set_value(std::unexpected(bound.error()));
+        return;
+    }
     auto reactor = core::Reactor::create();
     if (!reactor) {
         startup.set_value(std::unexpected(reactor.error()));
@@ -410,11 +421,6 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
                                    cfg.memory.use_hugepages, cfg.memory.hugetlb_page_bytes);
     if (!iobufs) {
         startup.set_value(std::unexpected(iobufs.error()));
-        return;
-    }
-    auto lfd = make_listener(cfg.listen_address, cfg.http_port, /*reuseport=*/true);
-    if (!lfd) {
-        startup.set_value(std::unexpected(lfd.error()));
         return;
     }
     http::KeyOptions keyopt;
@@ -422,20 +428,24 @@ void http_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Ind
     keyopt.keep_query = cfg.key_on_query;
     keyopt.strip_leading_slash = cfg.key_strip_slash;
     keyopt.index_name = cfg.http_index; // HTTP-only directory index (memcache + --source unaffected)
-    http::HttpLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, cfg.io_timeout_ms, &reg,
+    http::HttpLoop loop(*reactor, inbox, tm, index, *iobufs, keyopt, cfg.io_timeout_ms, &reg,
                         mirror);
     loop.set_read_ahead(cfg.read_ahead);
     loop.set_shutdown(&shutdown, cfg.shutdown_grace_ms);
     startup.set_value(Status{});
+    start_gate->wait();
     loop.run();
-    ::close(*lfd);
 }
 
 void exasock_http_worker(const ServerConfig& cfg, storage::TierManager& tm,
                          storage::Index& index, core::StatsRegistry& reg,
-                         const std::atomic<bool>& shutdown, unsigned id,
+                         const std::atomic<bool>& shutdown,
+                         net::ConnectionInbox& inbox, StartGate start_gate,
                          http::MirrorService* mirror, std::promise<Status> startup) {
-    (void)id;
+    if (auto bound = bind_protocol_worker(cfg, inbox); !bound) {
+        startup.set_value(std::unexpected(bound.error()));
+        return;
+    }
     auto reactor = core::Reactor::create();
     if (!reactor) {
         startup.set_value(std::unexpected(reactor.error()));
@@ -452,12 +462,6 @@ void exasock_http_worker(const ServerConfig& cfg, storage::TierManager& tm,
                                    cfg.memory.use_hugepages, cfg.memory.hugetlb_page_bytes);
     if (!iobufs) {
         startup.set_value(std::unexpected(iobufs.error()));
-        return;
-    }
-    auto lfd = make_listener(cfg.listen_address, cfg.http_port, /*reuseport=*/true,
-                             /*exasock=*/true);
-    if (!lfd) {
-        startup.set_value(std::unexpected(lfd.error()));
         return;
     }
     http::KeyOptions keyopt;
@@ -465,23 +469,27 @@ void exasock_http_worker(const ServerConfig& cfg, storage::TierManager& tm,
     keyopt.keep_query = cfg.key_on_query;
     keyopt.strip_leading_slash = cfg.key_strip_slash;
     keyopt.index_name = cfg.http_index;
-    http::HttpLoop loop(**stream_io, *lfd, tm, index, *iobufs, keyopt, cfg.io_timeout_ms, &reg,
+    http::HttpLoop loop(**stream_io, inbox, tm, index, *iobufs, keyopt, cfg.io_timeout_ms, &reg,
                         mirror);
     loop.set_read_ahead(cfg.read_ahead);
     loop.set_shutdown(&shutdown, cfg.shutdown_grace_ms);
     startup.set_value(Status{});
+    start_gate->wait();
     loop.run();
-    (*stream_io)->close_fd(*lfd);
 }
 
 #if GOBLIN_HAVE_TLS
-// HTTPS object server: own ring + read pool + SO_REUSEPORT listener on the HTTPS port, sharing one
-// tls::Context (per-host certs, SNI selection) across all workers. The handshake runs on the loop;
+// HTTPS object server: own ring + read pool behind the HTTPS dispatcher, sharing one tls::Context
+// (per-host certs, SNI selection) across all workers. The handshake runs on the loop;
 // after it, kTLS makes the data path the ordinary HttpLoop flow (ADR-0005/0011).
 void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& index,
                   tls::Context& ctx, core::StatsRegistry& reg, const std::atomic<bool>& shutdown,
-                  unsigned id, http::MirrorService* mirror, std::promise<Status> startup) {
-    (void)id;
+                  net::ConnectionInbox& inbox, StartGate start_gate,
+                  http::MirrorService* mirror, std::promise<Status> startup) {
+    if (auto bound = bind_protocol_worker(cfg, inbox); !bound) {
+        startup.set_value(std::unexpected(bound.error()));
+        return;
+    }
     auto reactor = core::Reactor::create();
     if (!reactor) {
         startup.set_value(std::unexpected(reactor.error()));
@@ -494,23 +502,18 @@ void https_worker(const ServerConfig& cfg, storage::TierManager& tm, storage::In
         startup.set_value(std::unexpected(iobufs.error()));
         return;
     }
-    auto lfd = make_listener(cfg.listen_address, cfg.https_port, /*reuseport=*/true);
-    if (!lfd) {
-        startup.set_value(std::unexpected(lfd.error()));
-        return;
-    }
     http::KeyOptions keyopt;
     keyopt.mode = cfg.http_vhost ? http::KeyMode::vhost : http::KeyMode::path;
     keyopt.keep_query = cfg.key_on_query;
     keyopt.strip_leading_slash = cfg.key_strip_slash;
     keyopt.index_name = cfg.http_index; // HTTP-only directory index (memcache + --source unaffected)
-    http::HttpsLoop loop(*reactor, *lfd, tm, index, *iobufs, keyopt, ctx, cfg.io_timeout_ms, &reg,
+    http::HttpsLoop loop(*reactor, inbox, tm, index, *iobufs, keyopt, ctx, cfg.io_timeout_ms, &reg,
                          mirror);
     loop.set_read_ahead(cfg.read_ahead);
     loop.set_shutdown(&shutdown, cfg.shutdown_grace_ms);
     startup.set_value(Status{});
+    start_gate->wait();
     loop.run();
-    ::close(*lfd);
 }
 #endif
 
@@ -525,11 +528,22 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
     if (n == 0) n = 1;
     std::unique_ptr<http::MirrorService> mirror;
     if (cfg.mirror_url) {
-        auto created = http::MirrorService::create(*cfg.mirror_url, tm, index, &shutdown, n);
+        auto created = http::MirrorService::create(*cfg.mirror_url, tm, index, &shutdown, n,
+                                                   cfg.mirror_client);
         if (!created) return std::unexpected(created.error());
         mirror = std::move(*created);
     }
     http::MirrorService* const mirror_service = mirror.get();
+    std::vector<int> protocol_worker_cpus(n, -1);
+    if (cfg.numa_enabled && cfg.numa_node && !cfg.numa_cpus.empty())
+        for (unsigned worker = 0; worker < n; ++worker)
+            protocol_worker_cpus[worker] =
+                static_cast<int>(cfg.numa_cpus[worker % cfg.numa_cpus.size()]);
+
+    std::unique_ptr<net::ConnectionDispatcher> memcache_dispatcher;
+    std::unique_ptr<net::ConnectionDispatcher> http_dispatcher;
+    std::unique_ptr<net::ConnectionDispatcher> https_dispatcher;
+    std::vector<std::thread> acceptors;
     std::vector<std::thread> workers;
     int blocking_lfd = -1; // shared listener for blocking-mode memcache; closed after join
     // One registry shared by every async loop (memcache + HTTP + HTTPS). Each loop registers its own
@@ -538,6 +552,11 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
     std::optional<Error> rdma_runtime_failure;
 
     auto join_workers = [&] {
+        // Once shutdown is visible, stop every producer before a worker drains its inbox. This
+        // makes the final queue drain stable: no accepted fd can arrive behind a departing loop.
+        for (auto& acceptor : acceptors) {
+            if (acceptor.joinable()) acceptor.join();
+        }
         for (auto& worker : workers) {
             if (worker.joinable()) worker.join();
         }
@@ -545,6 +564,9 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
             ::close(blocking_lfd);
             blocking_lfd = -1;
         }
+        if (memcache_dispatcher) memcache_dispatcher->report();
+        if (http_dispatcher) http_dispatcher->report();
+        if (https_dispatcher) https_dispatcher->report();
     };
     auto abort_startup = [&](std::string_view endpoint, Error error) -> Status {
         shutdown.store(true, std::memory_order_relaxed);
@@ -563,6 +585,14 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
         return err(Errc::unsupported,
                    "--net exasock requested, but this build has no ExaSock support");
 
+    auto create_dispatcher = [&](std::string label, std::uint16_t port,
+                                 bool exasock) -> Result<std::unique_ptr<net::ConnectionDispatcher>> {
+        auto listener = make_listener(cfg.listen_address, port, exasock, /*nonblocking=*/true);
+        if (!listener) return std::unexpected(listener.error());
+        return net::ConnectionDispatcher::create(*listener, protocol_worker_cpus,
+                                                 std::move(label), exasock);
+    };
+
     // Complete every fallible setup that can run on the coordinator before launching a thread.
     // In particular, an RDMA listener must never be left live when a later TCP bind or TLS-context
     // construction fails.
@@ -570,6 +600,30 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
         auto listener = make_listener(cfg.listen_address, cfg.memcache_port);
         if (!listener) return std::unexpected(listener.error());
         blocking_lfd = *listener;
+    } else if (cfg.enable_memcache) {
+        auto dispatcher = create_dispatcher(
+            cfg.net == NetMode::exasock ? "ExaSock memcache" : "memcache",
+            cfg.memcache_port, cfg.net == NetMode::exasock);
+        if (!dispatcher) return std::unexpected(dispatcher.error());
+        memcache_dispatcher = std::move(*dispatcher);
+    }
+    if (cfg.enable_http) {
+        auto dispatcher = create_dispatcher(
+            cfg.net == NetMode::exasock ? "ExaSock HTTP" : "HTTP", cfg.http_port,
+            cfg.net == NetMode::exasock);
+        if (!dispatcher) {
+            if (blocking_lfd >= 0) ::close(blocking_lfd);
+            return std::unexpected(dispatcher.error());
+        }
+        http_dispatcher = std::move(*dispatcher);
+    }
+    if (cfg.enable_https) {
+        auto dispatcher = create_dispatcher("HTTPS", cfg.https_port, /*exasock=*/false);
+        if (!dispatcher) {
+            if (blocking_lfd >= 0) ::close(blocking_lfd);
+            return std::unexpected(dispatcher.error());
+        }
+        https_dispatcher = std::move(*dispatcher);
     }
 
 #if GOBLIN_HAVE_TLS
@@ -619,19 +673,40 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
 
     // memcache: async io_uring loops, or the blocking thread-per-core fallback (--net blocking).
     if (cfg.enable_memcache) {
-        if (cfg.net == NetMode::async) {
+        if (cfg.net != NetMode::blocking) {
+            auto start_gate = std::make_shared<std::latch>(1);
             for (unsigned i = 0; i < n; ++i) {
                 std::promise<Status> startup;
                 auto ready = startup.get_future();
-                workers.emplace_back([&cfg, &tm, &index, &stats_reg, &shutdown, i,
-                                      startup = std::move(startup)]() mutable {
-                    async_worker(cfg, tm, index, stats_reg, shutdown, i, std::move(startup));
-                });
+                auto* const inbox = &memcache_dispatcher->inbox(i);
+                if (cfg.net == NetMode::async)
+                    workers.emplace_back(
+                        [&cfg, &tm, &index, &stats_reg, &shutdown, inbox, start_gate,
+                         startup = std::move(startup)]() mutable {
+                            async_worker(cfg, tm, index, stats_reg, shutdown, *inbox, start_gate,
+                                         std::move(startup));
+                        });
+                else
+                    workers.emplace_back(
+                        [&cfg, &tm, &index, &stats_reg, &shutdown, inbox, start_gate,
+                         startup = std::move(startup)]() mutable {
+                            exasock_memcache_worker(cfg, tm, index, stats_reg, shutdown, *inbox,
+                                                    start_gate, std::move(startup));
+                        });
                 Status opened = ready.get();
-                if (!opened)
-                    return abort_startup("memcache worker " + std::to_string(i),
-                                         opened.error());
+                if (!opened) {
+                    start_gate->count_down();
+                    return abort_startup(
+                        (cfg.net == NetMode::exasock ? "ExaSock memcache worker "
+                                                    : "memcache worker ") +
+                            std::to_string(i),
+                        opened.error());
+                }
             }
+            start_gate->count_down();
+            acceptors.emplace_back([&shutdown, dispatcher = memcache_dispatcher.get()] {
+                dispatcher->run(shutdown);
+            });
         } else if (cfg.net == NetMode::blocking) {
             for (unsigned i = 0; i < n; ++i) {
                 std::promise<Status> startup;
@@ -645,66 +720,71 @@ Status serve(const ServerConfig& cfg, storage::TierManager& tm, storage::Index& 
                     return abort_startup("blocking memcache worker " + std::to_string(i),
                                          opened.error());
             }
-        } else {
-            for (unsigned i = 0; i < n; ++i) {
-                std::promise<Status> startup;
-                auto ready = startup.get_future();
-                workers.emplace_back([&cfg, &tm, &index, &stats_reg, &shutdown, i,
-                                      startup = std::move(startup)]() mutable {
-                    exasock_memcache_worker(cfg, tm, index, stats_reg, shutdown, i,
-                                            std::move(startup));
-                });
-                Status opened = ready.get();
-                if (!opened)
-                    return abort_startup("ExaSock memcache worker " + std::to_string(i),
-                                         opened.error());
-            }
         }
     }
     // HTTP uses the selected ExaSock readiness loop when requested; otherwise it retains its
     // io_uring loop. The historical --net blocking selector remains memcache-only.
     if (cfg.enable_http) {
+        auto start_gate = std::make_shared<std::latch>(1);
         for (unsigned i = 0; i < n; ++i) {
             std::promise<Status> startup;
             auto ready = startup.get_future();
+            auto* const inbox = &http_dispatcher->inbox(i);
             if (cfg.net == NetMode::exasock)
-                workers.emplace_back([&cfg, &tm, &index, &stats_reg, &shutdown, i, mirror_service,
-                                      startup = std::move(startup)]() mutable {
-                    exasock_http_worker(cfg, tm, index, stats_reg, shutdown, i, mirror_service,
-                                        std::move(startup));
-                });
+                workers.emplace_back(
+                    [&cfg, &tm, &index, &stats_reg, &shutdown, inbox, start_gate, mirror_service,
+                     startup = std::move(startup)]() mutable {
+                        exasock_http_worker(cfg, tm, index, stats_reg, shutdown, *inbox,
+                                            start_gate, mirror_service, std::move(startup));
+                    });
             else
-                workers.emplace_back([&cfg, &tm, &index, &stats_reg, &shutdown, i, mirror_service,
-                                      startup = std::move(startup)]() mutable {
-                    http_worker(cfg, tm, index, stats_reg, shutdown, i, mirror_service,
-                                std::move(startup));
-                });
+                workers.emplace_back(
+                    [&cfg, &tm, &index, &stats_reg, &shutdown, inbox, start_gate, mirror_service,
+                     startup = std::move(startup)]() mutable {
+                        http_worker(cfg, tm, index, stats_reg, shutdown, *inbox, start_gate,
+                                    mirror_service, std::move(startup));
+                    });
             Status opened = ready.get();
-            if (!opened)
+            if (!opened) {
+                start_gate->count_down();
                 return abort_startup(cfg.net == NetMode::exasock
                                          ? "ExaSock HTTP worker " + std::to_string(i)
                                          : "HTTP worker " + std::to_string(i),
                                      opened.error());
+            }
         }
+        start_gate->count_down();
+        acceptors.emplace_back([&shutdown, dispatcher = http_dispatcher.get()] {
+            dispatcher->run(shutdown);
+        });
     }
 
-    // HTTPS: the shared context was built before any listener thread; now start each endpoint and
-    // wait for its own ring, buffer pool, and SO_REUSEPORT listener to be ready.
+    // HTTPS: the shared context was built before any listener thread; now start every ring and
+    // release them together before the dispatcher begins consuming the shared accept queue.
 #if GOBLIN_HAVE_TLS
     if (cfg.enable_https) {
         tls::Context& ctx = *https_ctx;
+        auto start_gate = std::make_shared<std::latch>(1);
         for (unsigned i = 0; i < n; ++i) {
             std::promise<Status> startup;
             auto ready = startup.get_future();
-            workers.emplace_back([&cfg, &tm, &index, &ctx, &stats_reg, &shutdown, i, mirror_service,
-                                  startup = std::move(startup)]() mutable {
-                https_worker(cfg, tm, index, ctx, stats_reg, shutdown, i, mirror_service,
-                             std::move(startup));
-            });
+            auto* const inbox = &https_dispatcher->inbox(i);
+            workers.emplace_back(
+                [&cfg, &tm, &index, &ctx, &stats_reg, &shutdown, inbox, start_gate,
+                 mirror_service, startup = std::move(startup)]() mutable {
+                    https_worker(cfg, tm, index, ctx, stats_reg, shutdown, *inbox, start_gate,
+                                 mirror_service, std::move(startup));
+                });
             Status opened = ready.get();
-            if (!opened)
+            if (!opened) {
+                start_gate->count_down();
                 return abort_startup("HTTPS worker " + std::to_string(i), opened.error());
+            }
         }
+        start_gate->count_down();
+        acceptors.emplace_back([&shutdown, dispatcher = https_dispatcher.get()] {
+            dispatcher->run(shutdown);
+        });
     }
 #endif
 

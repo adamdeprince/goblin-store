@@ -423,8 +423,8 @@ python3 "$MANIFEST_SCRIPT" "$DATASET" "$MANIFEST" | tee "$RUN_DIR/manifest-summa
 remote mkdir -p "$CLIENT_RUN_DIR"
 scp -q "$MANIFEST" "$CLIENT_HOST:$CLIENT_RUN_DIR/manifest.tsv"
 scp -q "$CLIENT_SOURCE" "$CLIENT_HOST:$CLIENT_RUN_DIR/mirror_proxy_benchmark.cpp"
-remote /usr/bin/g++ -O3 -std=c++20 -pthread -Wall -Wextra -Werror \
-    "$CLIENT_RUN_DIR/mirror_proxy_benchmark.cpp" -o "$CLIENT_BIN"
+remote /usr/bin/g++ -O3 -std=c++20 -Wall -Wextra -Werror \
+    "$CLIENT_RUN_DIR/mirror_proxy_benchmark.cpp" -luring -o "$CLIENT_BIN"
 
 {
     printf 'run_id=%s\nstarted_utc=%s\n' "$RUN_ID" "$(date -u +%FT%TZ)"

@@ -267,7 +267,7 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
                                       const EvictionConfig& ev, const PoolConfig& ssd,
                                       const PoolConfig& hdd, Index& index, Size io_chunk,
                                       unsigned write_buffers, bool direct_io,
-                                      AccessScoreConfig access_score) {
+                                      AccessScoreConfig access_score, Size write_io_chunk) {
     auto make_ram = [&]() -> Result<core::BufferPool> {
         if (!mem.split_pools() && mem.numa_regions.empty())
             return core::BufferPool::create(mem.total_bytes, mem.block_bytes, kDeviceBlock,
@@ -356,7 +356,8 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
         if (!h) return std::unexpected(h.error());
         hp.emplace(std::move(*h));
     }
-    auto wp = core::IoBufferPool::create(io_chunk, write_buffers, mem.lock_memory,
+    if (write_io_chunk == 0) write_io_chunk = io_chunk;
+    auto wp = core::IoBufferPool::create(write_io_chunk, write_buffers, mem.lock_memory,
                                          mem.use_hugepages, mem.hugetlb_page_bytes);
     if (!wp) return std::unexpected(wp.error());
     TierManager tm(t, std::move(*ram), std::move(head_policy), std::move(small_policy),
@@ -762,12 +763,15 @@ Status TierManager::StoreHandle::write(ByteView chunk) {
     return {};
 }
 
-Status TierManager::StoreHandle::flush_available() {
+Status TierManager::StoreHandle::flush_available(Size min_complete) {
     if (committed_ || !tm_)
         return err(Errc::invalid_argument, "flush on a completed store handle");
     if (layout_.ssd_bytes == 0 && layout_.hdd_bytes == 0) return {};
+    if (min_complete == 0) min_complete = kDeviceBlock;
+    // Round the caller's quantum up to a device block so O_DIRECT never sees a partial write.
+    const Size threshold = align_up(min_complete, kDeviceBlock);
     const Size complete = stage_fill_ - (stage_fill_ % kDeviceBlock);
-    if (complete == 0) return {};
+    if (complete < threshold) return {};
     const Size tail = stage_fill_ - complete;
     if (auto status = flush_block(complete); !status) return status;
     if (tail > 0) std::memmove(stage_.data(), stage_.data() + complete, tail);
@@ -1387,14 +1391,13 @@ void TierManager::touch(const Digest& digest) {
     if (meta) record_access_locked(digest, *meta);
 }
 
-void TierManager::touch_policies(const Digest& digest, bool head_resident) {
-    std::unique_lock<std::shared_mutex> lk(*mu_); // S3-FIFO's visited bit is not atomic
+void TierManager::touch_policies(const Digest& digest, Size object_size, bool head_resident) {
+    // Membership changes take mu_ exclusively. Hits only atomically set S3-FIFO visited bits, so
+    // readers share this lock instead of serializing every successful GET.
+    std::shared_lock<std::shared_mutex> lk(*mu_);
     object_policy_->touch(digest);
     touch_capacity_policies_locked(digest);
-    if (head_resident) {
-        const auto meta = index_->lookup(digest);
-        if (meta) resident_policy(meta->size).touch(digest);
-    }
+    if (head_resident) resident_policy(object_size).touch(digest);
 }
 
 std::optional<double> TierManager::access_score(const Digest& digest) const {

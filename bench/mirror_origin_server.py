@@ -3,7 +3,8 @@
 
 This deliberately remains a small Python HTTP origin.  Every accepted request is appended to a
 local access log so the controller can prove that a warmed benchmark generated no origin traffic.
-Only top-level ``*.gz`` objects are exposed.
+Only top-level files are exposed. By default they must end in ``.gz``; ``--allow-any-file`` is
+available for corpora whose object names have no extension.
 """
 
 from __future__ import annotations
@@ -22,14 +23,22 @@ class CorpusHandler(http.server.SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "GoblinMirrorOrigin/1"
 
-    def __init__(self, *args: object, directory: str, access_log: Path, **kwargs: object) -> None:
+    def __init__(
+        self,
+        *args: object,
+        directory: str,
+        access_log: Path,
+        allow_any_file: bool,
+        **kwargs: object,
+    ) -> None:
         self._access_log = access_log
+        self._allow_any_file = allow_any_file
         super().__init__(*args, directory=directory, **kwargs)
 
     def _allowed(self) -> bool:
         path = unquote(urlsplit(self.path).path)
         name = path.removeprefix("/")
-        return bool(name) and "/" not in name and name.endswith(".gz")
+        return bool(name) and "/" not in name and (self._allow_any_file or name.endswith(".gz"))
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if not self._allowed():
@@ -70,7 +79,9 @@ class OriginServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 128
 
-    def __init__(self, address: tuple[str, int], directory: Path, access_log: Path) -> None:
+    def __init__(
+        self, address: tuple[str, int], directory: Path, access_log: Path, allow_any_file: bool
+    ) -> None:
         self.log_lock = threading.Lock()
         access_log.parent.mkdir(parents=True, exist_ok=True)
         self.log_stream = access_log.open("a", encoding="utf-8", buffering=1)
@@ -80,6 +91,7 @@ class OriginServer(http.server.ThreadingHTTPServer):
                 *args,
                 directory=os.fspath(directory),
                 access_log=access_log,
+                allow_any_file=allow_any_file,
                 **kwargs,
             )
 
@@ -98,6 +110,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--access-log", required=True, type=Path)
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18000)
+    parser.add_argument(
+        "--allow-any-file",
+        action="store_true",
+        help="serve any top-level regular file instead of requiring a .gz suffix",
+    )
     return parser.parse_args()
 
 
@@ -106,10 +123,16 @@ def main() -> int:
     directory = args.directory.resolve()
     if not directory.is_dir():
         raise SystemExit(f"not a directory: {directory}")
-    objects = list(directory.glob("*.gz"))
+    objects = [
+        path
+        for path in directory.iterdir()
+        if path.is_file() and (args.allow_any_file or path.name.endswith(".gz"))
+    ]
     if not objects:
         raise SystemExit(f"no *.gz objects in {directory}")
-    server = OriginServer((args.bind, args.port), directory, args.access_log)
+    server = OriginServer(
+        (args.bind, args.port), directory, args.access_log, args.allow_any_file
+    )
     print(
         f"origin listening on {args.bind}:{args.port}; "
         f"directory={directory}; objects={len(objects)}",

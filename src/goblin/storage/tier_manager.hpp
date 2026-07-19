@@ -99,7 +99,8 @@ public:
                                     const PoolConfig& ssd, const PoolConfig& hdd, Index& index,
                                     Size io_chunk = 256 * KiB, unsigned write_buffers = 8,
                                     bool direct_io = false,
-                                    AccessScoreConfig access_score = {});
+                                    AccessScoreConfig access_score = {},
+                                    Size write_io_chunk = 0);
     bool three_layer() const noexcept { return hdd_.has_value(); }
 
     // Streaming write (ADR-0016/0017): open files + reserve the RAM head once, append chunks with
@@ -115,11 +116,11 @@ public:
         ~StoreHandle();
 
         Status write(ByteView chunk);       // append the next bytes (sequential, from offset 0)
-        // Persist every complete device block currently staged, retaining only the unavoidable
-        // sub-block tail. Mirror mode calls this at each network rendezvous so the client and disk
-        // cannot build up a full io_chunk of skew. Ordinary SETs keep the throughput-oriented
-        // full-staging-buffer policy in write().
-        Status flush_available();
+        // Persist complete device blocks currently staged once at least `min_complete` bytes are
+        // ready, retaining only the unavoidable sub-block tail. Prefer full-stage flushes via
+        // write() on high-BDP mirror fills (fast Ethernet / IPoIB); this progressive path is
+        // optional for callers that want intermediate durability of staged bytes before commit.
+        Status flush_available(Size min_complete = kDeviceBlock);
         // publish to the index + cache the head. expiry is an absolute Unix time (0 = never, ADR-0007).
         // cas_expected != 0 -> compare-and-swap: publish only if the live object's etag matches, else
         // return Errc::cas_mismatch (checked under the publish lock; the scratch files just abort).
@@ -167,7 +168,7 @@ public:
     void touch(const Digest&);          // record one logical read: eviction touch + score increment
     // Eviction-policy visited bits only (no score). Used after open_snapshot which already did the
     // atomic score update under its lock — avoids a double score bump.
-    void touch_policies(const Digest&, bool head_resident);
+    void touch_policies(const Digest&, Size object_size, bool head_resident);
     std::size_t head_resident() const;  // # heads currently cached in RAM (stats/tests)
     std::optional<double> access_score(const Digest&) const; // unified score regardless of owner
 

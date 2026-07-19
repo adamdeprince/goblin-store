@@ -231,7 +231,7 @@ bool RdmaSession::process_input() {
                 queue(kEnd);
                 continue;
             }
-            tm_.touch_policies(digest, snapshot_->pin.valid);
+            tm_.touch_policies(digest, snapshot_->meta.size, snapshot_->pin.valid);
             stats_.get_hits.fetch_add(1, rlx);
             if (verb == Verb::gets)
                 queue(value_header_cas(key, snapshot_->meta.flags, snapshot_->meta.size,

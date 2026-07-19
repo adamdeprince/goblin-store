@@ -1,25 +1,34 @@
 // Fixed-seed TCP/HTTP benchmark for Goblin Store --mirror versus Vinyl Cache.
 //
-// Every worker owns one persistent TCP connection. Per-request results remain in RAM until the
-// complete case finishes, then are written atomically as CSV. The measured interval begins just
-// before the HTTP request bytes are sent and ends when the final response-body byte is received.
+// One or more io_uring event loops multiplex the requested number of persistent TCP connections.
+// Each connection keeps exactly one request in flight, preserving the benchmark's closed-loop
+// HTTP/1.1 semantics without dedicating a thread to every socket. Idle connections claim work from
+// one cache-line-isolated queue, so neither an event loop nor a connection can retain a private
+// long tail. Per-request results remain in RAM until the complete case finishes, then are written
+// atomically as CSV. The measured interval begins just before the HTTP request bytes are sent and
+// ends when the final response-body byte is received.
 // Build on the client host:
-//   g++ -O3 -std=c++20 -pthread -Wall -Wextra -Werror mirror_proxy_benchmark.cpp -o mirror-proxy-benchmark
+//   g++ -O3 -std=c++20 -pthread -Wall -Wextra -Werror mirror_proxy_benchmark.cpp -luring -o mirror-proxy-benchmark
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <unistd.h>
+
+#include <liburing.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <charconv>
-#include <chrono>
 #include <cctype>
 #include <cerrno>
-#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -27,7 +36,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
-#include <mutex>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -45,11 +54,13 @@ struct Args {
     std::filesystem::path output;
     std::uint16_t port = 8080;
     unsigned concurrency = 1;
+    unsigned threads = 1;
     unsigned passes = 1;
     unsigned timeout_seconds = 300;
     std::uint64_t seed = 0x243f6a8885a308d3ULL;
     std::uint64_t max_requests = 0;
     bool head_only = false;
+    bool manifest_order = false;
 };
 
 struct Object {
@@ -107,10 +118,12 @@ std::uint64_t realtime_ns() { return clock_ns(CLOCK_REALTIME); }
         << "  --source IPV4       bind the client side to the IPoIB address\n"
         << "  --port N            proxy HTTP port [8080]\n"
         << "  --concurrency N     persistent connections [1]\n"
+        << "  --threads N         independent io_uring event loops [1]\n"
         << "  --passes N          independently shuffled passes through the manifest [1]\n"
         << "  --seed N            fixed PRNG seed, decimal or 0x-prefixed\n"
-        << "  --timeout N         socket send/receive timeout in seconds [300]\n"
+        << "  --timeout N         in-flight io_uring operation timeout in seconds [300]\n"
         << "  --max-requests N    truncate the generated request sequence (smoke/probe)\n"
+        << "  --manifest-order    replay manifest rows exactly; do not shuffle\n"
         << "  --head               issue HEAD requests (cache-hit probe)\n";
     std::exit(error.empty() ? 0 : 2);
 }
@@ -148,6 +161,10 @@ Args parse_args(int argc, char** argv) {
             const auto value = parse_u64(next(), "concurrency");
             if (value == 0 || value > 1024) usage(argv[0], "concurrency is out of range");
             args.concurrency = static_cast<unsigned>(value);
+        } else if (option == "--threads") {
+            const auto value = parse_u64(next(), "threads");
+            if (value == 0 || value > 1024) usage(argv[0], "threads is out of range");
+            args.threads = static_cast<unsigned>(value);
         } else if (option == "--passes") {
             const auto value = parse_u64(next(), "passes");
             if (value == 0 || value > 1000) usage(argv[0], "passes is out of range");
@@ -159,6 +176,7 @@ Args parse_args(int argc, char** argv) {
         } else if (option == "--seed") args.seed = parse_u64(next(), "seed");
         else if (option == "--max-requests")
             args.max_requests = parse_u64(next(), "max-requests");
+        else if (option == "--manifest-order") args.manifest_order = true;
         else if (option == "--head") args.head_only = true;
         else if (option == "--help" || option == "-h") usage(argv[0]);
         else usage(argv[0], std::string("unknown option ") + std::string(option));
@@ -195,7 +213,7 @@ std::vector<Object> load_manifest(const std::filesystem::path& path) {
 }
 
 std::vector<Task> make_tasks(std::size_t objects, unsigned passes, std::uint64_t seed,
-                             std::uint64_t maximum) {
+                             std::uint64_t maximum, bool manifest_order) {
     std::mt19937_64 random(seed);
     std::vector<Task> tasks;
     if (objects > std::numeric_limits<std::size_t>::max() / passes)
@@ -204,7 +222,7 @@ std::vector<Task> make_tasks(std::size_t objects, unsigned passes, std::uint64_t
     std::vector<std::size_t> order(objects);
     for (unsigned repetition = 0; repetition < passes; ++repetition) {
         std::iota(order.begin(), order.end(), 0);
-        std::shuffle(order.begin(), order.end(), random);
+        if (!manifest_order) std::shuffle(order.begin(), order.end(), random);
         for (const auto object : order)
             tasks.push_back({static_cast<std::uint64_t>(tasks.size()), repetition, object});
     }
@@ -291,161 +309,334 @@ std::optional<ResponseHead> parse_response_head(std::string_view head, std::stri
     return parsed;
 }
 
-class Connection {
+constexpr std::size_t cache_line_bytes = 64;
+
+template <typename T>
+struct alignas(cache_line_bytes) CacheLineAtomic {
+    std::atomic<T> value{0};
+};
+
+static_assert(sizeof(CacheLineAtomic<std::uint64_t>) == cache_line_bytes);
+static_assert(sizeof(CacheLineAtomic<unsigned>) == cache_line_bytes);
+
+struct Counters {
+    CacheLineAtomic<std::uint64_t> completed;
+    CacheLineAtomic<std::uint64_t> successful_bytes;
+    CacheLineAtomic<unsigned> failures;
+};
+
+static_assert(alignof(Counters) == cache_line_bytes);
+static_assert(sizeof(Counters) == 3 * cache_line_bytes);
+
+std::vector<unsigned> allowed_cpus() {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (::sched_getaffinity(0, sizeof(set), &set) != 0)
+        throw std::runtime_error(errno_message("sched_getaffinity"));
+    std::vector<unsigned> cpus;
+    for (unsigned cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+        if (CPU_ISSET(cpu, &set)) cpus.push_back(cpu);
+    if (cpus.empty()) throw std::runtime_error("process CPU affinity mask is empty");
+    return cpus;
+}
+
+void pin_current_thread(unsigned cpu) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    const int result = ::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set);
+    if (result != 0)
+        throw std::runtime_error("pthread_setaffinity_np: " +
+                                 std::string(std::strerror(result)));
+}
+
+enum class Operation { none, connect, send, receive };
+
+struct alignas(cache_line_bytes) TaskQueue {
+    std::atomic<std::size_t> next{0};
+
+    std::optional<std::size_t> take(std::size_t task_count) noexcept {
+        const auto index = next.fetch_add(1, std::memory_order_relaxed);
+        if (index >= task_count) return std::nullopt;
+        return index;
+    }
+};
+
+static_assert(sizeof(TaskQueue) == cache_line_bytes);
+
+struct ConnectionState {
+    explicit ConnectionState(unsigned lane_number) : lane(lane_number), body_buffer(1U << 20) {
+        head.reserve(4096);
+    }
+
+    unsigned lane = 0;
+    unsigned connection_id = 0;
+    int fd = -1;
+    Operation operation = Operation::none;
+    std::uint64_t operation_started_ns = 0;
+    std::uint64_t connect_started_ns = 0;
+    std::size_t task_index = 0;
+    bool has_task = false;
+    bool headers_complete = false;
+    bool close_after_response = false;
+    std::size_t sent_bytes = 0;
+    std::string request;
+    std::string head;
+    std::array<char, 64 * 1024> header_buffer{};
+    std::vector<char> body_buffer;
+};
+
+class UringClient {
 public:
-    explicit Connection(const Args& args) : args_(args), body_buffer_(1U << 20) {}
-    ~Connection() { close(); }
-    Connection(const Connection&) = delete;
-    Connection& operator=(const Connection&) = delete;
+    UringClient(const Args& args, const std::vector<Object>& objects,
+                const std::vector<Task>& tasks, std::vector<Record>& records, Counters& counters,
+                const std::vector<std::unique_ptr<Counters>>& all_counters,
+                std::atomic<bool>& cancelled, TaskQueue& task_queue, unsigned lane_base,
+                bool report_progress)
+        : args_(args), objects_(objects), tasks_(tasks), records_(records), counters_(counters),
+          all_counters_(all_counters), cancelled_(cancelled), task_queue_(task_queue),
+          lane_base_(lane_base),
+          report_progress_(report_progress) {
+        destination_.sin_family = AF_INET;
+        destination_.sin_port = htons(args_.port);
+        if (::inet_pton(AF_INET, args_.host.c_str(), &destination_.sin_addr) != 1)
+            throw std::runtime_error("invalid --host IPv4 address");
 
-    bool connected() const noexcept { return fd_ >= 0; }
+        if (!args_.source.empty()) {
+            source_.emplace();
+            source_->sin_family = AF_INET;
+            source_->sin_port = 0;
+            if (::inet_pton(AF_INET, args_.source.c_str(), &source_->sin_addr) != 1)
+                throw std::runtime_error("invalid --source IPv4 address");
+        }
 
-    bool connect(std::uint64_t& elapsed, std::string& error) {
-        close();
-        const auto start = monotonic_ns();
-        fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (fd_ < 0) {
-            error = errno_message("socket");
+        const auto lanes = std::min<std::size_t>(args_.concurrency, tasks_.size());
+        states_.reserve(lanes);
+        for (std::size_t lane = 0; lane < lanes; ++lane) {
+            const auto global_lane = lane_base_ + static_cast<unsigned>(lane);
+            states_.emplace_back(global_lane);
+        }
+
+        const unsigned entries = static_cast<unsigned>(std::max<std::size_t>(256, lanes * 2 + 8));
+        const int result = ::io_uring_queue_init(entries, &ring_, 0);
+        if (result < 0)
+            throw std::runtime_error("io_uring_queue_init: " +
+                                     std::string(std::strerror(-result)));
+        ring_ready_ = true;
+    }
+
+    ~UringClient() {
+        if (ring_ready_) ::io_uring_queue_exit(&ring_);
+        for (auto& state : states_) close_socket(state);
+    }
+
+    UringClient(const UringClient&) = delete;
+    UringClient& operator=(const UringClient&) = delete;
+
+    void run(std::uint64_t case_start_ns) {
+        for (auto& state : states_) assign_task(state);
+        start_progress_timer();
+
+        std::uint64_t previous_completed = 0;
+        while (!cancelled_.load(std::memory_order_acquire) && has_active_tasks()) {
+            const int result = ::io_uring_submit_and_wait(&ring_, 1);
+            if (result < 0 && result != -EINTR)
+                throw std::runtime_error("io_uring_submit_and_wait: " +
+                                         std::string(std::strerror(-result)));
+            if (result == -EINTR) continue;
+
+            bool progress_timer_fired = false;
+            io_uring_cqe* completion = nullptr;
+            while (::io_uring_peek_cqe(&ring_, &completion) == 0) {
+                if (completion->user_data == 0) {
+                    if (completion->res != -ETIME)
+                        throw std::runtime_error("io_uring progress timer: " +
+                                                 std::string(std::strerror(-completion->res)));
+                    progress_timer_fired = true;
+                } else {
+                    handle(*completion);
+                }
+                ::io_uring_cqe_seen(&ring_, completion);
+            }
+
+            if (progress_timer_fired && has_active_tasks()) {
+                const auto now = monotonic_ns();
+                if (report_progress_) report_progress(case_start_ns, previous_completed);
+                check_timeouts(now);
+                start_progress_timer();
+            }
+        }
+    }
+
+private:
+    bool has_active_tasks() const noexcept {
+        return std::ranges::any_of(states_, [](const auto& state) { return state.has_task; });
+    }
+
+    io_uring_sqe* get_sqe() {
+        io_uring_sqe* submission = ::io_uring_get_sqe(&ring_);
+        if (!submission) throw std::runtime_error("io_uring submission queue is full");
+        return submission;
+    }
+
+    void start_progress_timer() {
+        auto* submission = get_sqe();
+        ::io_uring_prep_timeout(submission, &progress_timeout_, 0, 0);
+        submission->user_data = 0;
+    }
+
+    void set_submission(ConnectionState& state, io_uring_sqe* submission, Operation operation) {
+        state.operation = operation;
+        state.operation_started_ns = monotonic_ns();
+        submission->user_data = static_cast<std::uint64_t>(state.lane - lane_base_) + 1;
+    }
+
+    void close_socket(ConnectionState& state) noexcept {
+        if (state.fd >= 0) ::close(state.fd);
+        state.fd = -1;
+        state.operation = Operation::none;
+        state.operation_started_ns = 0;
+    }
+
+    bool prepare_socket(ConnectionState& state, Record& record) {
+        close_socket(state);
+        state.fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (state.fd < 0) {
+            record.error = errno_message("socket");
             return false;
         }
         const int one = 1;
-        (void)::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        timeval timeout{static_cast<time_t>(args_.timeout_seconds), 0};
-        if (::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
-            ::setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
-            error = errno_message("setsockopt timeout");
-            close();
+        (void)::setsockopt(state.fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        if (source_ &&
+            ::bind(state.fd, reinterpret_cast<const sockaddr*>(&*source_), sizeof(*source_)) != 0) {
+            record.error = errno_message("bind source address");
+            close_socket(state);
             return false;
         }
-
-        if (!args_.source.empty()) {
-            sockaddr_in source{};
-            source.sin_family = AF_INET;
-            source.sin_port = 0;
-            if (::inet_pton(AF_INET, args_.source.c_str(), &source.sin_addr) != 1) {
-                error = "invalid --source IPv4 address";
-                close();
-                return false;
-            }
-            if (::bind(fd_, reinterpret_cast<const sockaddr*>(&source), sizeof(source)) != 0) {
-                error = errno_message("bind source address");
-                close();
-                return false;
-            }
-        }
-
-        sockaddr_in destination{};
-        destination.sin_family = AF_INET;
-        destination.sin_port = htons(args_.port);
-        if (::inet_pton(AF_INET, args_.host.c_str(), &destination.sin_addr) != 1) {
-            error = "invalid --host IPv4 address";
-            close();
-            return false;
-        }
-        if (::connect(fd_, reinterpret_cast<const sockaddr*>(&destination), sizeof(destination)) != 0) {
-            error = errno_message("connect");
-            close();
-            return false;
-        }
-        elapsed = monotonic_ns() - start;
         return true;
     }
 
-    bool request(const Object& object, bool head_only, Record& record) {
-        const std::string method = head_only ? "HEAD" : "GET";
-        const std::string request =
-            method + " " + object.path + " HTTP/1.1\r\nHost: " + args_.host +
-            "\r\nUser-Agent: goblin-mirror-bench/1\r\nAccept: */*\r\n"
-            "Accept-Encoding: identity\r\nConnection: keep-alive\r\n\r\n";
+    void start_connect(ConnectionState& state) {
+        state.connect_started_ns = monotonic_ns();
+        auto* submission = get_sqe();
+        ::io_uring_prep_connect(submission, state.fd,
+                                reinterpret_cast<const sockaddr*>(&destination_),
+                                sizeof(destination_));
+        set_submission(state, submission, Operation::connect);
+    }
+
+    void start_request(ConnectionState& state) {
+        const auto& task = tasks_[state.task_index];
+        const auto& object = objects_[task.object_index];
+        const std::string_view method = args_.head_only ? "HEAD" : "GET";
+        state.request.clear();
+        state.request.reserve(method.size() + object.path.size() + args_.host.size() + 128);
+        state.request.append(method).append(" ").append(object.path)
+            .append(" HTTP/1.1\r\nHost: ").append(args_.host)
+            .append("\r\nUser-Agent: goblin-mirror-bench/1\r\nAccept: */*\r\n")
+            .append("Accept-Encoding: identity\r\nConnection: keep-alive\r\n\r\n");
+        state.sent_bytes = 0;
+        state.head.clear();
+        state.headers_complete = false;
+        state.close_after_response = false;
+
+        Record& record = records_[state.task_index];
         record.wall_start_ns = realtime_ns();
         record.query_start_ns = monotonic_ns();
-        if (!send_all(request, record.error)) {
-            close();
-            return false;
-        }
+        start_send(state);
+    }
 
-        std::string head;
-        head.reserve(4096);
-        std::uint64_t first_response = 0;
-        std::array<char, 64 * 1024> header_buffer{};
-        std::size_t header_end = std::string::npos;
-        while (header_end == std::string::npos) {
-            const ssize_t got = receive(header_buffer.data(), header_buffer.size(), record.error);
-            if (got <= 0) {
-                close();
-                return false;
+    void start_send(ConnectionState& state) {
+        auto* submission = get_sqe();
+        ::io_uring_prep_send(submission, state.fd,
+                             state.request.data() + state.sent_bytes,
+                             state.request.size() - state.sent_bytes, MSG_NOSIGNAL);
+        set_submission(state, submission, Operation::send);
+    }
+
+    void start_receive(ConnectionState& state) {
+        void* buffer = state.header_buffer.data();
+        std::size_t wanted = state.header_buffer.size();
+        if (state.headers_complete) {
+            const auto& task = tasks_[state.task_index];
+            const auto& object = objects_[task.object_index];
+            const auto received = records_[state.task_index].received_bytes;
+            buffer = state.body_buffer.data();
+            wanted = static_cast<std::size_t>(
+                std::min<std::uint64_t>(object.bytes - received, state.body_buffer.size()));
+        }
+        auto* submission = get_sqe();
+        ::io_uring_prep_recv(submission, state.fd, buffer, wanted, 0);
+        set_submission(state, submission, Operation::receive);
+    }
+
+    void assign_task(ConnectionState& state) {
+        for (;;) {
+            const auto next = task_queue_.take(tasks_.size());
+            if (!next) {
+                state.has_task = false;
+                close_socket(state);
+                return;
             }
-            const auto received_at = monotonic_ns();
-            if (first_response == 0) first_response = received_at;
-            head.append(header_buffer.data(), static_cast<std::size_t>(got));
-            if (head.size() > 256 * 1024) {
-                record.error = "HTTP response headers exceed 256 KiB";
-                close();
-                return false;
+            const std::size_t index = *next;
+
+            state.task_index = index;
+            state.has_task = true;
+            const auto& task = tasks_[index];
+            const auto& object = objects_[task.object_index];
+            Record& record = records_[index];
+            record.sequence = task.sequence;
+            record.repetition = task.repetition;
+            record.object_index = task.object_index;
+            record.worker = state.lane;
+            record.expected_bytes = object.bytes;
+            record.path = object.path;
+            record.new_connection = state.fd < 0;
+
+            if (record.new_connection) {
+                ++state.connection_id;
+                record.connection = state.connection_id;
+                if (!prepare_socket(state, record)) {
+                    finish(state, false);
+                    continue;
+                }
+                start_connect(state);
+            } else {
+                record.connection = state.connection_id;
+                start_request(state);
             }
-            header_end = head.find("\r\n\r\n");
+            return;
         }
+    }
 
-        std::string parse_error;
-        const auto parsed = parse_response_head(std::string_view(head).substr(0, header_end + 2),
-                                                parse_error);
-        if (!parsed) {
-            record.error = std::move(parse_error);
-            close();
-            return false;
+    void finish(ConnectionState& state, bool success) {
+        Record& record = records_[state.task_index];
+        if (success) {
+            counters_.successful_bytes.value.fetch_add(record.received_bytes,
+                                                        std::memory_order_relaxed);
+        } else {
+            counters_.failures.value.fetch_add(1, std::memory_order_relaxed);
+            close_socket(state);
         }
-        record.status = parsed->status;
-        record.response_first_byte_ns = first_response;
-        record.response_ttfb_ns = first_response - record.query_start_ns;
-        if (parsed->transfer_encoding || !parsed->has_content_length) {
-            record.error = parsed->transfer_encoding ? "chunked/encoded response is unsupported"
-                                                     : "response has no Content-Length";
-            close();
-            return false;
-        }
-        if (parsed->status != 200) {
-            record.error = "HTTP status " + std::to_string(parsed->status);
-            close();
-            return false;
-        }
-        if (parsed->content_length != object.bytes) {
-            record.error = "Content-Length mismatch: expected " + std::to_string(object.bytes) +
-                           ", received header " + std::to_string(parsed->content_length);
-            close();
-            return false;
-        }
+        counters_.completed.value.fetch_add(1, std::memory_order_release);
+        state.has_task = false;
+    }
 
-        const std::size_t body_offset = header_end + 4;
-        const std::uint64_t initial = head.size() - body_offset;
-        if (initial > object.bytes) {
-            record.error = "received bytes beyond declared response body";
-            close();
-            return false;
-        }
-        if (head_only && initial != 0) {
-            record.error = "HEAD response included a body";
-            close();
-            return false;
-        }
+    void finish_and_continue(ConnectionState& state, bool success) {
+        const bool close_after = state.close_after_response;
+        finish(state, success);
+        if (success && close_after) close_socket(state);
+        assign_task(state);
+    }
 
-        record.received_bytes = head_only ? 0 : initial;
-        if (!head_only && initial != 0) record.body_first_byte_ns = first_response;
-        std::uint64_t last_receive = first_response;
-        while (!head_only && record.received_bytes < object.bytes) {
-            const auto remaining = object.bytes - record.received_bytes;
-            const auto wanted = static_cast<std::size_t>(
-                std::min<std::uint64_t>(remaining, body_buffer_.size()));
-            const ssize_t got = receive(body_buffer_.data(), wanted, record.error);
-            if (got <= 0) {
-                close();
-                return false;
-            }
-            last_receive = monotonic_ns();
-            if (record.body_first_byte_ns == 0) record.body_first_byte_ns = last_receive;
-            record.received_bytes += static_cast<std::uint64_t>(got);
-        }
+    void fail(ConnectionState& state, std::string error) {
+        records_[state.task_index].error = std::move(error);
+        finish_and_continue(state, false);
+    }
 
-        record.complete_ns = last_receive;
+    void succeed(ConnectionState& state, std::uint64_t completed_at) {
+        Record& record = records_[state.task_index];
+        record.complete_ns = completed_at;
         record.ttlb_ns = record.complete_ns - record.query_start_ns;
         if (record.body_first_byte_ns != 0) {
             record.body_ttfb_ns = record.body_first_byte_ns - record.query_start_ns;
@@ -455,43 +646,187 @@ public:
             record.body_transfer_ns = 0;
         }
         record.error.clear();
-        if (parsed->close) close();
-        return true;
+        finish_and_continue(state, true);
     }
 
-private:
-    bool send_all(std::string_view bytes, std::string& error) {
-        while (!bytes.empty()) {
-            const ssize_t sent = ::send(fd_, bytes.data(), bytes.size(), MSG_NOSIGNAL);
-            if (sent > 0) {
-                bytes.remove_prefix(static_cast<std::size_t>(sent));
-                continue;
+    void handle_connect(ConnectionState& state, int result, std::uint64_t completed_at) {
+        Record& record = records_[state.task_index];
+        record.connect_ns = completed_at - state.connect_started_ns;
+        if (result < 0) {
+            fail(state, "connect: " + std::string(std::strerror(-result)));
+            return;
+        }
+        start_request(state);
+    }
+
+    void handle_send(ConnectionState& state, int result) {
+        if (result <= 0) {
+            fail(state, result == 0 ? "send returned zero"
+                                    : "send: " + std::string(std::strerror(-result)));
+            return;
+        }
+        state.sent_bytes += static_cast<std::size_t>(result);
+        if (state.sent_bytes > state.request.size()) {
+            fail(state, "send completed beyond request boundary");
+        } else if (state.sent_bytes != state.request.size()) {
+            start_send(state);
+        } else {
+            start_receive(state);
+        }
+    }
+
+    void handle_response_head(ConnectionState& state, std::size_t received,
+                              std::uint64_t received_at) {
+        Record& record = records_[state.task_index];
+        const auto& task = tasks_[state.task_index];
+        const auto& object = objects_[task.object_index];
+        if (record.response_first_byte_ns == 0) {
+            record.response_first_byte_ns = received_at;
+            record.response_ttfb_ns = received_at - record.query_start_ns;
+        }
+        state.head.append(state.header_buffer.data(), received);
+        const std::size_t header_end = state.head.find("\r\n\r\n");
+        if (header_end == std::string::npos) {
+            if (state.head.size() > 256 * 1024) {
+                fail(state, "HTTP response headers exceed 256 KiB");
+            } else {
+                start_receive(state);
             }
-            if (sent < 0 && errno == EINTR) continue;
-            error = sent == 0 ? "send returned zero" : errno_message("send");
-            return false;
+            return;
         }
-        return true;
+
+        std::string parse_error;
+        const auto parsed = parse_response_head(
+            std::string_view(state.head).substr(0, header_end + 2), parse_error);
+        if (!parsed) {
+            fail(state, std::move(parse_error));
+            return;
+        }
+        record.status = parsed->status;
+        if (parsed->transfer_encoding || !parsed->has_content_length) {
+            fail(state, parsed->transfer_encoding ? "chunked/encoded response is unsupported"
+                                                   : "response has no Content-Length");
+            return;
+        }
+        if (parsed->status != 200) {
+            fail(state, "HTTP status " + std::to_string(parsed->status));
+            return;
+        }
+        if (parsed->content_length != object.bytes) {
+            fail(state, "Content-Length mismatch: expected " + std::to_string(object.bytes) +
+                            ", received header " + std::to_string(parsed->content_length));
+            return;
+        }
+
+        const std::size_t body_offset = header_end + 4;
+        const std::uint64_t initial = state.head.size() - body_offset;
+        if (initial > object.bytes) {
+            fail(state, "received bytes beyond declared response body");
+            return;
+        }
+        if (args_.head_only && initial != 0) {
+            fail(state, "HEAD response included a body");
+            return;
+        }
+
+        state.headers_complete = true;
+        state.close_after_response = parsed->close;
+        record.received_bytes = args_.head_only ? 0 : initial;
+        if (!args_.head_only && initial != 0) record.body_first_byte_ns = received_at;
+        if (args_.head_only || record.received_bytes == object.bytes) {
+            succeed(state, received_at);
+        } else {
+            start_receive(state);
+        }
     }
 
-    ssize_t receive(void* output, std::size_t length, std::string& error) {
-        for (;;) {
-            const ssize_t got = ::recv(fd_, output, length, 0);
-            if (got > 0) return got;
-            if (got < 0 && errno == EINTR) continue;
-            error = got == 0 ? "peer closed the connection" : errno_message("recv");
-            return got;
+    void handle_receive(ConnectionState& state, int result, std::uint64_t received_at) {
+        if (result <= 0) {
+            fail(state, result == 0 ? "peer closed the connection"
+                                    : "recv: " + std::string(std::strerror(-result)));
+            return;
+        }
+        if (!state.headers_complete) {
+            handle_response_head(state, static_cast<std::size_t>(result), received_at);
+            return;
+        }
+
+        Record& record = records_[state.task_index];
+        const auto& task = tasks_[state.task_index];
+        const auto& object = objects_[task.object_index];
+        if (record.body_first_byte_ns == 0) record.body_first_byte_ns = received_at;
+        record.received_bytes += static_cast<std::uint64_t>(result);
+        if (record.received_bytes > object.bytes) {
+            fail(state, "received bytes beyond declared response body");
+        } else if (record.received_bytes == object.bytes) {
+            succeed(state, received_at);
+        } else {
+            start_receive(state);
         }
     }
 
-    void close() noexcept {
-        if (fd_ >= 0) ::close(fd_);
-        fd_ = -1;
+    void handle(const io_uring_cqe& completion) {
+        const std::uint64_t user_data = completion.user_data;
+        if (user_data == 0 || user_data > states_.size())
+            throw std::runtime_error("io_uring completion has invalid user data");
+        ConnectionState& state = states_[static_cast<std::size_t>(user_data - 1)];
+        const Operation operation = state.operation;
+        state.operation = Operation::none;
+        state.operation_started_ns = 0;
+        const auto completed_at = monotonic_ns();
+        switch (operation) {
+            case Operation::connect: handle_connect(state, completion.res, completed_at); break;
+            case Operation::send: handle_send(state, completion.res); break;
+            case Operation::receive: handle_receive(state, completion.res, completed_at); break;
+            case Operation::none:
+                throw std::runtime_error("io_uring completion has no matching operation");
+        }
+    }
+
+    void report_progress(std::uint64_t case_start_ns, std::uint64_t& previous_completed) const {
+        std::uint64_t done = 0;
+        std::uint64_t bytes = 0;
+        unsigned failures = 0;
+        for (const auto& counters : all_counters_) {
+            done += counters->completed.value.load(std::memory_order_acquire);
+            bytes += counters->successful_bytes.value.load(std::memory_order_relaxed);
+            failures += counters->failures.value.load(std::memory_order_relaxed);
+        }
+        if (done == previous_completed) return;
+        const double seconds = static_cast<double>(monotonic_ns() - case_start_ns) / 1e9;
+        const double gib = static_cast<double>(bytes) / static_cast<double>(1ULL << 30);
+        std::cerr << "progress=" << done << '/' << tasks_.size() << " failures=" << failures
+                  << " GiB=" << gib
+                  << " elapsed_s=" << seconds << '\n';
+        previous_completed = done;
+    }
+
+    void check_timeouts(std::uint64_t now) const {
+        const std::uint64_t timeout_ns =
+            static_cast<std::uint64_t>(args_.timeout_seconds) * 1'000'000'000ULL;
+        for (const auto& state : states_) {
+            if (state.operation != Operation::none && now - state.operation_started_ns >= timeout_ns)
+                throw std::runtime_error("io_uring operation timed out on connection lane " +
+                                         std::to_string(state.lane));
+        }
     }
 
     const Args& args_;
-    int fd_ = -1;
-    std::vector<char> body_buffer_;
+    const std::vector<Object>& objects_;
+    const std::vector<Task>& tasks_;
+    std::vector<Record>& records_;
+    Counters& counters_;
+    const std::vector<std::unique_ptr<Counters>>& all_counters_;
+    std::atomic<bool>& cancelled_;
+    TaskQueue& task_queue_;
+    unsigned lane_base_ = 0;
+    bool report_progress_ = false;
+    sockaddr_in destination_{};
+    std::optional<sockaddr_in> source_;
+    std::vector<ConnectionState> states_;
+    io_uring ring_{};
+    __kernel_timespec progress_timeout_{5, 0};
+    bool ring_ready_ = false;
 };
 
 std::string csv_quote(std::string_view value) {
@@ -542,101 +877,97 @@ void write_results(const Args& args, const std::vector<Record>& records) {
 int main(int argc, char** argv) try {
     const Args args = parse_args(argc, argv);
     const auto objects = load_manifest(args.manifest);
-    const auto tasks = make_tasks(objects.size(), args.passes, args.seed, args.max_requests);
+    const auto tasks =
+        make_tasks(objects.size(), args.passes, args.seed, args.max_requests, args.manifest_order);
     std::vector<Record> records(tasks.size());
-    std::atomic<std::size_t> next{0};
-    std::atomic<std::uint64_t> completed{0};
-    std::atomic<std::uint64_t> successful_bytes{0};
-    std::atomic<unsigned> failures{0};
-    std::atomic<bool> start{false};
-    std::mutex start_mutex;
-    std::condition_variable start_cv;
-    std::mutex progress_mutex;
-    std::condition_variable progress_cv;
+    std::atomic<bool> cancelled{false};
+    const unsigned lanes =
+        static_cast<unsigned>(std::min<std::size_t>(args.concurrency, tasks.size()));
+    const unsigned loops = std::min(args.threads, lanes);
+    const auto cpus = allowed_cpus();
 
     std::cerr << "requests=" << tasks.size() << " objects=" << objects.size()
               << " passes=" << args.passes << " concurrency=" << args.concurrency
+              << " connections=" << lanes << " threads=" << loops
+              << " allowed_cpus=" << cpus.size() << " engine=io_uring"
+              << " task_dispatch=shared-queue"
               << " seed=0x" << std::hex << args.seed << std::dec
+              << " ordering=" << (args.manifest_order ? "manifest" : "shuffled")
               << " method=" << (args.head_only ? "HEAD" : "GET") << '\n';
 
-    std::vector<std::thread> workers;
-    workers.reserve(args.concurrency);
-    for (unsigned worker = 0; worker < args.concurrency; ++worker) {
-        workers.emplace_back([&, worker] {
-            {
-                std::unique_lock lock(start_mutex);
-                start_cv.wait(lock, [&] { return start.load(std::memory_order_acquire); });
-            }
-            Connection connection(args);
-            unsigned connection_id = 0;
-            for (;;) {
-                const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
-                if (index >= tasks.size()) break;
-                const auto& task = tasks[index];
-                const auto& object = objects[task.object_index];
-                Record& record = records[index];
-                record.sequence = task.sequence;
-                record.repetition = task.repetition;
-                record.object_index = task.object_index;
-                record.worker = worker;
-                record.expected_bytes = object.bytes;
-                record.path = object.path;
-                record.new_connection = !connection.connected();
-                if (record.new_connection) {
-                    ++connection_id;
-                    if (!connection.connect(record.connect_ns, record.error)) {
-                        record.connection = connection_id;
-                        failures.fetch_add(1, std::memory_order_relaxed);
-                        if (completed.fetch_add(1, std::memory_order_release) + 1 == tasks.size())
-                            progress_cv.notify_one();
-                        continue;
-                    }
-                }
-                record.connection = connection_id;
-                if (connection.request(object, args.head_only, record)) {
-                    successful_bytes.fetch_add(record.received_bytes, std::memory_order_relaxed);
-                } else {
-                    failures.fetch_add(1, std::memory_order_relaxed);
-                }
-                if (completed.fetch_add(1, std::memory_order_release) + 1 == tasks.size())
-                    progress_cv.notify_one();
-            }
-        });
+    std::vector<Args> loop_args(loops, args);
+    std::vector<std::unique_ptr<Counters>> counters;
+    counters.reserve(loops);
+    for (unsigned loop = 0; loop < loops; ++loop)
+        counters.push_back(std::make_unique<Counters>());
+    std::vector<std::unique_ptr<UringClient>> clients;
+    clients.reserve(loops);
+    TaskQueue task_queue;
+    unsigned lane_base = 0;
+    for (unsigned loop = 0; loop < loops; ++loop) {
+        loop_args[loop].concurrency =
+            lanes / loops + (loop < lanes % loops ? 1U : 0U);
+        clients.push_back(std::make_unique<UringClient>(
+            loop_args[loop], objects, tasks, records, *counters[loop], counters, cancelled,
+            task_queue, lane_base, loop == 0));
+        lane_base += loop_args[loop].concurrency;
     }
+    if (lane_base != lanes)
+        throw std::runtime_error("internal connection-lane partition is incomplete");
 
-    const auto case_start = monotonic_ns();
-    start.store(true, std::memory_order_release);
-    start_cv.notify_all();
-    std::uint64_t previous_completed = 0;
-    while (completed.load(std::memory_order_acquire) < tasks.size()) {
-        std::unique_lock lock(progress_mutex);
-        progress_cv.wait_for(lock, std::chrono::seconds(5), [&] {
-            return completed.load(std::memory_order_acquire) == tasks.size();
+    std::barrier start_gate(static_cast<std::ptrdiff_t>(loops + 1));
+    std::vector<std::thread> workers;
+    std::vector<std::exception_ptr> errors(loops);
+    workers.reserve(loops);
+    std::uint64_t case_start = 0;
+    for (unsigned loop = 0; loop < loops; ++loop) {
+        workers.emplace_back([&, loop] {
+            try {
+                pin_current_thread(cpus[loop % cpus.size()]);
+            } catch (...) {
+                errors[loop] = std::current_exception();
+                cancelled.store(true, std::memory_order_release);
+            }
+            start_gate.arrive_and_wait();
+            if (cancelled.load(std::memory_order_acquire)) return;
+            try {
+                clients[loop]->run(case_start);
+            } catch (...) {
+                errors[loop] = std::current_exception();
+                cancelled.store(true, std::memory_order_release);
+            }
         });
-        lock.unlock();
-        const auto done = completed.load(std::memory_order_acquire);
-        if (done != previous_completed) {
-            const double seconds = static_cast<double>(monotonic_ns() - case_start) / 1e9;
-            const double gib = static_cast<double>(successful_bytes.load(std::memory_order_relaxed)) /
-                               static_cast<double>(1ULL << 30);
-            std::cerr << "progress=" << done << '/' << tasks.size() << " failures="
-                      << failures.load(std::memory_order_relaxed) << " GiB=" << gib
-                      << " elapsed_s=" << seconds << '\n';
-            previous_completed = done;
-        }
     }
+    case_start = monotonic_ns();
+    start_gate.arrive_and_wait();
     for (auto& worker : workers) worker.join();
     const auto case_end = monotonic_ns();
+    for (const auto& error : errors)
+        if (error) std::rethrow_exception(error);
     write_results(args, records);
 
     const double seconds = static_cast<double>(case_end - case_start) / 1e9;
-    const auto bytes = successful_bytes.load(std::memory_order_relaxed);
+    std::uint64_t completed = 0;
+    std::uint64_t bytes = 0;
+    unsigned failures = 0;
+    for (const auto& loop_counters : counters) {
+        completed += loop_counters->completed.value.load(std::memory_order_relaxed);
+        bytes += loop_counters->successful_bytes.value.load(std::memory_order_relaxed);
+        failures += loop_counters->failures.value.load(std::memory_order_relaxed);
+    }
     const double gib = static_cast<double>(bytes) / static_cast<double>(1ULL << 30);
     const double gbps = seconds == 0.0 ? 0.0 : static_cast<double>(bytes) * 8.0 / seconds / 1e9;
-    std::cout << "completed=" << completed.load() << " failures=" << failures.load()
+    rusage usage{};
+    if (::getrusage(RUSAGE_SELF, &usage) != 0) throw std::runtime_error(errno_message("getrusage"));
+    const double cpu_seconds =
+        static_cast<double>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) +
+        static_cast<double>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
+    const double cpu_percent = seconds == 0.0 ? 0.0 : cpu_seconds / seconds * 100.0;
+    std::cout << "completed=" << completed << " failures=" << failures
               << " bytes=" << bytes << " GiB=" << gib << " elapsed_s=" << seconds
-              << " aggregate_Gbit_s=" << gbps << " output=" << args.output << '\n';
-    return failures.load() == 0 ? 0 : 1;
+              << " aggregate_Gbit_s=" << gbps << " client_cpu_percent=" << cpu_percent
+              << " client_max_rss_kib=" << usage.ru_maxrss << " output=" << args.output << '\n';
+    return failures == 0 ? 0 : 1;
 } catch (const std::exception& error) {
     std::cerr << "fatal: " << error.what() << '\n';
     return 2;

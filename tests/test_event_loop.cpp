@@ -4,6 +4,7 @@
 #include "goblin/core/reactor.hpp"
 #include "goblin/core/stats.hpp"
 #include "goblin/crypto/sha256.hpp"
+#include "goblin/net/connection_dispatcher.hpp"
 #include "goblin/protocol/memcache/event_loop.hpp"
 #include "goblin/storage/index.hpp"
 #include "goblin/storage/tier_manager.hpp"
@@ -15,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <optional>
 #include <print>
@@ -208,6 +210,52 @@ static std::string set_bad(int fd, const std::string& key, const std::string& va
 }
 
 // ----------------------------------------------------------------------------- Step 2: verbs
+
+TEST("event loop: consumes dispatcher handoff and owns the connection") {
+#if !defined(__linux__)
+    return;
+#else
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("dispatch");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    auto io = make_iopool();
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    const int flags = ::fcntl(lfd, F_GETFL, 0);
+    CHECK(flags >= 0 && ::fcntl(lfd, F_SETFL, flags | O_NONBLOCK) == 0);
+    auto dispatcher = goblin::net::ConnectionDispatcher::create(lfd, {-1}, "event-loop test");
+    CHECK(dispatcher.has_value());
+    if (!dispatcher) { fs::remove_all(base); return; } // dispatcher owns lfd on failure too
+
+    std::atomic<bool> dispatcher_shutdown{false};
+    EventLoop loop(*rc, (*dispatcher)->inbox(0), *tm, index, *io);
+    std::thread loop_thread([&] { loop.run(); });
+    std::thread dispatcher_thread([&] { (*dispatcher)->run(dispatcher_shutdown); });
+
+    bool version_ok = false;
+    if (const int client = client_connect(port); client >= 0) {
+        version_ok = write_all(client, "version\r\n", 9) &&
+                     read_until(client, "\r\n").find("VERSION ") == 0;
+        ::close(client);
+    }
+    dispatcher_shutdown.store(true, std::memory_order_relaxed);
+    dispatcher_thread.join();
+    loop.stop();
+    loop_thread.join();
+
+    CHECK(version_ok);
+    CHECK_EQ((*dispatcher)->inbox(0).accepted_connections(), 1u);
+    CHECK_EQ((*dispatcher)->inbox(0).current_connections(), 0u);
+    fs::remove_all(base);
+#endif
+}
 
 TEST("event loop: version + delete, pipelined in one request") {
     if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }

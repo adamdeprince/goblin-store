@@ -24,19 +24,21 @@ bool Reactor::submit_read(int fd, std::uint64_t offset, MutBytes buf, std::uint6
     return true;
 }
 
-bool Reactor::submit_recv(int fd, MutBytes buf, std::uint64_t user_data) {
+bool Reactor::submit_recv(int fd, MutBytes buf, std::uint64_t user_data, bool link) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
     if (!sqe) return false;
     io_uring_prep_recv(sqe, fd, buf.data(), buf.size(), 0);
+    if (link) sqe->flags |= IOSQE_IO_LINK;
     sqe->user_data = user_data;
     return true;
 }
 
-bool Reactor::submit_send(int fd, ByteView buf, std::uint64_t user_data, int flags) {
+bool Reactor::submit_send(int fd, ByteView buf, std::uint64_t user_data, int flags, bool link) {
     io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
     if (!sqe) return false;
     io_uring_prep_send(sqe, fd, buf.data(), static_cast<unsigned>(buf.size()),
                        MSG_NOSIGNAL | flags);
+    if (link) sqe->flags |= IOSQE_IO_LINK;
     sqe->user_data = user_data;
     return true;
 }
@@ -46,6 +48,26 @@ bool Reactor::submit_sendmsg(int fd, msghdr* msg, std::uint64_t user_data, int f
     io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
     if (!sqe) return false;
     io_uring_prep_sendmsg(sqe, fd, msg, MSG_NOSIGNAL | flags);
+    sqe->user_data = user_data;
+    return true;
+}
+
+bool Reactor::submit_connect(int fd, const sockaddr* address, socklen_t address_length,
+                             std::uint64_t user_data, bool link) {
+    if (!address) return false;
+    io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
+    if (!sqe) return false;
+    io_uring_prep_connect(sqe, fd, address, address_length);
+    if (link) sqe->flags |= IOSQE_IO_LINK;
+    sqe->user_data = user_data;
+    return true;
+}
+
+bool Reactor::submit_link_timeout(TimeoutSpec* timeout, std::uint64_t user_data) {
+    if (!timeout) return false;
+    io_uring_sqe* sqe = io_uring_get_sqe(ring_.get());
+    if (!sqe) return false;
+    io_uring_prep_link_timeout(sqe, timeout, 0);
     sqe->user_data = user_data;
     return true;
 }
@@ -146,9 +168,11 @@ Result<Reactor> Reactor::create(unsigned) {
     return err(Errc::unsupported, "built without liburing (GOBLIN_HAVE_URING=0)");
 }
 bool Reactor::submit_read(int, std::uint64_t, MutBytes, std::uint64_t) { return false; }
-bool Reactor::submit_recv(int, MutBytes, std::uint64_t) { return false; }
-bool Reactor::submit_send(int, ByteView, std::uint64_t, int) { return false; }
+bool Reactor::submit_recv(int, MutBytes, std::uint64_t, bool) { return false; }
+bool Reactor::submit_send(int, ByteView, std::uint64_t, int, bool) { return false; }
 bool Reactor::submit_sendmsg(int, msghdr*, std::uint64_t, int) { return false; }
+bool Reactor::submit_connect(int, const sockaddr*, socklen_t, std::uint64_t, bool) { return false; }
+bool Reactor::submit_link_timeout(TimeoutSpec*, std::uint64_t) { return false; }
 bool Reactor::submit_accept(int, std::uint64_t) { return false; }
 bool Reactor::submit_poll(int, unsigned, std::uint64_t) { return false; }
 unsigned Reactor::submission_space() const noexcept { return 0; }

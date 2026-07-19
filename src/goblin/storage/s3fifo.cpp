@@ -8,23 +8,24 @@ S3Fifo::S3Fifo(std::size_t capacity_hint) : cap_(capacity_hint == 0 ? 1 : capaci
 
 void S3Fifo::insert(const Digest& d) {
     if (const auto it = meta_.find(d); it != meta_.end()) {
-        it->second.visited = true; // already cached -> treat as a hit
+        it->second.visited.store(true, std::memory_order_relaxed);
         return;
     }
     const std::uint64_t ticket = next_ticket();
     if (ghost_tickets_.erase(d) > 0) { // recently evicted -> straight to main
-        meta_.emplace(d, Entry{Q::main, false, ticket});
+        meta_.try_emplace(d, Q::main, false, ticket);
         main_.push_back(QueueNode{d, ticket});
         ++main_n_;
     } else {
-        meta_.emplace(d, Entry{Q::small, false, ticket});
+        meta_.try_emplace(d, Q::small, false, ticket);
         small_.push_back(QueueNode{d, ticket});
         ++small_n_;
     }
 }
 
 void S3Fifo::touch(const Digest& d) {
-    if (const auto it = meta_.find(d); it != meta_.end()) it->second.visited = true;
+    if (const auto it = meta_.find(d); it != meta_.end())
+        it->second.visited.store(true, std::memory_order_relaxed);
 }
 
 void S3Fifo::remove(const Digest& d) {
@@ -79,9 +80,8 @@ std::optional<Digest> S3Fifo::evict() {
         while (auto d = pop_front_resident(small_, Q::small)) {
             --small_n_;
             const auto it = meta_.find(*d);
-            if (it->second.visited) {
+            if (it->second.visited.exchange(false, std::memory_order_relaxed)) {
                 it->second.q = Q::main;
-                it->second.visited = false;
                 main_.push_back(QueueNode{*d, it->second.ticket});
                 ++main_n_;
                 continue;
@@ -97,8 +97,7 @@ std::optional<Digest> S3Fifo::evict() {
     // Main: give accessed items a second chance; evict the first un-accessed one.
     while (auto d = pop_front_resident(main_, Q::main)) {
         const auto it = meta_.find(*d);
-        if (it->second.visited) {
-            it->second.visited = false;
+        if (it->second.visited.exchange(false, std::memory_order_relaxed)) {
             main_.push_back(QueueNode{*d, it->second.ticket});
             continue;
         }

@@ -107,3 +107,14 @@ TEST("Mirror requires HTTP, validates its base URL, and excludes virtual-host mo
     config.enable_https = false;
     CHECK(detail_contains(validate(config), "requires the HTTP"));
 }
+
+TEST("Native io_uring mirror client accepts only plaintext HTTP origins") {
+    ServerConfig config;
+    config.ssd.dirs.push_back("/not-opened-by-config-validation");
+    config.mirror_client = MirrorClient::uring;
+    config.mirror_url = "https://origin.example/assets";
+    CHECK(detail_contains(validate(config), "requires an http:// origin"));
+
+    config.mirror_url = "http://origin.example/assets";
+    CHECK(validate(config).has_value());
+}

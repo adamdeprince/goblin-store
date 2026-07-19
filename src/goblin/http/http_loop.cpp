@@ -399,8 +399,7 @@ void HttpLoop::advance_mirror(Conn* c) {
         if (!context.header_sent && can_stale) {
             context.allow_stale_once = true;
             c->state = St::idle;
-            const std::string key = c->get_key;
-            if (!begin_get(c, key, c->get_digest, /*record_access=*/false)) return;
+            if (!begin_get(c, c->get_key, c->get_digest, /*record_access=*/false)) return;
             if (c->state == St::get_header || !c->out.empty()) start_send(c);
             return;
         }
@@ -420,8 +419,7 @@ void HttpLoop::advance_mirror(Conn* c) {
         context.fetch.reset();
         context.allow_stale_once = true; // a successful validation serves even with `no-cache`
         c->state = St::idle;
-        const std::string key = c->get_key;
-        if (!begin_get(c, key, c->get_digest, /*record_access=*/false)) return;
+        if (!begin_get(c, c->get_key, c->get_digest, /*record_access=*/false)) return;
         if (c->state == St::get_header || !c->out.empty()) start_send(c);
         return;
     }

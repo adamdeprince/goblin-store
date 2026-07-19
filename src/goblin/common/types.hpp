@@ -26,6 +26,14 @@ inline constexpr Size kMaxObjectSize = 4 * GiB;
 // Device-block / O_DIRECT alignment (ADR-0011) and arena alignment floor (ADR-0008).
 inline constexpr Size kDeviceBlock = 4 * KiB;
 
+// High-BDP reverse-cache defaults for fast TCP paths — high-speed Ethernet (10/25/40/100GbE) and
+// TCP/IPoIB alike. Application I/O stays far above link MTU; TCP TSO/GSO (Ethernet) or the IPoIB
+// stack segments on the wire. Values cover a ~1 ms BDP at 40 Gbit/s and amortize per-chunk
+// publish/ack plus O_DIRECT stage costs on the mirror miss path (ADR-0021). No transport-specific
+// socket options: the same knobs apply to any TCP peer.
+inline constexpr Size kHighBdpSocketBuffer = 4 * MiB;
+inline constexpr Size kMirrorIoChunk = 1 * MiB;
+
 // An unresolved RFC 7233 single byte-range (resolved against the object size at serve time). Lives
 // here, not in http/, so the shared streaming loop can carry one without depending on the protocol.
 struct ByteRange {

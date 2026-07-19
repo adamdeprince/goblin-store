@@ -27,9 +27,25 @@ scheme, authority, and base path are preserved. For example:
     -> https://origin.example/z/a/b.html?v=2
 ```
 
-Only `GET` and `HEAD` participate. System libcurl performs DNS, TLS verification, HTTP transfer
-decoding, and origin I/O; it is an optional build dependency, and selecting `--mirror` on a build
-without it is a startup error. Redirects are returned as origin responses and are not followed.
+Only `GET` and `HEAD` participate. `--mirror-client curl` is the default compatibility transport:
+system libcurl performs DNS, TLS verification, HTTP transfer decoding, and origin I/O. It is an
+optional build dependency, and selecting `--mirror` on a build without it is a startup error.
+Redirects are returned as origin responses and are not followed.
+
+`--mirror-client uring` selects the Linux plaintext-HTTP fast path. One client is owned by each
+origin worker; it resolves and connects only when needed, then reuses its HTTP/1.1 connection across
+misses. Connect operations have a 10-second timeout and each send/receive has a 30-second inactivity
+timeout implemented as an io_uring linked timeout. A stale persistent connection may be retried once
+for an idempotent `GET` or `HEAD`, but only before response headers have been published.
+
+The native path deliberately has a narrow origin contract: a syntactically valid HTTP/1.1 response,
+persistent connections, bounded headers, and either one valid `Content-Length` or valid chunked
+transfer coding. It handles ordinary interim responses, chunk extensions, and bounded trailers. It
+rejects connection-close framing, upgrades, conflicting lengths, ambiguous transfer coding,
+overlong framing, bytes beyond the declared response, and malformed chunks. These failures are
+logged and returned as origin failures; they are not silently reissued through libcurl. Goblin Store
+optimizes well-behaved origins rather than carrying a compatibility slow path for pathological ones.
+The native path currently requires an `http://` origin; use the libcurl path for HTTPS origins.
 
 ### Shared-cache identity and policy
 
@@ -58,7 +74,7 @@ coalesced behind one active fill. Once that fill publishes a fresh entry, follow
 the normal hit path; if the response is intentionally non-cacheable, followers perform their own
 origin requests instead.
 
-The producer exposes at most one libcurl body chunk at a time. For each chunk it:
+The producer exposes at most one origin body chunk at a time. For each chunk it:
 
 1. publishes the immutable chunk to the serving event loop;
 2. writes the same bytes through `TierManager::StoreHandle` into the RAM head and positional backing
@@ -76,19 +92,25 @@ continues feeding the downstream response. If the client disconnects, its rendez
 released and the origin worker continues writing and publishing the cache entry. A slow connected
 client remains subject to the ordinary `--io-timeout` resource-holder timeout.
 
+`--write-io-chunk` controls the admission/write staging quantum (1 MiB by default in mirror mode),
+independently of `--io-chunk`, which controls warmed-cache read buffers (256 KiB by default). This
+lets population amortize origin/storage rendezvous without making later O_DIRECT reads needlessly
+coarse.
+
 ### Known-length boundary
 
 The current `StoreHandle` fixes positional layout and reserves filesystem capacity before accepting
 body bytes, so a cache fill needs the decoded final `Content-Length`. Responses without one—such as
-decoded chunked or close-delimited bodies—are still streamed to the client with correct close
-framing, but are not cached. They are never buffered in RAM merely to discover their size. A future
+decoded chunked bodies—are still streamed to the client with correct close framing, but are not
+cached. The libcurl path also accepts close-delimited origin bodies; the strict native path rejects
+them. Unknown-length bodies are never buffered in RAM merely to discover their size. A future
 growable unpublished generation can remove this boundary without changing the network rendezvous or
 atomic publication rules.
 
 ## Consequences
 
 - Miss time-to-first-byte is not delayed until the object has been downloaded or stored.
-- Memory used for origin/downstream handoff is bounded by one libcurl chunk per active key.
+- Memory used for origin/downstream handoff is bounded by one write chunk per active key.
 - Disk errors degrade cache population, not delivery of an otherwise valid origin response.
 - Client abandonment can still produce a useful cache entry.
 - Same-key request bursts do not stampede a cacheable origin object.

@@ -395,6 +395,20 @@ Status enable_exasock_socket(int fd) {
 #endif
 }
 
+Status validate_exasock_connection(int fd) {
+#if GOBLIN_HAVE_EXASOCK
+    if (const int error = exasock_connection_error(fd); error != 0)
+        return err(Errc::io_error,
+                   "socket is not ExaSock-accelerated (" +
+                       std::string(std::strerror(error)) + ")");
+    return {};
+#else
+    (void)fd;
+    return err(Errc::unsupported,
+               "built without ExaSock (configure with -DGOBLIN_ENABLE_EXASOCK=ON)");
+#endif
+}
+
 } // namespace goblin::net
 
 #else // !__linux__
@@ -406,6 +420,10 @@ Result<std::unique_ptr<StreamIo>> make_readiness_stream_io(core::Reactor&, bool)
 }
 
 Status enable_exasock_socket(int) {
+    return err(Errc::unsupported, "ExaSock is Linux-only");
+}
+
+Status validate_exasock_connection(int) {
     return err(Errc::unsupported, "ExaSock is Linux-only");
 }
 

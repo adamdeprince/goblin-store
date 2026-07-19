@@ -24,7 +24,9 @@ own local (`--small-memory`) and per-foreign-node (`--small-sub-memory`) budgets
   `--block`, which may span several HugeTLB pages. Fallback preserves both pools' sizes, class isolation, and
   packing exactly.
 - **Streaming I/O pools are separate and fixed:** read pools are `--io-chunk × --io-buffers` per
-  worker; one write-staging pool uses the same geometry. Pool exhaustion produces backpressure
+  worker; one write-staging pool is `--write-io-chunk × --io-buffers`. The independent geometry
+  lets cache-miss/SET admission amortize writes without forcing warmed reads to use the same
+  quantum. Pool exhaustion produces backpressure
   ([ADR-0006](0006-positional-tiering-pipeline.md)), never heap growth.
 - **No operation buffers a whole object.** SET streams socket→disk in fixed chunks; GET streams
   disk→socket head-first in fixed chunks. RAM per transfer = a few pool chunks, *independent of

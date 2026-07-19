@@ -1,7 +1,7 @@
 // Thread-per-core memcache/TCP server (ADR-0001/0018): one worker per core, each with its own
-// io_uring reactor, I/O-buffer pool, and SO_REUSEPORT listener; the index + tier manager are shared
-// and thread-safe. Serves get/gets/set/add/replace/delete/version/quit. The io_uring multishot
-// async loop (many connections per core) layers on later behind this wiring. serve() blocks.
+// io_uring reactor and I/O-buffer pool. A coordinator accepts each TCP connection and hands its fd
+// to one least-loaded worker; that worker owns it end-to-end. The index + tier manager are shared
+// and thread-safe. Serves get/gets/set/add/replace/delete/version/quit. serve() blocks.
 #pragma once
 
 #include "goblin/common/config.hpp"

@@ -115,6 +115,9 @@ Status validate(const ServerConfig& c) {
         return err(Errc::invalid_argument, "--ram-head must divide --block exactly");
     if (!is_power_of_two(c.io_chunk_bytes) || c.io_chunk_bytes < kDeviceBlock)
         return err(Errc::invalid_argument, "io_chunk_bytes must be a power of two >= 4 KiB");
+    if (!is_power_of_two(c.write_io_chunk_bytes) || c.write_io_chunk_bytes < kDeviceBlock)
+        return err(Errc::invalid_argument,
+                   "write_io_chunk_bytes must be a power of two >= 4 KiB");
     if (c.io_buffers == 0)
         return err(Errc::invalid_argument, "io_buffers must be >= 1");
 
@@ -140,6 +143,10 @@ Status validate(const ServerConfig& c) {
         if (!plausible_mirror_url(*c.mirror_url))
             return err(Errc::invalid_argument,
                        "--mirror needs an absolute http:// or https:// URL without a query or fragment");
+        if (c.mirror_client == MirrorClient::uring &&
+            !std::string_view(*c.mirror_url).starts_with("http://"))
+            return err(Errc::invalid_argument,
+                       "--mirror-client uring currently requires an http:// origin");
     }
 
     if (c.rdma.enabled) {

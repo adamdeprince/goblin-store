@@ -22,6 +22,13 @@ public:
               MirrorService* mirror = nullptr)
         : HttpLoop(reactor, listen_fd, tm, index, iobufs, keyopt, io_timeout_ms, reg, mirror),
           ctx_(ctx) {}
+    HttpsLoop(core::Reactor& reactor, net::ConnectionInbox& inbox,
+              storage::TierManager& tm, storage::Index& index,
+              core::IoBufferPool& iobufs, KeyOptions keyopt, tls::Context& ctx,
+              unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr,
+              MirrorService* mirror = nullptr)
+        : HttpLoop(reactor, inbox, tm, index, iobufs, keyopt, io_timeout_ms, reg, mirror),
+          ctx_(ctx) {}
 
 protected:
     void on_connection(Conn*) override; // start the TLS handshake instead of an immediate recv

@@ -10,7 +10,8 @@ io_uring event loops are now the default and the only HTTP/HTTPS implementation.
 ## Decision
 - **Thread-per-core.** N worker threads per enabled protocol (`--cores`; zero means the CPU count
   available on the selected NUMA node), each with its own io_uring `Reactor` + I/O-buffer pool. A
-  connection is served end-to-end on its accepting core — no cross-core byte movement (ADR-0001).
+  connection is served end-to-end on its assigned core — no cross-core payload movement
+  (ADR-0001).
   - **NUMA affinity before allocation.** `--numa NODE` selects a node explicitly. Otherwise the node
     comes from the Linux NUMA locality of the UP Ethernet interfaces reached by the wildcard IPv4
     listeners. Interfaces on different nodes, an unknown interface locality on a multi-node host,
@@ -34,9 +35,15 @@ io_uring event loops are now the default and the only HTTP/HTTPS implementation.
     connections collide on the hash one worker serves both serially while another idles — and under
     one-connection-per-worker the collided connection *starves* in the backlog. (Measured: cores=2
     showed zero speedup until switched to a shared listener; then 1.7×/4.0×/5.0× at 2/4/8 cores.)
-  - **Async default:** each worker owns a `SO_REUSEPORT` listener and one io_uring loop. A one-shot
-    async accept is rearmed after each completion, and the worker multiplexes many connections, so
-    an uneven reuseport hash means more connections on one loop rather than backlog starvation.
+  - **Async default: one application-owned acceptor per endpoint.** The coordinator owns the sole
+    listener. A dedicated acceptor batches nonblocking `accept()` calls and assigns each fd to the
+    worker with the fewest queued plus active connections. `SO_INCOMING_CPU` and
+    `SO_INCOMING_NAPI_ID` are locality tie-breakers only; load always wins. The handoff is an fd
+    integer through a small mutex-protected queue signalled by eventfd, so neither requests nor
+    payload bytes cross workers. Each worker is pinned to one CPU on the selected NUMA node, polls
+    its inbox from its existing event mechanism, and owns an assigned socket until close. This
+    avoids `SO_REUSEPORT` 4-tuple hash imbalance at small concurrency without requiring reuseport
+    eBPF or a newer kernel. HTTP, HTTPS, memcache, and ExaSock use the same placement policy.
 - **Shared, locked storage.** The index is sharded `shared_mutex` (already). The tier manager's
   head-cache + eviction policies are guarded by a single `TierManager` mutex (coarse, v1), held
   **only** for the control-plane (head memcpy + policy ops) — never during disk I/O or network.
@@ -78,6 +85,7 @@ io_uring event loops are now the default and the only HTTP/HTTPS implementation.
   the head cache + policies (or RCU on the index) is the scaling follow-up.
 
 ## Consequences
-- ➕ N-way concurrency; each async worker multiplexes connections and disk reads on its own ring.
+- ➕ N-way concurrency; each async worker multiplexes connections and disk reads on its own ring,
+  while connection counts remain balanced even for small persistent-connection sets.
 - ➖ The coarse control-plane lock remains the principal v1 simplification; sharded policies or RCU
   remain follow-ups if profiling shows contention.

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -90,6 +91,49 @@ TEST("reactor net: socketpair recv + send round-trip via the ring") {
     CHECK_EQ(recv_res, int(sizeof msg - 1));
     CHECK(std::memcmp(rbuf.data(), msg, sizeof msg - 1) == 0);
 
+    ::close(sp[0]);
+    ::close(sp[1]);
+}
+
+TEST("reactor net: a linked timeout cancels a stalled receive and leaves the ring reusable") {
+    if (!Reactor::available()) {
+        std::println("    (skipped: built without liburing)");
+        return;
+    }
+    auto r = Reactor::create();
+    if (!r) {
+        std::println("    (skipped: io_uring unavailable: {})", r.error().detail);
+        return;
+    }
+
+    int sp[2];
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+    std::array<std::byte, 16> buffer{};
+    constexpr std::uint64_t UD_RECV = 0x51, UD_TIMEOUT = 0x52;
+    TimeoutSpec timeout{};
+    timeout.tv_nsec = 10'000'000; // 10 ms
+    CHECK(r->submit_recv(sp[0], MutBytes(buffer.data(), buffer.size()), UD_RECV, /*link=*/true));
+    CHECK(r->submit_link_timeout(&timeout, UD_TIMEOUT));
+    CHECK(r->submit_and_wait(2) >= 0);
+
+    std::array<Completion, 4> completions{};
+    const unsigned count = r->reap(completions);
+    CHECK_EQ(count, 2u);
+    int recv_result = 0, timeout_result = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        if (completions[i].user_data == UD_RECV) recv_result = completions[i].res;
+        if (completions[i].user_data == UD_TIMEOUT) timeout_result = completions[i].res;
+    }
+    CHECK_EQ(recv_result, -ECANCELED);
+    CHECK_EQ(timeout_result, -ETIME);
+
+    const char byte = 'g';
+    CHECK(::send(sp[1], &byte, 1, 0) == 1);
+    CHECK(r->submit_recv(sp[0], MutBytes(buffer.data(), 1), UD_RECV));
+    CHECK(r->submit_and_wait(1) >= 0);
+    CHECK_EQ(r->reap(completions), 1u);
+    CHECK_EQ(completions[0].res, 1);
+    CHECK_EQ(buffer[0], std::byte{'g'});
     ::close(sp[0]);
     ::close(sp[1]);
 }

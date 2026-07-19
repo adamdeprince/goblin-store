@@ -25,6 +25,15 @@
 
 namespace goblin::core {
 
+#if GOBLIN_HAVE_URING
+using TimeoutSpec = __kernel_timespec;
+#else
+struct TimeoutSpec {
+    std::int64_t tv_sec = 0;
+    std::int64_t tv_nsec = 0;
+};
+#endif
+
 // One reaped completion: `res` is bytes transferred (>= 0) or a negative errno.
 struct Completion {
     std::uint64_t user_data = 0;
@@ -41,13 +50,19 @@ public:
 
     // Network ops on the same ring (ADR-0002). `user_data` is echoed in the Completion so the event
     // loop can dispatch on it. submit_accept's completion `res` is the new connection fd.
-    bool submit_recv(int fd, MutBytes buf, std::uint64_t user_data);
+    bool submit_recv(int fd, MutBytes buf, std::uint64_t user_data, bool link = false);
     // `flags` is OR'd with MSG_NOSIGNAL. Pass MSG_MORE for intermediate pieces so the stack can
     // coalesce with the next send (header+head, mid-tail pieces).
-    bool submit_send(int fd, ByteView buf, std::uint64_t user_data, int flags = 0);
+    bool submit_send(int fd, ByteView buf, std::uint64_t user_data, int flags = 0,
+                     bool link = false);
     // Scatter-gather send. `msg` (and its iov) must remain valid until the next ring submit drains
     // the SQE (caller typically owns them on Conn). CQE `res` is total bytes across iovecs.
     bool submit_sendmsg(int fd, msghdr* msg, std::uint64_t user_data, int flags = 0);
+    bool submit_connect(int fd, const sockaddr* address, socklen_t address_length,
+                        std::uint64_t user_data, bool link = false);
+    // Append a relative timeout to an operation submitted with `link=true`. `timeout` must remain
+    // alive until submit()/submit_and_wait() returns; io_uring copies it during submission.
+    bool submit_link_timeout(TimeoutSpec* timeout, std::uint64_t user_data);
     bool submit_accept(int listen_fd, std::uint64_t user_data);
     // One-shot readiness poll (POLLIN/POLLOUT): the Completion's `res` is the ready events. Used to
     // drive OpenSSL's non-blocking handshake/read on the loop (ADR-0005).

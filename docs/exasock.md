@@ -87,18 +87,18 @@ explicitly opts its selected listeners into acceleration with
 `SO_EXA_NO_ACCEL`. Startup is fail-closed: before listener opt-in, the server
 verifies through the preload namespace that the ExaSock runtime is active.
 It deliberately does not call the extension device query on a listening
-socket. Each accepted connection is checked with `exasock_tcp_get_device`
-before Goblin admits it to the protocol loop. A missing preload, unsupported
-interface, or unaccelerated connection is rejected rather than silently using
-kernel TCP.
+socket. The centralized acceptor checks each connection with
+`exasock_tcp_get_device` before assigning its fd to a protocol worker. A
+missing preload, unsupported interface, or unaccelerated connection is
+rejected rather than silently using kernel TCP.
 
-The ExaSock path uses nonblocking `accept`, `recv`, and `send` calls behind a
-readiness loop so the preload library sees all socket operations. Disk work
-remains asynchronous: the same worker retains its `io_uring` reactor for SSD
-and HDD reads, and the reactor's completion event is integrated into the
-readiness loop. Thus serving a resident head and starting/overlapping its tail
-read does not turn into blocking disk I/O merely because the socket transport
-changed.
+The ExaSock path uses a nonblocking coordinator acceptor, then nonblocking
+`recv` and `send` calls in the assigned worker's readiness loop so the preload
+library sees all socket operations. Disk work remains asynchronous: the same
+worker retains its `io_uring` reactor for SSD and HDD reads, and the reactor's
+completion event is integrated into the readiness loop. Thus serving a
+resident head and starting/overlapping its tail read does not turn into
+blocking disk I/O merely because the socket transport changed.
 
 HTTPS is not accelerated by `--net exasock`; the accelerated services are
 memcached and plaintext HTTP. If HTTPS is enabled in the same process, it

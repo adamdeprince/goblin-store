@@ -86,7 +86,8 @@ void print_help() {
         "  --hdd-dir DIR       HDD cold-pool directory (repeatable; enables 3-layer)\n"
         "  --ram-head SIZE     packed per-object RAM head, power of two [default 256K]\n"
         "  --ssd-prefix SIZE   per-object SSD prefix                 [default 32M]\n"
-        "  --io-chunk SIZE     streaming I/O chunk size              [default 256K]\n"
+        "  --io-chunk SIZE     cache-hit/read streaming chunk size   [default 256K]\n"
+        "  --write-io-chunk SIZE  write-staging chunk size           [default 256K; mirror 1M]\n"
         "  --io-buffers N      streaming I/O buffers per worker      [default 64]\n"
         "  --io-timeout MS     drop a stalled transfer (slow client) [default 30000, 0=off]\n"
         "  --listen-address A  numeric IPv4 address for TCP listeners [default 0.0.0.0]\n"
@@ -106,6 +107,7 @@ void print_help() {
         "  --decay FLOAT       per-minute score multiplier, 0 < d < 1 [default 0.5]\n"
         "  --source DIR        preload a directory tree at startup (repeatable)\n"
         "  --mirror URL        cache misses from an HTTP(S) origin/base path\n"
+        "  --mirror-client M   upstream client: curl|uring            [default curl]\n"
         "  --http-vhost        HTTP key = Host + URI (default: key = URI path)\n"
         "  --virtual-host      alias for --http-vhost\n"
         "  --key-on-query      include the query string in the key (default: strip)\n"
@@ -131,6 +133,7 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, on_term); // graceful shutdown: drain in-flight transfers, then exit
     std::signal(SIGINT, on_term);
     ServerConfig cfg;
+    bool write_io_chunk_explicit = false;
     std::span<char*> args(argv + 1, argc > 0 ? static_cast<std::size_t>(argc - 1) : 0);
 
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -190,7 +193,8 @@ int main(int argc, char** argv) {
         else if (a == "--https-port") { auto v = take(a); if (!v) return 2; auto p = parse_int<std::uint16_t>(*v); if (!p) { bad("port", *v); return 2; } cfg.https_port = *p; }
         else if (a == "--memory" || a == "--sub-memory" || a == "--small-memory" ||
                  a == "--small-sub-memory" || a == "--block" || a == "--ram-head" ||
-                 a == "--ssd-prefix" || a == "--io-chunk" || a == "--small-min-alloc" ||
+                 a == "--ssd-prefix" || a == "--io-chunk" || a == "--write-io-chunk" ||
+                 a == "--small-min-alloc" ||
                  a == "--rdma-ring" || a == "--rdma-window") {
             auto v = take(a); if (!v) return 2;
             auto s = parse_size(*v); if (!s) { bad("size", *v); return 2; }
@@ -213,7 +217,11 @@ int main(int argc, char** argv) {
             else if (a == "--small-min-alloc") cfg.memory.small_min_alloc = *s;
             else if (a == "--rdma-ring")       cfg.rdma.ring_bytes = *s;
             else if (a == "--rdma-window")     cfg.rdma.bulk_window_bytes = *s;
-            else                               cfg.io_chunk_bytes = *s;
+            else if (a == "--io-chunk") cfg.io_chunk_bytes = *s;
+            else {
+                cfg.write_io_chunk_bytes = *s;
+                write_io_chunk_explicit = true;
+            }
         }
         else if (a == "--memcache-port" || a == "--http-port" || a == "--rdma-port") {
             auto v = take(a); if (!v) return 2;
@@ -245,6 +253,12 @@ int main(int argc, char** argv) {
             else if (*v == "exasock") cfg.net = NetMode::exasock;
             else { bad("net mode", *v); return 2; }
         }
+        else if (a == "--mirror-client") {
+            auto v = take(a); if (!v) return 2;
+            if (*v == "curl") cfg.mirror_client = MirrorClient::curl;
+            else if (*v == "uring") cfg.mirror_client = MirrorClient::uring;
+            else { bad("mirror client", *v); return 2; }
+        }
         else if (a == "--io-buffers") {
             auto v = take(a); if (!v) return 2;
             auto n = parse_int<unsigned>(*v); if (!n || *n == 0) { bad("io-buffers", *v); return 2; }
@@ -264,6 +278,11 @@ int main(int argc, char** argv) {
     }
 
     cfg.enable_https = !cfg.tls_cert_paths.empty();
+
+    // Mirror fills use a large admission quantum, independently of cache-hit tail reads.
+    if (cfg.mirror_url && !write_io_chunk_explicit &&
+        cfg.write_io_chunk_bytes < kMirrorIoChunk)
+        cfg.write_io_chunk_bytes = kMirrorIoChunk;
 
     if (auto ok = validate(cfg); !ok) {
         std::println(stderr, "config error: {}", ok.error().detail);
@@ -417,6 +436,10 @@ int main(int argc, char** argv) {
     std::println("│ https       : {}", cfg.enable_https ? cfg.listen_address + ":" + std::to_string(cfg.https_port)
                                                          : std::string("off"));
     std::println("│ mirror      : {}", cfg.mirror_url.value_or("off"));
+    if (cfg.mirror_url)
+        std::println("│ mirror client: {}",
+                     cfg.mirror_client == MirrorClient::uring ? "io_uring HTTP/1.1"
+                                                              : "libcurl");
     std::println("│ io backend  : {}", GOBLIN_HAVE_URING ? "io_uring (available)" : "stub (no liburing)");
     const std::string worker_count = cfg.cores
         ? std::to_string(cfg.cores)
@@ -442,8 +465,8 @@ int main(int argc, char** argv) {
                                        : std::string("NUMA node unknown"));
         }
     }
-    std::println("│ io bufs     : {} x {} KiB / worker, stall timeout {}", cfg.io_buffers,
-                 cfg.io_chunk_bytes / KiB,
+    std::println("│ io bufs     : {} x {} KiB read / {} KiB write, stall timeout {}",
+                 cfg.io_buffers, cfg.io_chunk_bytes / KiB, cfg.write_io_chunk_bytes / KiB,
                  cfg.io_timeout_ms ? std::to_string(cfg.io_timeout_ms) + "ms" : std::string("off"));
     std::println("└─────────────────────────────────────────────");
     // Blank-slate the pool dirs (ADR-0013): wipe requires the .goblin-store-marker
@@ -465,7 +488,7 @@ int main(int argc, char** argv) {
     auto tm = storage::TierManager::open(cfg.tiers, cfg.memory, cfg.eviction, cfg.ssd, cfg.hdd, index,
                                          cfg.io_chunk_bytes, cfg.io_buffers,
                                          cfg.cache_bypass == CacheBypass::o_direct,
-                                         cfg.access_score);
+                                         cfg.access_score, cfg.write_io_chunk_bytes);
     if (!tm) {
         std::println(stderr, "startup: {}", tm.error().detail);
         return 1;

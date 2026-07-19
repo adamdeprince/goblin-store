@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Goblin Store is a NUMA-aware large-object memcache clone with TCP, native InfiniBand/RoCE, and HTTP front ends. Object heads stay in RAM while tails stream from SSD and HDD.">
+  <meta name="description" content="Goblin Store is a NUMA-aware large-object cache: memcache over TCP or native InfiniBand RDMA, plus HTTP server and caching-proxy modes. Object heads stay in RAM while tails stream from SSD and HDD.">
   <meta name="theme-color" content="#11130f">
   <meta property="og:title" content="Goblin Store — first byte from RAM, the rest already on its way">
   <meta property="og:description" content="Memcache latency for large objects with 7.4× less RAM. A RAM head hides SSD and HDD latency while a read-ahead pipeline keeps the wire fed.">
@@ -317,11 +317,11 @@
     <section class="hero" aria-labelledby="hero-title">
       <img class="hero-goblin" src="goblin.png" alt="The Goblin Store silkie mascot" width="1254" height="1254">
       <div class="hero-inner">
-        <p class="eyebrow">Large-object cache + HTTP object server</p>
+        <p class="eyebrow">Large-object cache + HTTP server/proxy</p>
         <h1 id="hero-title">First byte from RAM. The rest is already on its way.</h1>
         <p class="hero-copy">
           Goblin Store keeps each object’s latency-sensitive <strong>head in RAM</strong>, streams the middle from SSD,
-          and hoards the cold tail on cheap HDD. It speaks memcache over TCP or native RDMA, but large objects no longer require an all-RAM bill.
+          and hoards the cold tail on cheap HDD. It speaks memcache over TCP or native InfiniBand RDMA, and HTTP as either a server or a caching proxy, but large objects no longer require an all-RAM bill.
         </p>
         <div class="hero-actions">
           <a class="button primary" href="#quickstart">Build Goblin Store</a>
@@ -443,6 +443,7 @@
               One run fit in memory. The other forced cold reads onto the same slow HDD used by extstore.
             </p>
             <a class="bench-link" href="BENCHMARKS.html">Full rig, methodology, tables, and caveats →</a>
+            <p><a class="bench-link" href="docs/optane-small-object-concurrency-scaling.html">Optane small-object concurrency: 54.1 Gbit/s and tighter delivery times →</a></p>
             <p><a class="bench-link" href="docs/numa-interconnect-bandwidth.html">NUMA interconnect-bandwidth report →</a></p>
             <p><a class="bench-link" href="docs/numa-first-byte-latency.html">68 million requests: local vs remote first-byte latency →</a></p>
             <p><a class="bench-link" href="docs/native-rdma-256k-performance.html">Native InfiniBand: 38.2 Gbit/s and 7.7 us median header TTFB →</a></p>

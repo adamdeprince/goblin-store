@@ -156,10 +156,15 @@ def render(path):
             f'<article class="doc-body">\n{body}\n</article></main>{footer}</body></html>\n')
 
 mds = []
+assets = []
+asset_extensions = {".png", ".jpg", ".jpeg", ".webp", ".svg"}
 for dp, dn, fns in os.walk("."):
     dn[:] = [d for d in dn if not skip(d)]
     mds += [os.path.relpath(os.path.join(dp, fn), ".") for fn in fns if fn.endswith(".md")]
+    assets += [os.path.relpath(os.path.join(dp, fn), ".") for fn in fns
+               if os.path.splitext(fn)[1].lower() in asset_extensions]
 mds.sort()
+assets.sort()
 
 for md in mds:
     # Every Markdown page mirrors its source path, including the root README.
@@ -167,6 +172,13 @@ for md in mds:
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         f.write(render(md))
+    print("  ", out)
+
+# Mirror source image assets so relative Markdown image links keep working in the generated tree.
+for asset in assets:
+    out = os.path.join(OUT, asset)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    shutil.copy2(asset, out)
     print("  ", out)
 
 # Copy LICENSE into the site so in-page [LICENSE](LICENSE) links resolve.

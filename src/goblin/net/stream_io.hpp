@@ -77,6 +77,10 @@ Result<std::unique_ptr<StreamIo>> make_readiness_stream_io(
 // SO_EXA_NO_ACCEL enables acceleration only for the selected listener.  The stub returns
 // unsupported when GOBLIN_ENABLE_EXASOCK was not requested.
 Status enable_exasock_socket(int fd);
+// Verify that an accepted socket is actually backed by the active ExaSock device. The centralized
+// connection dispatcher calls this before handing the fd to a worker; fail closed rather than
+// silently serving one connection through kernel TCP.
+Status validate_exasock_connection(int fd);
 constexpr bool exasock_compiled() noexcept {
 #if GOBLIN_HAVE_EXASOCK
     return true;
