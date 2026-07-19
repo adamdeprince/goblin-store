@@ -18,9 +18,9 @@ the bandwidth and 50.9% less elapsed time.
 | Warmed throughput at C1024 | 40.944 Gbit/s | **48.509 Gbit/s** | **18.5%** |
 | Empty-cache population | 9.142 Gbit/s | **18.614 Gbit/s** | **103.6%** |
 
-This is a **small-object concurrency and cache-throughput test over local TCP loopback**. It is
-not a 40 Gbit/s NIC test, and its 54 Gbit/s peak is not constrained by an external link. It is
-also one complete run per cache, not a replicated statistical study.
+This is a **small-object concurrency and cache-throughput test over local TCP loopback**. It was a
+local test and did not involve a network card. It is also one complete run per cache, not a
+replicated statistical study.
 
 Goblin Store speaks memcache over TCP or native InfiniBand RDMA, and HTTP as either a server or a
 caching proxy. This experiment exercises only its HTTP caching-proxy path.
