@@ -38,9 +38,9 @@ The implemented v1 has three synchronous pressure paths:
    `out_of_space` without entering this reclaim loop. See
    [ADR-0010](0010-write-admission-modes.md).
 
-TTL expiry is additionally reclaimed by the periodic reaper and lazy-hidden on reads. SSD-to-HDD
-demotion, hit-driven re-promotion, byte watermarks, and background high-to-low reclaim are not
-implemented; they remain possible refinements. Primary placement remains positional
+TTL expiry is additionally reclaimed by the periodic reaper and lazy-hidden on reads. Live byte
+and inode watermarks drive bounded background high-to-low reclaim through the same filesystem-local
+policies. SSD-to-HDD demotion and hit-driven re-promotion remain possible refinements. Primary placement remains positional
 ([ADR-0006](0006-positional-tiering-pipeline.md)).
 
 ## Consequences
@@ -49,4 +49,4 @@ implemented; they remain possible refinements. Primary placement remains positio
 - ➕ Real allocation retry remains correct in the presence of concurrent writers, unrelated
   filesystem users, and open-but-unlinked reader generations.
 - ➖ Whole-object filesystem reclaim may free shards on additional mounts occupied by the same
-  object. Background watermarks and tier demotion remain future work.
+  object. Tier demotion remains future work.

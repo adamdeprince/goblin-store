@@ -2,6 +2,7 @@
 
 #include "goblin/core/stats.hpp"
 #include "goblin/crypto/sha256.hpp"
+#include "goblin/protocol/memcache/protocol.hpp"
 #include "goblin/protocol/memcache/rdma_session.hpp"
 #include "goblin/storage/index.hpp"
 #include "goblin/storage/tier_manager.hpp"
@@ -348,6 +349,36 @@ TEST("rdma session: rejected ADD drains and releases its bulk body without stori
     CHECK_EQ(f.channel.inline_stream, std::string("VERSION goblin-store 0.0.2\r\n"));
 }
 
+TEST("rdma session: add and replace conditions are rechecked after their bodies arrive") {
+    SessionFixture f(/*window_bytes=*/8, /*tx_windows=*/1, /*ram_head=*/64,
+                     /*write_buffers=*/2);
+    if (!f.ready()) return;
+
+    const auto add_key = crypto::hash_key("contested");
+    CHECK(accept_inline(f, "add contested 0 0 4\r\n")); // observes absent and opens its handle
+    CHECK(f.tm->store(add_key, bytes_of("winner"), 9).has_value());
+    const unsigned add_rx = f.channel.offer_rx("lost");
+    CHECK(accept_and_release(f, add_rx));
+    CHECK(accept_inline(f, "\r\n"));
+    CHECK(f.session->drive());
+    CHECK_EQ(f.channel.inline_stream, std::string("NOT_STORED\r\n"));
+    const auto add_head = f.tm->head_view(add_key);
+    CHECK(add_head.has_value());
+    if (add_head) CHECK_EQ(string_of(*add_head), std::string("winner"));
+
+    f.channel.reset_observations();
+    const auto replace_key = crypto::hash_key("removed");
+    CHECK(f.tm->store(replace_key, bytes_of("old"), 3).has_value());
+    CHECK(accept_inline(f, "replace removed 0 0 3\r\n")); // observes present
+    CHECK(f.tm->remove(replace_key));
+    const unsigned replace_rx = f.channel.offer_rx("new");
+    CHECK(accept_and_release(f, replace_rx));
+    CHECK(accept_inline(f, "\r\n"));
+    CHECK(f.session->drive());
+    CHECK_EQ(f.channel.inline_stream, std::string("NOT_STORED\r\n"));
+    CHECK(!f.index.contains(replace_key));
+}
+
 TEST("rdma session: inline SET body is a fatal v3 framing error") {
     SessionFixture f;
     if (!f.ready()) return;
@@ -431,6 +462,37 @@ TEST("rdma session: GET sends inline header, only bulk body, then inline trailer
           event_index(f.channel, "tx-inline:\r\nEND\r\n"));
 }
 
+TEST("rdma session: multi-key get and gets omit misses and terminate once") {
+    SessionFixture f(/*window_bytes=*/4);
+    if (!f.ready()) return;
+    CHECK(f.tm->store(crypto::hash_key("first"), bytes_of(""), 3).has_value());
+    CHECK(f.tm->store(crypto::hash_key("second"), bytes_of(""), 7).has_value());
+    const auto first = f.index.lookup(crypto::hash_key("first"));
+    const auto second = f.index.lookup(crypto::hash_key("second"));
+    CHECK(first.has_value() && second.has_value());
+    if (!first || !second) return;
+
+    CHECK(accept_inline(f, "get missing first second absent\r\n"));
+    CHECK(f.session->drive());
+    CHECK_EQ(f.channel.inline_stream,
+             std::string("VALUE first 3 0\r\n\r\n"
+                         "VALUE second 7 0\r\n\r\n"
+                         "END\r\n"));
+    CHECK(f.channel.bulk_sends.empty());
+
+    f.channel.reset_observations();
+    CHECK(accept_inline(f, "gets absent second nowhere first\r\n"));
+    CHECK(f.session->drive());
+    std::string expected = value_header_cas("second", 7, 0, second->etag);
+    expected += "\r\n";
+    expected += value_header_cas("first", 3, 0, first->etag);
+    expected += "\r\nEND\r\n";
+    CHECK_EQ(f.channel.inline_stream, expected);
+    CHECK(f.channel.bulk_sends.empty());
+    CHECK_EQ(f.stats.get_hits.load(std::memory_order_relaxed), std::uint64_t(4));
+    CHECK_EQ(f.stats.get_misses.load(std::memory_order_relaxed), std::uint64_t(4));
+}
+
 TEST("rdma session: zero-byte SET and GET use no bulk records") {
     SessionFixture f;
     if (!f.ready()) return;
@@ -483,6 +545,17 @@ TEST("rdma session: version, delete, malformed command, and stats remain inline 
     CHECK_EQ(f.channel.inline_stream, std::string("ERROR\r\n"));
 
     f.channel.reset_observations();
+    CHECK(accept_inline(f, "set malformed 0 nope 1\r\n"));
+    f.session->drive();
+    CHECK_EQ(f.channel.inline_stream,
+             std::string("CLIENT_ERROR bad command line format\r\n"));
+
+    f.channel.reset_observations();
+    CHECK(accept_inline(f, "stats items\r\n"));
+    f.session->drive();
+    CHECK_EQ(f.channel.inline_stream, std::string("ERROR\r\n"));
+
+    f.channel.reset_observations();
     CHECK(accept_inline(f, "stats\r\n"));
     f.session->drive();
     CHECK(f.channel.bulk_sends.empty());
@@ -492,4 +565,96 @@ TEST("rdma session: version, delete, malformed command, and stats remain inline 
     CHECK(f.channel.inline_stream.find("STAT sets_stored 1\r\n") != std::string::npos);
     CHECK(f.channel.inline_stream.find("STAT rdma_bulk_rx 1\r\n") != std::string::npos);
     CHECK(f.channel.inline_stream.ends_with("END\r\n"));
+
+    f.channel.reset_observations();
+    CHECK(accept_inline(f, "stats reset\r\n"));
+    f.session->drive();
+    CHECK_EQ(f.channel.inline_stream, std::string("RESET\r\n"));
+
+    f.channel.reset_observations();
+    CHECK(accept_inline(f, "stats\r\n"));
+    f.session->drive();
+    CHECK(f.channel.inline_stream.find("STAT cmd_set 0\r\n") != std::string::npos);
+    CHECK(f.channel.inline_stream.find("STAT sets_stored 0\r\n") != std::string::npos);
+}
+
+TEST("rdma session: negative classic exptime stores an immediately expired item") {
+    SessionFixture f;
+    if (!f.ready()) return;
+
+    CHECK(accept_inline(f, "set gone 0 -1 1\r\n"));
+    const unsigned rx = f.channel.offer_rx("x");
+    CHECK(accept_and_release(f, rx));
+    CHECK(accept_inline(f, "\r\n"));
+    f.session->drive();
+    CHECK_EQ(f.channel.inline_stream, std::string("STORED\r\n"));
+
+    f.channel.reset_observations();
+    CHECK(accept_inline(f, "get gone\r\n"));
+    f.session->drive();
+    CHECK_EQ(f.channel.inline_stream, std::string("END\r\n"));
+    const auto meta = f.index.lookup(crypto::hash_key("gone"));
+    CHECK(meta.has_value());
+    if (meta) CHECK_EQ(meta->expiry, std::uint32_t(1));
+}
+
+TEST("rdma session: classic mutation, arithmetic, touch, gat, and flush commands") {
+    SessionFixture f(/*window_bytes=*/16, /*tx_windows=*/1, /*ram_head=*/64,
+                     /*write_buffers=*/2);
+    if (!f.ready()) return;
+
+    const auto store_value = [&](std::string_view command, std::string value) {
+        f.channel.reset_observations();
+        if (!accept_inline(f, command)) return false;
+        if (!value.empty()) {
+            const unsigned rx = f.channel.offer_rx(std::move(value));
+            if (!accept_and_release(f, rx)) return false;
+        }
+        if (!accept_inline(f, "\r\n")) return false;
+        f.session->drive();
+        return f.channel.inline_stream == "STORED\r\n";
+    };
+
+    CHECK(store_value("set word 7 0 3\r\n", "old"));
+    CHECK(store_value("append word 0 0 1\r\n", "!"));
+    CHECK(store_value("prepend word 0 0 1\r\n", ">"));
+    const auto word = f.tm->head_view(crypto::hash_key("word"));
+    CHECK(word.has_value());
+    if (word) CHECK_EQ(string_of(*word), std::string(">old!"));
+    const auto word_meta = f.index.lookup(crypto::hash_key("word"));
+    CHECK(word_meta.has_value());
+    if (word_meta) CHECK_EQ(word_meta->flags, std::uint32_t(7));
+
+    CHECK(store_value("set number 0 0 2\r\n", "10"));
+    f.channel.reset_observations();
+    CHECK(accept_inline(f, "incr number 5\r\n"));
+    f.session->drive();
+    CHECK_EQ(f.channel.inline_stream, std::string("15\r\n"));
+    f.channel.reset_observations();
+    CHECK(accept_inline(f, "decr number 20\r\n"));
+    f.session->drive();
+    CHECK_EQ(f.channel.inline_stream, std::string("0\r\n"));
+
+    CHECK(store_value("set empty 0 0 0\r\n", ""));
+    f.channel.reset_observations();
+    CHECK(accept_inline(f, "touch empty 60\r\n"));
+    f.session->drive();
+    CHECK_EQ(f.channel.inline_stream, std::string("TOUCHED\r\n"));
+    f.channel.reset_observations();
+    CHECK(accept_inline(f, "gats 60 empty missing\r\n"));
+    f.session->drive();
+    const auto empty = f.index.lookup(crypto::hash_key("empty"));
+    CHECK(empty.has_value());
+    if (empty)
+        CHECK_EQ(f.channel.inline_stream,
+                 value_header_cas("empty", 0, 0, empty->etag) + "\r\nEND\r\n");
+
+    f.channel.reset_observations();
+    CHECK(accept_inline(f, "flush_all\r\n"));
+    f.session->drive();
+    CHECK_EQ(f.channel.inline_stream, std::string("OK\r\n"));
+    f.channel.reset_observations();
+    CHECK(accept_inline(f, "get word\r\n"));
+    f.session->drive();
+    CHECK_EQ(f.channel.inline_stream, std::string("END\r\n"));
 }

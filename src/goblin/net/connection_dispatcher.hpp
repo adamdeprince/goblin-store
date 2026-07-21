@@ -8,6 +8,7 @@
 #pragma once
 
 #include "goblin/common/error.hpp"
+#include "goblin/core/stats.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -21,6 +22,26 @@
 #include <vector>
 
 namespace goblin::net {
+
+// One process-wide stream admission counter is shared by every TCP/Unix protocol dispatcher. Charging happens
+// before an fd enters a worker inbox and release happens only when that inbox observes retirement,
+// so queued handoffs and live connections consume the same finite budget.
+class ConnectionBudget {
+public:
+    explicit ConnectionBudget(std::uint64_t maximum) : maximum_(maximum) {}
+
+    bool try_acquire() noexcept;
+    void release() noexcept;
+    bool full() const noexcept { return current() >= maximum_; }
+    std::uint64_t current() const noexcept {
+        return current_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t maximum() const noexcept { return maximum_; }
+
+private:
+    const std::uint64_t maximum_;
+    std::atomic<std::uint64_t> current_{0};
+};
 
 struct ConnectionRoute {
     std::size_t worker = 0;
@@ -44,9 +65,9 @@ private:
 };
 
 // One acceptor producer and one event-loop consumer touch this queue. The mutex is intentionally on
-// the connection-establishment path, never the request or byte-streaming path. Keeping the queue
-// dynamically sized means a connection burst cannot be discarded merely because a fixed handoff
-// ring was undersized.
+// the connection-establishment path, never the request or byte-streaming path. The shared
+// ConnectionBudget bounds the aggregate number of queued plus live descriptors; dynamic sizing
+// within that hard ceiling avoids discarding a burst merely because a handoff ring was undersized.
 class alignas(64) ConnectionInbox {
 public:
     ~ConnectionInbox();
@@ -72,9 +93,11 @@ public:
 private:
     friend class ConnectionDispatcher;
 
-    ConnectionInbox(std::size_t worker_id, int worker_cpu, int notification_fd) noexcept;
+    ConnectionInbox(std::size_t worker_id, int worker_cpu, int notification_fd,
+                    std::shared_ptr<ConnectionBudget> connection_budget) noexcept;
     static Result<std::unique_ptr<ConnectionInbox>> create(std::size_t worker_id,
-                                                            int worker_cpu);
+                                                            int worker_cpu,
+                                                            std::shared_ptr<ConnectionBudget>);
     bool enqueue(int fd) noexcept;
     void discard_connections() noexcept;
 
@@ -85,6 +108,7 @@ private:
     std::deque<int> queue_;
     std::atomic<std::uint64_t> current_connections_{0};
     std::atomic<std::uint64_t> accepted_connections_{0};
+    std::shared_ptr<ConnectionBudget> connection_budget_;
 };
 
 class ConnectionDispatcher {
@@ -94,7 +118,10 @@ public:
     // worker has no explicit CPU affinity and therefore cannot be an incoming-CPU locality match.
     static Result<std::unique_ptr<ConnectionDispatcher>> create(
         int listener_fd, std::vector<int> worker_cpus, std::string label,
-        bool require_exasock_connections = false);
+        bool require_exasock_connections = false,
+        std::shared_ptr<ConnectionBudget> connection_budget = {},
+        core::StatsRegistry* stats = nullptr,
+        core::StatsDomain stats_domain = core::StatsDomain::memcache_tcp);
 
     ~ConnectionDispatcher();
 
@@ -112,7 +139,9 @@ public:
 
 private:
     ConnectionDispatcher(int listener_fd, std::vector<int> worker_cpus, std::string label,
-                         bool require_exasock_connections);
+                         bool require_exasock_connections,
+                         std::shared_ptr<ConnectionBudget> connection_budget,
+                         core::StatsRegistry* stats, core::StatsDomain stats_domain);
 
     bool dispatch(int fd) noexcept;
 
@@ -120,6 +149,10 @@ private:
     std::string label_;
     bool require_exasock_connections_ = false;
     bool reported_exasock_rejection_ = false;
+    [[maybe_unused]] bool listener_paused_ = false; // Linux accept loop only
+    std::shared_ptr<ConnectionBudget> connection_budget_;
+    [[maybe_unused]] core::StatsRegistry* stats_ = nullptr; // Linux accept loop only
+    [[maybe_unused]] core::StatsDomain stats_domain_ = core::StatsDomain::memcache_tcp;
     ConnectionRouter router_;
     std::vector<std::unique_ptr<ConnectionInbox>> inboxes_;
     std::vector<std::uint64_t> load_snapshot_;

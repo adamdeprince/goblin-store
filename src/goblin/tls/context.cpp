@@ -55,7 +55,7 @@ int sni_select(SSL* ssl, int* al, void* arg) {
 
 } // namespace
 
-Result<Context> Context::create(const std::vector<CertKey>& certs) {
+Result<Context> Context::create(const std::vector<CertKey>& certs, SniPolicy policy) {
     if (certs.empty()) return err(Errc::invalid_argument, "no TLS certificates configured");
     Context self;
     for (const auto& ck : certs) {
@@ -80,8 +80,12 @@ Result<Context> Context::create(const std::vector<CertKey>& certs) {
         self.ctxs_.push_back(std::move(owned));
     }
     // The handshake starts on default_; the callback then enforces strict per-tenant selection.
-    SSL_CTX_set_tlsext_servername_callback(self.default_, sni_select);
-    SSL_CTX_set_tlsext_servername_arg(self.default_, self.by_host_.get());
+    if (policy == SniPolicy::strict) {
+        SSL_CTX_set_tlsext_servername_callback(self.default_, sni_select);
+        SSL_CTX_set_tlsext_servername_arg(self.default_, self.by_host_.get());
+    }
+    // Optional-SNI contexts intentionally use the first certificate. Ordinary memcache clients
+    // generally do not send SNI and memcache has no Host-derived tenant boundary.
     return self;
 }
 

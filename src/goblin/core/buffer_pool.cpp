@@ -1,6 +1,7 @@
 #include "goblin/core/buffer_pool.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cerrno>
 #include <cstdint>
@@ -130,6 +131,14 @@ unsigned BuddyAllocator::order_for(Size bytes) const noexcept {
     return o;
 }
 
+std::size_t BuddyAllocator::free_blocks(Size bytes) const noexcept {
+    if (bytes < min_block_ || bytes > arena_size_ || !is_power_of_two(bytes) ||
+        bytes % min_block_ != 0)
+        return 0;
+    const unsigned order = order_for(bytes);
+    return order <= max_order_ && block_size(order) == bytes ? free_[order].size() : 0;
+}
+
 std::optional<Offset> BuddyAllocator::allocate(Size bytes) {
     if (bytes == 0 || bytes > arena_size_) return std::nullopt;
     const unsigned target = order_for(bytes);
@@ -146,12 +155,14 @@ std::optional<Offset> BuddyAllocator::allocate(Size bytes) {
         free_[o].push_back(off + block_size(o));
     }
     used_ += block_size(target);
+    requested_ += bytes;
     return off;
 }
 
 void BuddyAllocator::deallocate(Offset off, Size bytes) {
     const unsigned target = order_for(bytes);
     used_ -= block_size(target);
+    requested_ -= bytes;
 
     unsigned order = target;
     Offset cur = off;
@@ -176,6 +187,7 @@ std::optional<Offset> ArenaAllocator::allocate(Size bytes) {
     const Offset off = static_cast<Offset>(frontier_);
     frontier_ += a;
     live_ += a;
+    requested_ += bytes;
     return off;
 }
 
@@ -183,6 +195,7 @@ void ArenaAllocator::deallocate(Offset /*off*/, Size bytes) {
     // Bump arenas don't reuse individual slots; just drop the live count. When it hits 0 the block is
     // fully dead and the BufferPool returns it to the pool; short of that, compaction reclaims the holes.
     live_ -= round(bytes);
+    requested_ -= bytes;
 }
 
 // ---------------- BlockPool ----------------
@@ -570,6 +583,81 @@ bool BufferPool::swap_blocks(unsigned first, unsigned second) {
     std::swap_ranges(addr(first, 0), addr(first, 0) + blocks_.block_bytes(), addr(second, 0));
     std::swap(arenas_[first], arenas_[second]);
     return true;
+}
+
+std::vector<BufferPool::ClassUsage> BufferPool::usage() const {
+    std::array<ClassUsage, 3> totals{};
+    for (std::size_t i = 0; i < totals.size(); ++i)
+        totals[i].allocation_class = static_cast<BufferPoolClass>(i);
+    for (unsigned block = 0; block < arenas_.size(); ++block) {
+        const auto region = blocks_.block_region(block);
+        if (!region) continue;
+        auto& total = totals[static_cast<std::size_t>(blocks_.region_allocation_class(*region))];
+        total.capacity_bytes += blocks_.block_bytes();
+        if (const auto* buddy = std::get_if<BuddyAllocator>(&arenas_[block])) {
+            total.used_bytes += buddy->requested();
+            total.fragmented_bytes += buddy->fragmented();
+            total.free_bytes += buddy->capacity() - buddy->used();
+        } else if (const auto* arena = std::get_if<ArenaAllocator>(&arenas_[block])) {
+            total.used_bytes += arena->requested();
+            total.fragmented_bytes += arena->frontier() - arena->requested();
+            total.free_bytes += arena->capacity() - arena->frontier();
+        } else {
+            total.free_bytes += blocks_.block_bytes();
+        }
+    }
+    std::vector<ClassUsage> out;
+    for (const auto& total : totals)
+        if (total.capacity_bytes != 0) out.push_back(total);
+    return out;
+}
+
+std::vector<BufferPool::MappingUsage> BufferPool::mappings() const {
+    std::vector<MappingUsage> out;
+    out.reserve(blocks_.region_count());
+    for (std::size_t region = 0; region < blocks_.region_count(); ++region) {
+        const Size blocks = blocks_.region_end_block(region) - blocks_.region_first_block(region);
+        out.push_back({region, blocks_.region_numa_node(region),
+                       blocks_.region_allocation_class(region),
+                       blocks * blocks_.block_bytes(), blocks_.region_uses_hugetlb(region)});
+    }
+    return out;
+}
+
+std::vector<BufferPool::BuddyFreeBlocks> BufferPool::buddy_free_blocks() const {
+    constexpr std::size_t classes = 3;
+    std::vector<Size> sizes;
+    for (Size bytes = kDeviceBlock;; bytes <<= 1) {
+        sizes.push_back(bytes);
+        if (bytes == blocks_.block_bytes()) break;
+    }
+    std::array<std::vector<std::uint64_t>, classes> counts;
+    std::array<bool, classes> present{};
+    for (auto& values : counts) values.resize(sizes.size());
+
+    for (unsigned block = 0; block < arenas_.size(); ++block) {
+        const auto region = blocks_.block_region(block);
+        if (!region) continue;
+        const std::size_t allocation_class =
+            static_cast<std::size_t>(blocks_.region_allocation_class(*region));
+        present[allocation_class] = true;
+        if (const auto* buddy = std::get_if<BuddyAllocator>(&arenas_[block])) {
+            for (std::size_t i = 0; i < sizes.size(); ++i)
+                counts[allocation_class][i] += buddy->free_blocks(sizes[i]);
+        } else if (std::holds_alternative<std::monostate>(arenas_[block])) {
+            ++counts[allocation_class].back();
+        }
+    }
+
+    std::vector<BuddyFreeBlocks> out;
+    for (std::size_t allocation_class = 0; allocation_class < classes; ++allocation_class) {
+        if (!present[allocation_class]) continue;
+        out.reserve(out.size() + sizes.size());
+        for (std::size_t i = 0; i < sizes.size(); ++i)
+            out.push_back({static_cast<BufferPoolClass>(allocation_class), sizes[i],
+                           counts[allocation_class][i]});
+    }
+    return out;
 }
 
 // ---------------- IoBufferPool ----------------

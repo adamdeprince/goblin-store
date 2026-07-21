@@ -33,6 +33,32 @@ TEST("index: set / lookup roundtrip") {
     CHECK_EQ(m->flags, std::uint32_t(7));
     CHECK(ix.contains(k));
     CHECK_EQ(ix.size(), std::size_t(1));
+    const auto usage = ix.usage();
+    CHECK_EQ(usage.items, std::uint64_t(1));
+    CHECK_EQ(usage.logical_bytes, Size(1234));
+    CHECK_EQ(usage.head_resident, std::uint64_t(0));
+    CHECK_EQ(usage.headless, std::uint64_t(1));
+}
+
+TEST("index: O(1) usage follows replacement, head eviction, and erase") {
+    Index index;
+    const auto key = hash_key("usage");
+    auto first = meta(100);
+    first.head = HeadLoc{2, 0, 64};
+    index.set(key, first);
+    CHECK_EQ(index.usage().resident_head_bytes, Size(64));
+    auto replacement = meta(250);
+    replacement.head = HeadLoc{3, 0, 128};
+    index.set(key, replacement);
+    CHECK_EQ(index.usage().items, std::uint64_t(1));
+    CHECK_EQ(index.usage().logical_bytes, Size(250));
+    CHECK_EQ(index.usage().resident_head_bytes, Size(128));
+    CHECK(index.set_head(key, HeadLoc{}));
+    CHECK_EQ(index.usage().head_resident, std::uint64_t(0));
+    CHECK_EQ(index.usage().headless, std::uint64_t(1));
+    CHECK(index.erase(key));
+    CHECK_EQ(index.usage().items, std::uint64_t(0));
+    CHECK_EQ(index.usage().logical_bytes, Size(0));
 }
 
 TEST("index: mirror metadata is paired with an object generation and cleared by ordinary replace") {

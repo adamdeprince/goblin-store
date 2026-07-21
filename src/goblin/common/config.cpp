@@ -20,15 +20,22 @@ bool numeric_network_address(const std::string& address) {
     return status == 0;
 }
 
-bool numeric_ipv4_address(const std::string& address) {
-    in_addr parsed{};
-    return ::inet_pton(AF_INET, address.c_str(), &parsed) == 1;
+bool strict_numeric_network_address(const std::string& address) {
+    in_addr v4{};
+    if (::inet_pton(AF_INET, address.c_str(), &v4) == 1) return true;
+    const std::size_t zone = address.find('%');
+    const std::string host = address.substr(0, zone);
+    in6_addr v6{};
+    return ::inet_pton(AF_INET6, host.c_str(), &v6) == 1;
 }
 
-bool wildcard_ipv4_address(const std::string& address) {
-    in_addr parsed{};
-    return ::inet_pton(AF_INET, address.c_str(), &parsed) == 1 &&
-           parsed.s_addr == htonl(INADDR_ANY);
+bool wildcard_network_address(const std::string& address) {
+    in_addr v4{};
+    if (::inet_pton(AF_INET, address.c_str(), &v4) == 1)
+        return v4.s_addr == htonl(INADDR_ANY);
+    in6_addr v6{};
+    return ::inet_pton(AF_INET6, address.c_str(), &v6) == 1 &&
+           IN6_IS_ADDR_UNSPECIFIED(&v6);
 }
 
 bool plausible_mirror_url(const std::string& url) {
@@ -120,18 +127,45 @@ Status validate(const ServerConfig& c) {
                    "write_io_chunk_bytes must be a power of two >= 4 KiB");
     if (c.io_buffers == 0)
         return err(Errc::invalid_argument, "io_buffers must be >= 1");
-
-    if (c.listen_address.empty() || !numeric_ipv4_address(c.listen_address))
+    if (c.max_connections == 0)
+        return err(Errc::invalid_argument, "--max-connections must be >= 1");
+    if (c.listen_backlog == 0 ||
+        c.listen_backlog > static_cast<unsigned>(std::numeric_limits<int>::max()))
+        return err(Errc::invalid_argument, "--listen-backlog must be between 1 and INT_MAX");
+    if (c.max_object_size == 0 || c.max_object_size > kMaxObjectSize)
         return err(Errc::invalid_argument,
-                   "--listen-address needs a numeric IPv4 address");
+                   "--max-object-size must be between 1 byte and the 4 GiB hard limit");
+
+    if (c.listen_address.empty() || !strict_numeric_network_address(c.listen_address))
+        return err(Errc::invalid_argument,
+                   "--listen-address needs a numeric IPv4 or IPv6 address");
+    if (c.memcache_socket_mode > 0777)
+        return err(Errc::invalid_argument,
+                   "--memcache-socket-mode must be an octal mode between 0000 and 0777");
+    if (c.memcache_socket && c.memcache_socket->empty())
+        return err(Errc::invalid_argument, "--memcache-socket path cannot be empty");
+    if (c.memcache_auth_file && c.memcache_auth_file->empty())
+        return err(Errc::invalid_argument, "--auth-file path cannot be empty");
     if (c.net == NetMode::exasock) {
-        if (wildcard_ipv4_address(c.listen_address))
+        if (wildcard_network_address(c.listen_address))
             return err(Errc::invalid_argument,
                        "--net exasock requires an exact, non-wildcard --listen-address");
         if (!c.enable_memcache && !c.enable_http)
             return err(Errc::invalid_argument,
                        "--net exasock requires memcache and/or plaintext HTTP");
     }
+    if (c.memcache_tls && !c.enable_memcache)
+        return err(Errc::invalid_argument,
+                   "--memcache-tls requires the memcache TCP listener");
+    if (c.memcache_tls && c.net == NetMode::exasock)
+        return err(Errc::invalid_argument,
+                   "--memcache-tls is incompatible with --net exasock");
+    if (c.memcache_tls && c.net == NetMode::blocking)
+        return err(Errc::invalid_argument,
+                   "--memcache-tls currently requires the default --net async backend");
+    if (c.memcache_auth_file && c.rdma.enabled)
+        return err(Errc::invalid_argument,
+                   "--auth-file currently protects TCP and Unix memcache; disable RDMA or authentication");
 
     if (c.mirror_url) {
         if (c.http_vhost)
@@ -192,7 +226,8 @@ Status validate(const ServerConfig& c) {
 
     if (c.eviction.low_watermark <= 0.0 || c.eviction.high_watermark > 1.0 ||
         c.eviction.low_watermark >= c.eviction.high_watermark)
-        return err(Errc::invalid_argument, "require 0 < low_watermark < high_watermark <= 1.0");
+        return err(Errc::invalid_argument,
+                   "require 0 < --disk-low-watermark < --disk-high-watermark <= 1.0");
 
     if (!std::isfinite(c.access_score.increment) || c.access_score.increment <= 0.0)
         return err(Errc::invalid_argument, "--increment must be a finite positive number");
@@ -200,13 +235,15 @@ Status validate(const ServerConfig& c) {
         c.access_score.decay >= 1.0)
         return err(Errc::invalid_argument, "--decay must be finite and strictly between 0 and 1");
 
-    if (!c.enable_memcache && !c.enable_http && !c.enable_https && !c.rdma.enabled)
+    if (!c.enable_memcache && !c.memcache_socket && !c.enable_http && !c.enable_https &&
+        !c.rdma.enabled)
         return err(Errc::invalid_argument,
-                   "no listeners enabled (need memcache, RDMA memcache, HTTP, or HTTPS)");
+                   "no listeners enabled (need TCP/Unix/RDMA memcache, HTTP, or HTTPS)");
     if (c.tls_cert_paths.size() != c.tls_key_paths.size())
         return err(Errc::invalid_argument, "each --tls-cert needs a matching --tls-key");
-    if (c.enable_https && c.tls_cert_paths.empty())
-        return err(Errc::invalid_argument, "HTTPS requires at least one --tls-cert/--tls-key pair");
+    if ((c.enable_https || c.memcache_tls) && c.tls_cert_paths.empty())
+        return err(Errc::invalid_argument,
+                   "HTTPS and memcache TLS require at least one --tls-cert/--tls-key pair");
 
     return {};
 }

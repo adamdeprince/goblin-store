@@ -115,6 +115,7 @@ struct EvictionConfig {                // ADR-0007 / ADR-0012
     std::uint64_t max_ssd_objects = 0; // disk-backed object count bound; 0 => unbounded
     double high_watermark = 0.90;      // start background reclaim
     double low_watermark  = 0.80;      // reclaim down to here
+    unsigned reclaim_interval_ms = 1000; // live filesystem check/reclaim cadence; 0 disables
 };
 
 // Native reliable-connected RDMA memcache endpoint. The control ring carries only typed command,
@@ -132,16 +133,21 @@ struct RdmaConfig {
 };
 
 struct ServerConfig {
-    // Numeric IPv4 address shared by the TCP listeners.  The historical wildcard remains the
-    // default; ExaSock requires an exact SmartNIC address so acceleration and NUMA locality cannot
-    // silently resolve to the management interface.
-    std::string   listen_address = "0.0.0.0";
+    // Numeric IPv4/IPv6 address shared by the TCP listeners. Loopback-only by default: exposing an
+    // unauthenticated cache on an external interface must be an explicit operator decision.
+    // ExaSock requires an exact SmartNIC address so acceleration and NUMA locality cannot silently
+    // resolve to the management interface.
+    std::string   listen_address = "127.0.0.1";
     std::uint16_t memcache_port = 11211;  // memcache over TCP only (ADR-0005)
     std::uint16_t http_port     = 8080;   // plaintext HTTP listener
     std::uint16_t https_port    = 8443;   // TLS listener (ADR-0005)
     bool          enable_memcache = true;
     bool          enable_http     = true;  // serve plaintext HTTP
     bool          enable_https    = false; // serve TLS; HTTP+HTTPS may both run
+    bool          memcache_tls    = false; // replace plaintext on memcache_port with TLS 1.3
+    std::optional<std::string> memcache_auth_file; // memcached ASCII auth file: user:password
+    std::optional<std::string> memcache_socket;    // AF_UNIX memcache listener; no TLS
+    std::uint32_t memcache_socket_mode = 0600;     // chmod after bind
     // One cert/key pair per domain (SNI selects, ADR-0005); paired by index. Repeat --tls-cert/--tls-key.
     std::vector<std::string> tls_cert_paths; // PEM certificate chains
     std::vector<std::string> tls_key_paths;  // PEM private keys
@@ -169,6 +175,13 @@ struct ServerConfig {
     Size          write_io_chunk_bytes = 256 * KiB; // SET/mirror write-staging chunk size
     unsigned      io_buffers     = 64;         // streaming chunk buffers (read pool/worker; write staging)
     unsigned      io_timeout_ms  = 30000;      // drop a stalled in-flight transfer (slow client); 0 = off
+    unsigned      idle_timeout_ms = 300000;    // expire idle keepalive connections; 0 = off
+    unsigned      queue_timeout_ms = 30000;    // max wait for a GET/SET streaming buffer; 0 = off
+    unsigned      max_get_waiters = 64;        // bounded read-buffer wait queue, per worker
+    unsigned      max_set_waiters = 64;        // bounded write-buffer wait queue, per worker
+    unsigned      max_connections = 1024;      // aggregate TCP + Unix connections across listeners
+    unsigned      listen_backlog = 1024;       // TCP completed-connection queue (kernel may clamp)
+    Size          max_object_size = kMaxObjectSize; // storage admission bound for every protocol
     unsigned      ttl_reap_ms    = 1000;       // TTL reaper sweep period (ms); 0 = off (lazy-skip only)
     unsigned      shutdown_grace_ms = 5000;    // graceful-shutdown drain deadline for in-flight transfers
     bool          read_ahead     = true;       // double-buffered GET read-ahead; off => serial (A/B knob)

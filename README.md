@@ -15,8 +15,8 @@ memcached’s hit latency at a fraction of the RAM, outperform memcached
 + extstore on cold reads, and cost less per stored GiB by spreading
 each object down a RAM → SSD → HDD price pyramid.
 
-goblin-store speaks the memcache text and meta protocols, making it a
-drop-in replacement for memcached. It also serves read-only HTTP/1.1
+goblin-store implements a compatible subset of the memcache text and meta
+protocols. It also serves read-only HTTP/1.1
 for edge/CDN use, either from explicitly inserted objects or as a
 streaming reverse cache for an HTTP(S) origin.
 
@@ -101,9 +101,15 @@ filesystem-local reclaim, and immutable publication, read
 
 ## Protocols
 
-- **memcache (TCP):** classic text (`get`/`gets`/`set`/`add`/`replace`/`cas`/`delete`/`stats`/
-  `version`/`quit`) + the **meta** protocol (`mn`/`mg`/`ms`/`md`), TTL, and
-  **CAS** (= a per-store ETag, essentially free). No binary protocol, no UDP, no built-in auth.
+- **memcache (TCP):** classic text retrieval, storage, arithmetic, touch, delete, delayed flush,
+  stats, and CAS—including full multi-key `get`/`gets`, `gat`/`gats`, and atomic `add`/`replace`.
+  The **meta** surface (`mn`/`mg`/`ms`/`md`/`ma`/`me`) includes CAS, binary keys, access metadata,
+  conditional value retrieval, early recache, serve-stale, and `N`/`W`/`Z` anti-stampede
+  coordination. TCP is IPv4/IPv6 capable and may be wrapped in TLS 1.3; the same protocol is also
+  available on an optional Unix-domain socket. Standard memcached ASCII authentication can gate
+  both TCP and Unix clients. The default async and fallback blocking TCP backends run the same semantics and a
+  differential wire-transcript suite guards that contract. This remains a compatible subset: no
+  binary protocol or UDP.
 - **memcache (native InfiniBand/RoCE):** optional reliable-connected v3 endpoint for the classic
   operations. Commands and framing use a small one-sided control ring; every nonempty object body
   uses registered, credit-controlled bulk windows. With the defaults, 1 MiB is four bulk writes
@@ -129,7 +135,7 @@ filesystem-local reclaim, and immutable publication, read
   [ADR-0021](docs/adr/0021-http-mirror-cache.md).
 
 > **Status:** working memcache + HTTP/HTTPS server on io_uring + O_DIRECT — 3-tier store, atomic
-> publish, RAM-head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **237 unit-test
+> publish, RAM-head GET, read-ahead pipeline, TTL/CAS, graceful shutdown. **281 unit-test
 > cases, with Release, ASan/UBSan, and TSan coverage.** macOS is a non-goal (no io_uring / O_DIRECT
 > analog); FreeBSD (kqueue/aio) is a planned port.
 
@@ -170,6 +176,17 @@ ctest --test-dir build --output-on-failure
     --ssd-dir /mnt/ssd/pool --hdd-dir /mnt/hdd/pool \
     --memcache-port 11211 --http-port 8080
 
+# Secure remote memcache: an external bind is explicit, TLS replaces plaintext on port 11211,
+# and every connection must complete the memcached ASCII auth exchange before any other command.
+# Supplying certs for memcache TLS alone does not also open the HTTPS listener; add --https to do so.
+./build/goblin-store --listen-address :: --memcache-tls --auth-file /etc/goblin-store/users \
+    --tls-cert /etc/goblin-store/server.crt --tls-key /etc/goblin-store/server.key \
+    --no-http --memory 4G --ssd-dir /mnt/ssd/pool
+
+# Local-only memcache over a mode-0600 Unix socket. --no-memcache disables only TCP.
+./build/goblin-store --no-memcache --no-http --memcache-socket /run/goblin-store/memcache.sock \
+    --memory 4G --ssd-dir /mnt/ssd/pool
+
 # Four NUMA nodes, legacy shared mode: 100 GiB on the serving/NIC-local node and 20 GiB on
 # each of the other three. Fixed heads and packed small objects share all 160 GiB.
 ./build/goblin-store --numa 0 --memory 100G --sub-memory 20G \
@@ -199,14 +216,93 @@ Key knobs (see `--help`): `--ram-head` (power-of-two per-object resident head, d
 `--ssd-prefix` (positional tier size), `--block` (power-of-two allocation/promotion block, default
 2 MiB on x86 and 32 MiB on Arm/LoongArch), `--io-buffers` /
 `--io-chunk` (warmed-read quantum), `--write-io-chunk` (admission/write quantum), `--eviction`,
-`--max-objects`, `--no-mlock` (dev), `--tls-cert`/
-`--tls-key` (HTTPS), `--source` (preload a directory tree), `--numa NODE` (explicit NUMA
+`--max-objects`, `--max-object-size`, `--no-mlock` (dev), `--tls-cert`/
+`--tls-key` (HTTPS and memcache TLS), `--memcache-tls`, `--auth-file`, `--memcache-socket`,
+`--disk-high-watermark` / `--disk-low-watermark` / `--disk-reclaim-interval`,
+`--source` (preload a directory tree), `--numa NODE` (explicit NUMA
 placement), `--mirror URL` (streaming HTTP(S) reverse-cache origin; incompatible with virtual-host
 mode), `--mirror-client curl|uring`, `--memory SIZE` / `--sub-memory SIZE` (fixed-head RAM on the local / each non-local
 NUMA node), `--small-memory SIZE` / `--small-sub-memory SIZE` (packed-small-object RAM on the local /
 each non-local node), `--increment FLOAT` (score added per successful key read), `--decay FLOAT`
 (per-minute score multiplier in `(0, 1)`), and `--perverse` (benchmark-only inversion of preferred
 head-memory placement).
+
+### Network security
+
+TCP binds to `127.0.0.1` by default. Use an exact numeric IPv4/IPv6 address—or `0.0.0.0`/`::`
+for a wildcard—only when remote access is intended. `::` is configured as a dual-stack wildcard
+where the kernel permits it. IPv6 endpoints are logged in bracketed form.
+
+`--memcache-tls` replaces plaintext on `--memcache-port` with TLS 1.3 and requires at least one
+paired `--tls-cert`/`--tls-key`. The first certificate is the memcache default because ordinary
+memcache clients need not send SNI. The async streaming path requires Linux kTLS so encrypted
+resident heads and disk tails can keep using the normal io_uring send pipeline. Memcache TLS is
+therefore rejected with the blocking and ExaSock backends rather than silently serving plaintext.
+Certificate options used with `--memcache-tls` do not implicitly open HTTPS; add `--https` when both
+TLS services are intended.
+
+`--auth-file FILE` uses the memcached ASCII authentication format: one `user:password` record per
+line, up to 256 bytes. The file must be a regular file with no group/other permission bits (normally
+mode `0600`). A client authenticates with memcached's initial fake storage request—`set` followed by
+a `username password` value—and may retry after `CLIENT_ERROR authentication failure`. Authentication
+also covers `--memcache-socket`; it deliberately cannot be combined with the current native RDMA
+endpoint, which does not yet carry the ASCII login exchange. `stats` exposes `auth_cmds` and
+`auth_errors`, while `stats settings` reports `auth_enabled_ascii`, `memcache_tls`, and the Unix
+socket path when configured.
+
+`--memcache-socket PATH` creates an AF_UNIX listener with `--memcache-socket-mode 0600` by default.
+A stale socket node is replaced, but startup refuses to remove a live socket or a non-socket at that
+path. The socket is removed on shutdown. It shares the process-wide connection budget and overload
+counters with the TCP listeners.
+
+TCP overload is contained by a process-wide `--max-connections` budget shared by memcache, HTTP,
+HTTPS, and ExaSock, plus a configurable `--listen-backlog`. Idle keepalives expire after
+`--idle-timeout`; GET and SET buffer wait queues have independent per-worker bounds
+(`--max-get-waiters` / `--max-set-waiters`) and a `--queue-timeout`. Set a timeout to zero only when
+explicitly opting out. Memcache `stats` reports `rejected_connections`, `listen_disabled_num`,
+`idle_drops`, and `queue_drops` alongside the existing transfer/backpressure counters.
+It also reports each distinct backing filesystem once per tier as
+`goblin_{ssd,hdd}_filesystem_N_*`: byte capacity, used, free, and unprivileged-available space;
+total, used, free, and unprivileged-available inodes; and the numeric device ID. The accompanying
+`goblin_{ssd,hdd}_filesystem_count` fields make the indexed series straightforward to discover.
+These are live `fstatvfs()` gauges and do not scan cached objects.
+The same response includes a live buddy free-list histogram named
+`goblin_{ram,ram_head,small_pool}_buddy_free_SIZE_blocks`, where `SIZE` is the power-of-two block
+size in bytes. Counts describe the allocator's currently coalesced blocks: a free larger block is
+reported once at its current size rather than multiplied into every smaller size it could satisfy.
+Fractional small objects use compactable bump arenas, so their unused and fragmented space is not
+misreported as buddy blocks.
+
+### Disk health, quarantine, and readiness
+
+Every backing filesystem is tracked by its device ID even when several configured pool directories
+share the same mount. Disk read, write, and capacity errors are counted per device, with the last
+errno and error time. A device becomes `degraded` after a hardware-class read error; a
+hardware-class write error makes it `read_only`, while disappearance errors such as `ENODEV` make
+it `failed`. Degraded devices may continue serving cached data, but read-only and failed storage
+makes the process not ready and rejects new disk-backed stores before body admission. `ENOSPC` and
+`EDQUOT` remain capacity events rather than hardware failures: memcache reports `SERVER_ERROR out
+of space`, while a hardware failure reports `SERVER_ERROR storage I/O failure` and an already
+read-only device reports `SERVER_ERROR storage is read-only`.
+
+A failed or short tail read still truncates the response and closes its connection once response
+bytes have begun; no replacement status can be sent honestly at that point. Before closing, Goblin
+quarantines the exact immutable generation that failed. It removes that object from the index and
+all eviction policies and unlinks its shards. A concurrent replacement is protected by the
+generation check and remains live. `quarantined_objects` and `quarantine_failures` expose the result.
+
+The background storage-health thread checks live byte and inode availability every
+`--disk-reclaim-interval` milliseconds (default 1000). At `--disk-high-watermark` (default 0.90),
+it uses the existing filesystem-local victim policy to reclaim whole objects toward
+`--disk-low-watermark` (default 0.80). Each pass is bounded and later passes continue the work, so
+maintenance cannot monopolize serving threads. Set the interval to zero to disable proactive
+reclaim; foreground `fallocate`/`pwrite` results remain authoritative either way.
+
+Memcache `stats` exposes `storage_state`, `storage_ready`, quarantine and watermark counters, plus
+`storage_device_N_{id,paths,state,read_errors,write_errors,capacity_errors,last_errno,last_error_unix}`.
+HTTP and HTTPS reserve `GET`/`HEAD /__goblin/ready`: it returns JSON with HTTP 200 for healthy or
+degraded-but-serving storage and HTTP 503 for read-only or failed storage. The endpoint is handled
+locally even in mirror mode and is never sent to the origin.
 
 On Linux, every fixed pool—including both sides of an explicit head/small-object split—first
 requests HugeTLB backing using the platform page order
@@ -225,11 +321,12 @@ On Linux, Goblin Store binds the main thread before allocating its fixed RAM are
 coordinator threads inherit that affinity, and `--cores 0` uses the number of CPUs available on the
 selected NUMA node as the worker count for each enabled protocol. Score-table workers instead bind
 to the node whose score memory they scan. A strict inherited local memory policy keeps the dynamic
-key index, I/O buffers, and ordinary thread allocations on the serving node. Without `--numa`, the
-serving node is derived from the UP Ethernet interfaces covered by the wildcard listeners. If those
-interface addresses belong to different nodes—or locality is unknown on a multi-node host—startup
-stops and reports each Linux interface name, listening address, NUMA node, and the corresponding
-`--numa NODE` override.
+key index, I/O buffers, and ordinary thread allocations on the serving node. For a loopback/Unix-only
+deployment without `--numa`, Goblin selects the first online node allowed by the inherited
+taskset/cgroup. For an external exact or wildcard bind, the serving node is derived from the covered
+UP interfaces. If those interface addresses belong to different nodes—or locality is unknown on a
+multi-node host—startup stops and reports each Linux interface name, listening address, NUMA node,
+and the corresponding `--numa NODE` override.
 
 `--perverse` leaves the serving threads, key index, I/O pools, and inherited default memory policy on
 that selected NIC-local node, but maps the preferred region-zero `--memory` head arena—and an

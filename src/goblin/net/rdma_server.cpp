@@ -317,7 +317,7 @@ private:
     core::StatsRegistry& registry_;
     const std::atomic<bool>& shutdown_;
     const std::atomic<bool>& listener_stop_;
-    core::Stats stats_{};
+    core::Stats stats_{core::StatsDomain::memcache_rdma};
     std::optional<memcache::RdmaSession> session_;
 
     std::uint32_t local_slot_count_ = 0;

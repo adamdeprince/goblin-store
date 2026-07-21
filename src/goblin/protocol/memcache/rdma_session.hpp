@@ -13,9 +13,11 @@
 #include "goblin/storage/tier_manager.hpp"
 
 #include <cstdint>
+#include <chrono>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace goblin::memcache {
 
@@ -82,9 +84,12 @@ private:
     bool process_input();
     bool retry_store();
     bool drive_get();
+    bool continue_get_batch();
     bool prepare_next_get_piece();
     bool prefetch_first_tail();
     void finish_store_trailer();
+    bool copy_mutation_source();
+    void release_set_source();
     void finish_get();
     void reset_get();
     void queue(std::string_view bytes);
@@ -92,7 +97,6 @@ private:
     std::string format_stats() const;
 
     storage::TierManager& tm_;
-    storage::Index& index_;
     core::Reactor* reactor_;
     core::Stats& stats_;
     core::StatsRegistry* registry_;
@@ -103,6 +107,7 @@ private:
     std::string input_;
     std::string output_;
     std::size_t output_offset_ = 0;
+    std::chrono::steady_clock::time_point request_started_{};
     bool failed_ = false;
     bool close_requested_ = false;
     std::string error_;
@@ -111,8 +116,13 @@ private:
     Size set_size_ = 0;
     Size set_remaining_ = 0;
     std::uint32_t set_flags_ = 0;
-    std::uint32_t set_exptime_ = 0;
+    std::uint32_t set_expiry_ = 0;
     std::uint64_t set_cas_ = 0;
+    char set_mode_ = 'S';
+    std::optional<storage::TierManager::Snapshot> set_source_;
+    bool set_source_copied_ = false;
+    storage::StoreCondition set_condition_ = storage::StoreCondition::unconditional;
+    core::CommandKind set_command_ = core::CommandKind::set;
     bool set_noreply_ = false;
     bool set_reject_ = false;
     bool set_failed_ = false;
@@ -125,6 +135,11 @@ private:
     bool first_head_sent_ = false;
     std::optional<PreparedWindow> prepared_;
     std::optional<PreparedWindow> prefetched_tail_;
+    std::vector<std::string> get_batch_keys_;
+    std::size_t get_batch_next_ = 0;
+    bool get_batch_active_ = false;
+    bool get_batch_with_cas_ = false;
+    std::optional<std::uint32_t> get_batch_expiry_;
 
     LifetimeCounters counters_{};
 };

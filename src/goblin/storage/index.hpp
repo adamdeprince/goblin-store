@@ -36,6 +36,11 @@ struct ObjectMeta {
     std::uint32_t flags = 0;  // opaque memcache flags
     std::uint32_t expiry = 0; // unix seconds; 0 = never (TTL swept separately, ADR-0007)
     std::uint64_t etag = 0;   // store generation -> HTTP ETag validator; changes on every (re)store
+    std::int64_t stored_at_ns = 0; // publication time; delayed flush_all compares against its cutoff
+    std::uint32_t last_access = 0; // Unix seconds of the most recent successful fetched access
+    bool fetched = false;          // meta h: fetched at least once since this incarnation was stored
+    bool stale = false;            // meta X: explicitly invalidated but still serveable
+    bool recache_claimed = false;  // meta W/Z: one client currently owns refresh responsibility
     // Immutable disk-file incarnation. Zero means the object is RAM-only. Disk-backed shards use
     // <digest>.g<file_generation>; publishing is one in-memory Index swap, never a sequence of
     // cross-drive renames that can stop halfway.
@@ -109,6 +114,12 @@ public:
 
     bool set_head(const Digest& d, HeadLoc loc);        // metadata only; false if absent
     bool update_expiry(const Digest& d, std::uint32_t expiry); // overwrite the TTL (meta T); false if absent
+    bool mark_fetched(const Digest& d, std::uint32_t now); // meta h/l bookkeeping
+    enum class RecacheClaim { missing, winner, already_claimed };
+    RecacheClaim claim_recache(const Digest& d);
+    enum class MetaMutation { missing, cas_mismatch, stored };
+    MetaMutation mark_stale(const Digest& d, std::uint64_t cas_expected,
+                            std::uint64_t new_cas, std::optional<std::uint32_t> expiry);
     // Replace mirror metadata only if the body incarnation is still `etag`. Used by a 304
     // revalidation so a late origin reply cannot attach headers to a concurrently replaced body.
     bool update_http_if_etag(const Digest& d, std::uint64_t etag,
@@ -126,10 +137,21 @@ public:
     void decay_scores(double decay);
 
     std::size_t size() const; // live object count across shards
+    struct Usage {
+        std::uint64_t items = 0;
+        Size logical_bytes = 0;
+        std::uint64_t head_resident = 0;
+        std::uint64_t headless = 0;
+        Size resident_head_bytes = 0;
+    };
+    Usage usage() const;
+    // Infrequent observability/maintenance snapshot. Avoid on request paths.
+    std::vector<std::pair<Digest, ObjectMeta>> records() const;
     void clear();             // blank slate (startup, ADR-0013)
 
     // Digests of objects whose absolute expiry has passed `now` (TTL reaper, lazy-skip is elsewhere).
     std::vector<Digest> expired_keys(std::uint32_t now) const;
+    std::vector<Digest> keys() const; // maintenance snapshot (flush/TTL reclaim)
 
     // (digest, head) for every RAM-resident object. The compaction pass buckets these by block to
     // slide live heads down and reclaim dead arena space (ADR-0008 Phase 2).
@@ -140,6 +162,9 @@ public:
     std::size_t swap_head_blocks(unsigned first, unsigned second);
 
 private:
+    void account_add(const ObjectMeta&) noexcept;
+    void account_remove(const ObjectMeta&) noexcept;
+    void account_replace(const ObjectMeta&, const ObjectMeta&) noexcept;
     struct Entry {
         explicit Entry(const ObjectMeta& value) : meta(value), score(0.0) {}
         ObjectMeta meta;
@@ -156,6 +181,10 @@ private:
     std::unique_ptr<Shard[]> shards_;
     std::size_t nshards_;
     std::uint64_t mask_;
+    std::atomic<std::uint64_t> item_count_{0};
+    std::atomic<Size> logical_bytes_{0};
+    std::atomic<std::uint64_t> resident_heads_{0};
+    std::atomic<Size> resident_head_bytes_{0};
 };
 
 } // namespace goblin::storage

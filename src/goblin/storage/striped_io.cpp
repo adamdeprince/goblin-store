@@ -7,7 +7,7 @@
 namespace goblin::storage {
 
 Status striped_pwrite(const DrivePool& pool, std::uint64_t key_hash, std::span<const int> fds,
-                      Offset offset, ByteView data, unsigned* failed_drive) {
+                      Offset offset, ByteView data, unsigned* failed_drive, int* failed_errno) {
     const auto segs = pool.plan_reads(key_hash, offset, data.size());
     Size dst = 0;
     for (const auto& s : segs) {
@@ -17,11 +17,21 @@ Status striped_pwrite(const DrivePool& pool, std::uint64_t key_hash, std::span<c
         while (left > 0) {
             const ssize_t w = ::pwrite(fds[s.drive], src, left, static_cast<off_t>(fo));
             if (w < 0 && errno == EINTR) continue;
+            if (w < 0) {
+                if (failed_drive) *failed_drive = s.drive;
+                if (failed_errno) *failed_errno = errno;
+            }
             if (w < 0 && (errno == ENOSPC || errno == EDQUOT)) {
                 if (failed_drive) *failed_drive = s.drive;
                 return err(Errc::out_of_space, "pwrite exhausted backing filesystem capacity");
             }
-            if (w <= 0) return err(Errc::io_error, "pwrite failed");
+            if (w <= 0) {
+                if (w == 0) {
+                    if (failed_drive) *failed_drive = s.drive;
+                    if (failed_errno) *failed_errno = EIO;
+                }
+                return err(Errc::io_error, "pwrite failed");
+            }
             src += w;
             fo += static_cast<Size>(w);
             left -= static_cast<Size>(w);

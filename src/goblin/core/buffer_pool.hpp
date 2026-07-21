@@ -28,10 +28,15 @@ public:
 
     Size capacity() const noexcept { return arena_size_; }
     Size used() const noexcept { return used_; }
+    Size requested() const noexcept { return requested_; }
+    Size fragmented() const noexcept { return used_ - requested_; }
     Size min_block() const noexcept { return min_block_; }
     Size allocation_bytes(Size bytes) const noexcept {
         return bytes == 0 || bytes > arena_size_ ? 0 : block_size(order_for(bytes));
     }
+    // Count maximal, currently coalesced free blocks at an exact buddy size. A larger free block is
+    // not multiplied into its possible descendants; it appears once at its current free-list order.
+    std::size_t free_blocks(Size bytes) const noexcept;
 
 private:
     unsigned order_for(Size bytes) const noexcept;
@@ -41,6 +46,7 @@ private:
     Size min_block_;
     unsigned max_order_;
     Size used_ = 0;
+    Size requested_ = 0;
     std::vector<std::vector<Offset>> free_; // free_[o] = stack of free block offsets at order o
 };
 
@@ -60,6 +66,7 @@ public:
 
     Size capacity() const noexcept { return arena_size_; }
     Size used() const noexcept { return live_; }              // live (still-referenced) bytes
+    Size requested() const noexcept { return requested_; }    // logical bytes in live slots
     Size dead() const noexcept { return frontier_ - live_; }  // reclaimable-by-compaction bytes
     Size frontier() const noexcept { return frontier_; }      // high-water; room left = capacity-frontier
     Size align() const noexcept { return align_; }            // slot granularity; the small-class key
@@ -72,6 +79,7 @@ private:
     Size align_;
     Size frontier_ = 0; // next free offset; never rewinds (compaction drains the whole block instead)
     Size live_ = 0;     // sum of live slot sizes (rounded); block is reclaimable when this hits 0
+    Size requested_ = 0;
 };
 
 // Fixed-head and small-object reservations share one BlockPool (and therefore one block/address
@@ -179,6 +187,7 @@ public:
     std::byte* addr(unsigned block, std::uint32_t offset) const noexcept;
 
     Size block_bytes() const noexcept { return blocks_.block_bytes(); }
+    Size capacity_bytes() const noexcept { return blocks_.block_bytes() * blocks_.num_blocks(); }
     Size free_blocks() const noexcept { return blocks_.free_blocks(); }
     std::size_t region_count() const noexcept { return blocks_.region_count(); }
     unsigned region_first_block(std::size_t region) const noexcept {
@@ -204,6 +213,31 @@ public:
     bool region_uses_hugetlb(std::size_t region) const noexcept {
         return blocks_.region_uses_hugetlb(region);
     }
+
+    struct ClassUsage {
+        BufferPoolClass allocation_class = BufferPoolClass::shared;
+        Size capacity_bytes = 0;
+        Size used_bytes = 0;       // live object bytes requested by callers
+        Size free_bytes = 0;       // immediately allocatable bytes
+        Size fragmented_bytes = 0; // buddy/alignment slack plus dead arena holes
+    };
+    struct MappingUsage {
+        std::size_t region = 0;
+        std::optional<unsigned> numa_node;
+        BufferPoolClass allocation_class = BufferPoolClass::shared;
+        Size bytes = 0;
+        bool hugetlb = false;
+    };
+    struct BuddyFreeBlocks {
+        BufferPoolClass allocation_class = BufferPoolClass::shared;
+        Size block_bytes = 0;
+        std::uint64_t count = 0;
+    };
+    std::vector<ClassUsage> usage() const;
+    std::vector<MappingUsage> mappings() const;
+    // One stable entry per allocation class and power-of-two size from 4 KiB through --block.
+    // Untyped/free backing blocks count as one --block-sized buddy; compact bump arenas do not.
+    std::vector<BuddyFreeBlocks> buddy_free_blocks() const;
 
     // NUMA promotion uses only completely occupied buddy blocks. indexed_bytes lets TierManager
     // prove that every allocation belongs to a published index entry (no in-flight StoreHandle or

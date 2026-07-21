@@ -6,6 +6,8 @@ compile_commands.json
 *.o
 *.tmp
 .DS_Store
+__pycache__/
+/CMakeFiles/
 
 # Generated docs (scripts/build-docs.sh). The hand-built front page and its
 # mascot are committed; Markdown renderings remain build artifacts.

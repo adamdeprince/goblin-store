@@ -597,7 +597,7 @@ private:
         out += url.target;
         out += " HTTP/1.1\r\nHost: ";
         out += url.authority;
-        out += "\r\nUser-Agent: goblin-store/0.0.2\r\nConnection: keep-alive\r\n";
+        out += "\r\nUser-Agent: goblin-store/0.0.3\r\nConnection: keep-alive\r\n";
         for (const auto& header : request.headers) {
             if (request.stale &&
                 (iequals(header.name, "if-none-match") ||
@@ -1366,7 +1366,7 @@ void MirrorService::perform(Task& task) {
     ::curl_easy_setopt(easy, CURLOPT_PROTOCOLS,
                        static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
 #endif
-    ::curl_easy_setopt(easy, CURLOPT_USERAGENT, "goblin-store/0.0.2");
+    ::curl_easy_setopt(easy, CURLOPT_USERAGENT, "goblin-store/0.0.3");
     if (task.request.head_only) ::curl_easy_setopt(easy, CURLOPT_NOBODY, 1L);
 
     const CURLcode result = ::curl_easy_perform(easy);

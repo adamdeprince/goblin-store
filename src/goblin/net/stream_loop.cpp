@@ -25,9 +25,9 @@ constexpr auto rlx = std::memory_order_relaxed;
 StreamLoop::StreamLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm,
                        storage::Index& index, core::IoBufferPool& iobufs, unsigned io_timeout_ms,
                        core::StatsRegistry* reg, WriteMode write_mode,
-                       bool include_http_metadata)
+                       bool include_http_metadata, core::StatsDomain stats_domain)
     : owned_io_(std::make_unique<UringStreamIo>(reactor)), io_(*owned_io_), tm_(tm),
-      index_(index), iobufs_(iobufs), reg_(reg),
+      index_(index), iobufs_(iobufs), stats_(stats_domain), reg_(reg),
       write_mode_(write_mode), include_http_metadata_(include_http_metadata), lfd_(listen_fd),
       io_timeout_ms_(io_timeout_ms),
       last_sweep_(std::chrono::steady_clock::now()) {
@@ -38,9 +38,9 @@ StreamLoop::StreamLoop(core::Reactor& reactor, ConnectionInbox& inbox,
                        storage::TierManager& tm, storage::Index& index,
                        core::IoBufferPool& iobufs, unsigned io_timeout_ms,
                        core::StatsRegistry* reg, WriteMode write_mode,
-                       bool include_http_metadata)
+                       bool include_http_metadata, core::StatsDomain stats_domain)
     : owned_io_(std::make_unique<UringStreamIo>(reactor)), io_(*owned_io_), tm_(tm),
-      index_(index), iobufs_(iobufs), reg_(reg), write_mode_(write_mode),
+      index_(index), iobufs_(iobufs), stats_(stats_domain), reg_(reg), write_mode_(write_mode),
       include_http_metadata_(include_http_metadata), inbox_(&inbox),
       io_timeout_ms_(io_timeout_ms), last_sweep_(std::chrono::steady_clock::now()) {
     if (reg_) reg_->add(&stats_);
@@ -49,8 +49,8 @@ StreamLoop::StreamLoop(core::Reactor& reactor, ConnectionInbox& inbox,
 StreamLoop::StreamLoop(StreamIo& stream_io, int listen_fd, storage::TierManager& tm,
                        storage::Index& index, core::IoBufferPool& iobufs,
                        unsigned io_timeout_ms, core::StatsRegistry* reg, WriteMode write_mode,
-                       bool include_http_metadata)
-    : io_(stream_io), tm_(tm), index_(index), iobufs_(iobufs), reg_(reg),
+                       bool include_http_metadata, core::StatsDomain stats_domain)
+    : io_(stream_io), tm_(tm), index_(index), iobufs_(iobufs), stats_(stats_domain), reg_(reg),
       write_mode_(write_mode), include_http_metadata_(include_http_metadata), lfd_(listen_fd),
       io_timeout_ms_(io_timeout_ms),
       last_sweep_(std::chrono::steady_clock::now()) {
@@ -61,8 +61,8 @@ StreamLoop::StreamLoop(StreamIo& stream_io, ConnectionInbox& inbox,
                        storage::TierManager& tm, storage::Index& index,
                        core::IoBufferPool& iobufs, unsigned io_timeout_ms,
                        core::StatsRegistry* reg, WriteMode write_mode,
-                       bool include_http_metadata)
-    : io_(stream_io), tm_(tm), index_(index), iobufs_(iobufs), reg_(reg),
+                       bool include_http_metadata, core::StatsDomain stats_domain)
+    : io_(stream_io), tm_(tm), index_(index), iobufs_(iobufs), stats_(stats_domain), reg_(reg),
       write_mode_(write_mode), include_http_metadata_(include_http_metadata), inbox_(&inbox),
       io_timeout_ms_(io_timeout_ms), last_sweep_(std::chrono::steady_clock::now()) {
     if (reg_) reg_->add(&stats_);
@@ -88,6 +88,7 @@ void StreamLoop::run() {
         if (fd >= 0) io_.close_fd(fd); // hard-close anything left after the drain / on stop()
         release_lanes(c);
         unpin_if_held(c);
+        release_set_source(c);
         on_destroy(c);
         stats_.curr_conns.fetch_sub(1, rlx);
         if (inbox_) inbox_->release_connection();
@@ -119,6 +120,7 @@ void StreamLoop::run_once() {
     const auto now = std::chrono::steady_clock::now();
     std::array<core::Completion, 256> cqes{};
     const unsigned n = io_.reap(cqes);
+    stats_.uring_cqes.fetch_add(n, rlx);
     for (unsigned i = 0; i < n; ++i) {
         const std::uint64_t ud = cqes[i].user_data;
         const int res = cqes[i].res;
@@ -130,8 +132,16 @@ void StreamLoop::run_once() {
             on_inbox(res);
             continue;
         }
-        auto* c = reinterpret_cast<Conn*>(ud & ~std::uint64_t{7});
         const std::uint64_t op = ud & 7;
+        const Conn::ReadCompletion* read_completion = nullptr;
+        Conn* c = nullptr;
+        if (op == kRead) {
+            read_completion = reinterpret_cast<const Conn::ReadCompletion*>(
+                ud & ~std::uint64_t{7});
+            c = read_completion->connection;
+        } else {
+            c = reinterpret_cast<Conn*>(ud & ~std::uint64_t{7});
+        }
         if (c->inflight) --c->inflight;
         if (res > 0) c->last_progress = now; // bytes moved -> this conn is making progress
         if (op == kRecv)
@@ -139,7 +149,7 @@ void StreamLoop::run_once() {
         else if (op == kSend)
             on_send(c, res);
         else if (op == kRead)
-            on_read(c, res);
+            on_read(c, *read_completion, res);
         else if (op == kPoll)
             on_poll(c, res);
         else if (op == kExternal)
@@ -151,13 +161,16 @@ void StreamLoop::run_once() {
     // read pool is per-loop, so its frees are always local.
     if (!set_waiters_.empty()) drain_set_waiters();
     if (!get_waiters_.empty()) drain_get_waiters();
-    // Periodically drop connections whose in-flight transfer has stalled (slow client) and reclaim
-    // their buffers. Sweep frequency is bounded so it stays cheap with many connections.
-    if (io_timeout_ms_) {
-        const auto interval = std::chrono::milliseconds(std::min(io_timeout_ms_, 250u));
+    // One bounded-frequency pass covers active transfer stalls, idle keepalives, and buffer-wait
+    // deadlines. This keeps timeout work O(connections) at no more than four passes per second.
+    if (io_timeout_ms_ || idle_timeout_ms_ || queue_timeout_ms_) {
+        unsigned shortest = 250;
+        for (const unsigned timeout : {io_timeout_ms_, idle_timeout_ms_, queue_timeout_ms_})
+            if (timeout) shortest = std::min(shortest, timeout);
+        const auto interval = std::chrono::milliseconds(shortest);
         if (now - last_sweep_ >= interval) {
             last_sweep_ = now;
-            sweep_stalled(now);
+            sweep_timeouts(now);
         }
     }
 }
@@ -279,6 +292,7 @@ void StreamLoop::on_recv(Conn* c, int res) {
         close_conn(c);
         return;
     }
+    stats_.bytes_received.fetch_add(static_cast<std::uint64_t>(res), rlx);
     // Keep unparsed bytes contiguous at the front so append stays O(new bytes), not O(buffer).
     if (c->in_off) {
         c->in.erase(0, c->in_off);
@@ -300,6 +314,7 @@ bool StreamLoop::begin_get(Conn* c, std::string_view key, bool record_access, st
 
 bool StreamLoop::begin_get(Conn* c, std::string_view key, const crypto::Digest& digest,
                            bool record_access, std::uint32_t now) {
+    if (c->state != St::get_wait) c->request_started = std::chrono::steady_clock::now();
     c->http_meta.reset();
     auto snap = tm_.open_snapshot(digest, record_access, now, include_http_metadata_);
     if (!snap) {
@@ -327,13 +342,19 @@ bool StreamLoop::begin_get(Conn* c, std::string_view key, const crypto::Digest& 
     }
     const Size head_len = snap->pin.valid ? snap->pin.len : 0;
     if (snap->meta.size > head_len) { // a disk tail remains -> need a read I/O buffer
+        c->get_digest = digest; // retained until tail CQEs finish; required for exact quarantine
         auto buf = iobufs_.acquire();
         if (!buf) { // pool exhausted -> park: drop the snapshot now, re-take it when a buffer frees
             if (snap->pin.valid) tm_.unpin_head(snap->pin);
             stats_.get_backpressure.fetch_add(1, rlx);
             c->get_key.assign(key.data(), key.size());
             c->get_digest = digest; // drain retries without re-hashing
+            if (get_waiters_.size() >= max_get_waiters_) {
+                abort_conn(c, DropReason::queue);
+                return false;
+            }
             c->state = St::get_wait;
+            c->queue_since = std::chrono::steady_clock::now();
             get_waiters_.push_back(c);
             return false;
         }
@@ -358,6 +379,16 @@ bool StreamLoop::begin_get(Conn* c, std::string_view key, const crypto::Digest& 
     // Eviction visited bits outside the snapshot critical section (scores already updated there).
     if (record_access) tm_.touch_policies(digest, snap->meta.size, c->head_pin.valid);
     frame_get_hit(c, key, snap->meta); // protocol header + get_pos/get_size
+
+    // Meta conditional retrieval (`mg ... C<cas> v`) is a hit but intentionally has no body.
+    // The protocol hook frames HD and sets this bit after seeing the snapshot's authoritative CAS.
+    if (c->meta_suppress_value) {
+        release_lanes(c);
+        unpin_if_held(c);
+        c->rs.reset();
+        c->state = St::idle;
+        return true;
+    }
 
     // The protocol hook has now resolved the requested byte range. Start the tail after whichever
     // bytes the pinned resident head will serve; this is derived from the actual head allocation,
@@ -400,17 +431,25 @@ void StreamLoop::drain_set_waiters() {
         Conn* c = set_waiters_.front();
         if (c->closing) { // parked conns have no in-flight op, but stay defensive
             set_waiters_.pop_front();
+            retire(c);
             continue;
         }
-        auto h = tm_.begin_store(c->set_digest, c->set_remaining,
-                                 write_mode_); // set_remaining == full nbytes here
+        auto h = tm_.begin_store(c->set_digest, c->set_store_size, write_mode_,
+                                 c->set_condition);
         if (!h) {
             if (h.error().code == Errc::would_block) return; // still no buffer -> retry next tick
-            c->set_reject = true;                            // real open failure -> reject
+            c->set_reject = true;                            // real open failure -> server error
+            c->set_error = h.error().code;
         } else {
             c->sh.emplace(std::move(*h));
         }
         set_waiters_.pop_front();
+        const auto waited = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - c->queue_since).count());
+        stats_.set_queue_wait.observe(waited);
+        stats_.backpressure.observe(waited);
+        c->queue_since = {};
         c->state = St::set_body;
         process(c); // drive the body already buffered in `in`, then resume recv (or reply if rejected)
     }
@@ -424,19 +463,38 @@ void StreamLoop::drain_get_waiters() {
         Conn* c = get_waiters_.front();
         if (c->closing) {
             get_waiters_.pop_front();
+            retire(c);
             continue;
         }
         get_waiters_.pop_front();
+        const auto waited = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - c->queue_since).count());
+        stats_.get_queue_wait.observe(waited);
+        stats_.backpressure.observe(waited);
+        c->queue_since = {};
         // Reuse the digest stored at park time — no second SHA-256 of get_key.
         if (!begin_get(c, c->get_key, c->get_digest, /*record_access=*/false))
             return; // re-parked -> pool still empty, retry next tick
         if (c->state == St::get_header)
-            start_send(c); // hit -> stream the value (header first)
-        else if (!c->out.empty())
-            start_send(c); // inlined small body already fully framed in `out`
+            start_send(c); // streaming hit -> send the header first
         else
-            process(c); // miss while parked (removed) -> flush + resume
+            // An inline hit or miss may be one member of a classic multi-get. Let the protocol
+            // resume the batch before it flushes `out`; ordinary single-key requests also end up
+            // at process()'s normal send/recv decision.
+            process(c);
     }
+}
+
+bool StreamLoop::park_set_waiter(Conn* c) {
+    if (set_waiters_.size() >= max_set_waiters_) {
+        abort_conn(c, DropReason::queue);
+        return false;
+    }
+    c->state = St::set_wait;
+    c->queue_since = std::chrono::steady_clock::now();
+    set_waiters_.push_back(c);
+    return true;
 }
 
 // Queue the disk tail as soon as the first response send is queued. pump_stream() may fill both
@@ -472,8 +530,12 @@ bool StreamLoop::plan_lane_read(Conn* c, int i) {
         if (rlen < s.len || !is_aligned(rlen, kDeviceBlock)) return false;
     }
     if (plan.nsegs > io_.submission_space()) {
+        stats_.uring_sqe_shortage.fetch_add(1, rlx);
         (void)io_.submit(); // flush already-queued sends/reads, then recheck the now-drained SQ
-        if (plan.nsegs > io_.submission_space()) return false;
+        if (plan.nsegs > io_.submission_space()) {
+            stats_.uring_sqe_shortage.fetch_add(1, rlx);
+            return false;
+        }
     }
 
     L.len = plan.total;
@@ -481,6 +543,10 @@ bool StreamLoop::plan_lane_read(Conn* c, int i) {
     L.reads = 0;
     L.err = false;
     L.ready = false;
+    L.tier_mask = 0;
+    L.read_errno = 0;
+    L.tier_errno = {};
+    L.read_started = std::chrono::steady_clock::now();
     c->plan_pos += L.len;
     c->fill_i = (c->fill_i + 1) % c->n_lanes;
     if (plan.nsegs == 0) { // all-head piece already copied into the buffer -> no disk reads
@@ -488,11 +554,17 @@ bool StreamLoop::plan_lane_read(Conn* c, int i) {
         return true;
     }
     for (const auto& s : plan.segments()) {
+        L.tier_mask |= s.tier == storage::Tier::ssd ? 1u : 2u;
         // O_DIRECT (ADR-0011): read length must be a device-block multiple. Round up into the
         // (page-aligned, io_chunk-sized) buffer and serve only L.len bytes; offsets are already
         // 4 KiB-aligned (pieces start on 4 KiB boundaries, segments at stripe boundaries).
         const Size rlen = std::min<Size>(align_up(s.len, kDeviceBlock), L.buf.size() - s.out_off);
-        if (!io_.submit_read(s.fd, s.file_off, L.buf.subspan(s.out_off, rlen), tag(c, kRead)))
+        auto& completion = L.read_completion[L.reads];
+        // The aligned read may legitimately return fewer padding bytes at EOF. Only the logical
+        // segment is required for the response; anything below s.len is a poisoned short read.
+        completion = {c, s.device, s.len, s.tier};
+        const auto read_tag = reinterpret_cast<std::uint64_t>(&completion) | kRead;
+        if (!io_.submit_read(s.fd, s.file_off, L.buf.subspan(s.out_off, rlen), read_tag))
             return false;
         ++c->inflight;
         ++L.reads;
@@ -535,14 +607,30 @@ void StreamLoop::pump_stream(Conn* c) {
     }
 }
 
-void StreamLoop::on_read(Conn* c, int res) {
+void StreamLoop::on_read(Conn* c, const Conn::ReadCompletion& completion, int res) {
     if (c->read_lane < 0) return; // no read batch tracked (defensive)
     Conn::Lane& L = c->lane[c->read_lane];
-    if (res <= 0) L.err = true;
+    const int completion_errno = res < 0
+        ? -res
+        : (static_cast<Size>(res) >= completion.expected ? 0 : EIO);
+    tm_.note_device_read(completion.device, completion_errno);
+    if (completion_errno != 0) {
+        L.err = true;
+        if (L.read_errno == 0) L.read_errno = completion_errno;
+        const std::size_t tier_index = completion.tier == storage::Tier::ssd ? 0 : 1;
+        if (L.tier_errno[tier_index] == 0) L.tier_errno[tier_index] = completion_errno;
+    }
     if (L.reads) --L.reads;
     if (L.reads != 0) return; // more segments of this piece still outstanding
     const int done = c->read_lane;
     c->read_lane = -1;
+    const auto elapsed = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - L.read_started).count());
+    if (L.tier_mask & 1u) tm_.note_disk_read(storage::Tier::ssd, elapsed, L.tier_errno[0]);
+    if (L.tier_mask & 2u) tm_.note_disk_read(storage::Tier::hdd, elapsed, L.tier_errno[1]);
+    if (L.err && c->rs)
+        (void)tm_.quarantine_object(c->get_digest, c->rs->generation());
     if (c->closing) return; // already aborting; just drain
     if (c->lane[done].err) {
         abort_get(c);
@@ -580,6 +668,13 @@ void StreamLoop::start_send_head(Conn* c) {
 
 void StreamLoop::on_send(Conn* c, int res) {
     if (res > 0) stats_.bytes_served.fetch_add(static_cast<std::uint64_t>(res), rlx);
+    if (res > 0 && c->request_started != std::chrono::steady_clock::time_point{}) {
+        const auto elapsed = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - c->request_started).count());
+        stats_.ttfb.observe(elapsed);
+        c->request_started = {};
+    }
     if (on_custom_send(c, res)) return;
     if (res < 0) {
         if (res == -EAGAIN || res == -EWOULDBLOCK) { // non-blocking fd (kTLS/HTTPS): buffer full -> retry
@@ -710,6 +805,14 @@ void StreamLoop::unpin_if_held(Conn* c) {
     }
 }
 
+void StreamLoop::release_set_source(Conn* c) {
+    if (c->set_source && c->set_source->pin.valid) {
+        tm_.unpin_head(c->set_source->pin);
+        c->set_source->pin.valid = false;
+    }
+    c->set_source.reset();
+}
+
 void StreamLoop::finish_get(Conn* c) {
     release_lanes(c);
     unpin_if_held(c);
@@ -735,6 +838,7 @@ void StreamLoop::retire(Conn* c) {
     if (c->closing && c->inflight == 0) {
         release_lanes(c);  // in case we closed mid-GET (frees any held read buffers)
         unpin_if_held(c);  // release the head pin if a send was interrupted
+        release_set_source(c); // append/prepend may hold an immutable source snapshot
         on_destroy(c);     // free any per-conn TLS state before the Conn goes away
         stats_.curr_conns.fetch_sub(1, rlx);
         if (inbox_) inbox_->release_connection();
@@ -755,25 +859,49 @@ void StreamLoop::reject_queued_connections() {
 // completes any pending io_uring send/recv on the socket with an error -- so the in-flight op drains
 // and retire() reclaims the buffer. A graceful FIN could leave a send parked indefinitely on a
 // dead-but-open peer (exactly the slow-client case we're reclaiming from).
-void StreamLoop::abort_conn(Conn* c) {
+void StreamLoop::abort_conn(Conn* c, DropReason reason) {
     if (c->closing) return;
-    stats_.slow_drops.fetch_add(1, rlx);
+    switch (reason) {
+        case DropReason::stalled: stats_.slow_drops.fetch_add(1, rlx); break;
+        case DropReason::idle: stats_.idle_drops.fetch_add(1, rlx); break;
+        case DropReason::queue: stats_.queue_drops.fetch_add(1, rlx); break;
+    }
     const linger lo{1, 0};
-    if (c->fd >= 0) ::setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &lo, sizeof lo);
+    if (c->fd >= 0) {
+        ::setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &lo, sizeof lo);
+        // close(2) alone does not reliably cancel a recv already owned by io_uring's file
+        // reference. shutdown wakes that operation, allowing an idle connection to retire now.
+        ::shutdown(c->fd, SHUT_RDWR);
+    }
     close_conn(c);
 }
 
-// Drop connections whose in-flight transfer has gone idle past io_timeout_ms_ while holding a scarce
-// buffer: a slow reader pinning a read buffer / head, or a slow writer pinning a staging buffer
-// (ADR-0011). We sweep only resource-holders -- an idle keepalive conn between requests holds nothing
-// and is left alone. Reclaiming an active slow reader's buffer also unblocks any parked GETs behind it.
-void StreamLoop::sweep_stalled(std::chrono::steady_clock::time_point now) {
-    const auto deadline = std::chrono::milliseconds(io_timeout_ms_);
+// Enforce three independent deadlines. Active transfer stalls protect scarce buffers; the idle
+// deadline bounds the 16 KiB per-connection receive allocation; queue deadlines ensure a parked
+// request cannot consume a connection slot forever without an in-flight operation.
+void StreamLoop::sweep_timeouts(std::chrono::steady_clock::time_point now) {
     for (auto& [c, up] : conns_) {
         if (c->closing) continue;
+        if (queue_timeout_ms_ && (c->state == St::get_wait || c->state == St::set_wait) &&
+            now - c->queue_since >= std::chrono::milliseconds(queue_timeout_ms_)) {
+            const auto waited = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now - c->queue_since).count());
+            if (c->state == St::get_wait) stats_.get_queue_wait.observe(waited);
+            else stats_.set_queue_wait.observe(waited);
+            stats_.backpressure.observe(waited);
+            abort_conn(c, DropReason::queue);
+            continue;
+        }
+        if (idle_timeout_ms_ && c->state == St::idle && c->out.empty() &&
+            now - c->last_progress >= std::chrono::milliseconds(idle_timeout_ms_)) {
+            abort_conn(c, DropReason::idle);
+            continue;
+        }
         const bool holds_buffer = c->n_lanes > 0 || c->head_pin.valid || c->sh.has_value() ||
                                   c->state == St::mirror_body;
-        if (holds_buffer && now - c->last_progress >= deadline) abort_conn(c);
+        if (io_timeout_ms_ && holds_buffer &&
+            now - c->last_progress >= std::chrono::milliseconds(io_timeout_ms_))
+            abort_conn(c, DropReason::stalled);
     }
 }
 

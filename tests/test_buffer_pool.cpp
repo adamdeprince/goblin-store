@@ -31,6 +31,58 @@ TEST("buddy: rounds up to a power of two") {
     BuddyAllocator b(64 * KiB, 4 * KiB);
     CHECK(b.allocate(5 * KiB).has_value());
     CHECK_EQ(b.used(), Size(8 * KiB)); // 5 KiB -> 8 KiB block
+    CHECK_EQ(b.requested(), Size(5 * KiB));
+    CHECK_EQ(b.fragmented(), Size(3 * KiB));
+}
+
+TEST("buddy: free-list counts expose coalesced blocks at every order") {
+    BuddyAllocator b(64 * KiB, 4 * KiB);
+    CHECK_EQ(b.free_blocks(64 * KiB), std::size_t(1));
+    CHECK_EQ(b.free_blocks(4 * KiB), std::size_t(0));
+    const auto allocated = b.allocate(5 * KiB); // consumes 8 KiB and splits the larger orders
+    CHECK(allocated.has_value());
+    CHECK_EQ(b.free_blocks(4 * KiB), std::size_t(0));
+    CHECK_EQ(b.free_blocks(8 * KiB), std::size_t(1));
+    CHECK_EQ(b.free_blocks(16 * KiB), std::size_t(1));
+    CHECK_EQ(b.free_blocks(32 * KiB), std::size_t(1));
+    CHECK_EQ(b.free_blocks(64 * KiB), std::size_t(0));
+    b.deallocate(*allocated, 5 * KiB);
+    CHECK_EQ(b.free_blocks(64 * KiB), std::size_t(1));
+}
+
+TEST("buffer_pool: usage separates live, immediately free, and fragmented bytes") {
+    auto pool = BufferPool::create(64 * KiB, 64 * KiB, 4 * KiB, false, false);
+    CHECK(pool.has_value());
+    if (!pool) return;
+    const auto region = pool->allocate(5 * KiB, 4 * KiB);
+    CHECK(region.has_value());
+    const auto usage = pool->usage();
+    CHECK_EQ(usage.size(), std::size_t(1));
+    CHECK_EQ(usage[0].used_bytes, Size(5 * KiB));
+    CHECK_EQ(usage[0].fragmented_bytes, Size(3 * KiB));
+    CHECK_EQ(usage[0].free_bytes, Size(56 * KiB));
+    CHECK_EQ(usage[0].used_bytes + usage[0].fragmented_bytes + usage[0].free_bytes,
+             usage[0].capacity_bytes);
+}
+
+TEST("buffer_pool: buddy histogram includes active free lists and untouched blocks") {
+    auto pool = BufferPool::create(128 * KiB, 64 * KiB, 4 * KiB, false, false);
+    CHECK(pool.has_value());
+    if (!pool) return;
+    CHECK(pool->allocate(5 * KiB, 4 * KiB).has_value());
+    const auto free = pool->buddy_free_blocks();
+    const auto count = [&free](Size bytes) {
+        const auto found = std::find_if(free.begin(), free.end(), [bytes](const auto& value) {
+            return value.allocation_class == BufferPoolClass::shared &&
+                   value.block_bytes == bytes;
+        });
+        return found == free.end() ? std::uint64_t(0) : found->count;
+    };
+    CHECK_EQ(count(4 * KiB), std::uint64_t(0));
+    CHECK_EQ(count(8 * KiB), std::uint64_t(1));
+    CHECK_EQ(count(16 * KiB), std::uint64_t(1));
+    CHECK_EQ(count(32 * KiB), std::uint64_t(1));
+    CHECK_EQ(count(64 * KiB), std::uint64_t(1)); // the second backing block is still untouched
 }
 
 TEST("buddy: free coalesces buddies back to the whole arena") {

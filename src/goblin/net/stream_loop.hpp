@@ -27,6 +27,7 @@
 #include <string_view>
 #include <sys/socket.h> // iovec, msghdr, MSG_MORE
 #include <unordered_map>
+#include <vector>
 
 namespace goblin::net {
 
@@ -35,22 +36,26 @@ public:
     StreamLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm, storage::Index& index,
                core::IoBufferPool& iobufs, unsigned io_timeout_ms = 0,
                core::StatsRegistry* reg = nullptr, WriteMode write_mode = WriteMode::evict,
-               bool include_http_metadata = false);
+               bool include_http_metadata = false,
+               core::StatsDomain stats_domain = core::StatsDomain::memcache_tcp);
     StreamLoop(core::Reactor& reactor, ConnectionInbox& inbox, storage::TierManager& tm,
                storage::Index& index, core::IoBufferPool& iobufs,
                unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr,
                WriteMode write_mode = WriteMode::evict,
-               bool include_http_metadata = false);
+               bool include_http_metadata = false,
+               core::StatsDomain stats_domain = core::StatsDomain::memcache_tcp);
     StreamLoop(StreamIo& stream_io, int listen_fd, storage::TierManager& tm,
                storage::Index& index, core::IoBufferPool& iobufs,
                unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr,
                WriteMode write_mode = WriteMode::evict,
-               bool include_http_metadata = false);
+               bool include_http_metadata = false,
+               core::StatsDomain stats_domain = core::StatsDomain::memcache_tcp);
     StreamLoop(StreamIo& stream_io, ConnectionInbox& inbox, storage::TierManager& tm,
                storage::Index& index, core::IoBufferPool& iobufs,
                unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr,
                WriteMode write_mode = WriteMode::evict,
-               bool include_http_metadata = false);
+               bool include_http_metadata = false,
+               core::StatsDomain stats_domain = core::StatsDomain::memcache_tcp);
     virtual ~StreamLoop();
 
     void run();           // arm accept, then loop until stop()
@@ -58,6 +63,14 @@ public:
     void stop() noexcept; // ask run() to exit (thread-safe)
     std::size_t live_conns() const noexcept { return conns_.size(); }
     void set_read_ahead(bool on) noexcept { read_ahead_ = on; } // double-buffered GET pipeline (A/B knob)
+    void set_overload_limits(unsigned idle_timeout_ms, unsigned queue_timeout_ms,
+                             std::size_t max_get_waiters,
+                             std::size_t max_set_waiters) noexcept {
+        idle_timeout_ms_ = idle_timeout_ms;
+        queue_timeout_ms_ = queue_timeout_ms;
+        max_get_waiters_ = max_get_waiters;
+        max_set_waiters_ = max_set_waiters;
+    }
     void set_shutdown(const std::atomic<bool>* flag, unsigned grace_ms) noexcept {
         shutdown_ = flag; // observed in run(): once set, stop accepting, drain in-flight, then return
         shutdown_grace_ms_ = grace_ms;
@@ -65,7 +78,7 @@ public:
 
 protected:
     enum class St {
-        idle, set_body, set_wait, get_wait, get_header, get_send_head, get_stream, get_trailer,
+        idle, auth_body, set_body, set_wait, get_wait, get_header, get_send_head, get_stream, get_trailer,
         mirror_wait, mirror_header, mirror_body
     };
 
@@ -74,8 +87,12 @@ protected:
         unsigned inflight = 0;   // outstanding SQEs referencing this Conn
         bool closing = false;    // freed once inflight hits 0
         bool quit_after = false; // close once the pending response is sent (memcache quit / HTTP no-keep-alive)
+        bool authenticated = false; // memcache only; ignored when no Authenticator is installed
+        std::size_t auth_remaining = 0;
         St state = St::idle;
         std::chrono::steady_clock::time_point last_progress{}; // last completion that moved bytes (stall timeout)
+        std::chrono::steady_clock::time_point queue_since{}; // entered get_wait/set_wait
+        std::chrono::steady_clock::time_point request_started{}; // GET parsed -> first send CQE
         std::array<std::byte, 16 * 1024> rbuf;
         std::string in;           // accumulated unparsed request bytes
         std::size_t in_off = 0;   // consume cursor into `in` (avoids front-erase memmove until compact)
@@ -92,14 +109,26 @@ protected:
         // GET streaming state:
         std::string get_key;        // final key, retained only for backpressure or async mirror fill
         crypto::Digest get_digest{}; // hashed key for retry/fill resume (avoid a second SHA-256)
+        // Classic memcache multi-get state. Empty/inactive for single-key GETs, preserving their
+        // allocation-free parse/dispatch path. Values are streamed one at a time in request order.
+        std::vector<std::string> get_batch_keys;
+        std::size_t get_batch_next = 0;
+        bool get_batch_active = false;
+        std::optional<std::uint32_t> get_batch_expiry; // gat/gats touch applied before each lookup
         std::optional<ByteRange> req_range; // requested sub-range (HTTP Range), resolved in frame_get_hit
         std::string inm;            // HTTP If-None-Match (conditional GET), used in frame_get_hit; empty=absent
         bool get_with_cas = false;  // memcache `gets`: emit the CAS in the VALUE header
         bool meta = false;            // meta `mg` with value: VA framing (frame_get_hit/miss/on_value_sent)
-        std::uint8_t meta_rflags = 0; // meta return-flags bitmask (f=1 s=2 t=4 c=8 k=16)
         bool meta_quiet = false;      // meta q: suppress EN miss (mg) / HD success (ms)
         std::string meta_opaque;      // meta O<token> to echo (copied; `in` is erased before the stream)
         std::string meta_key;         // meta `ms` key, for k-echo on the HD reply (copied)
+        std::string meta_return_order; // requested response flags in request order
+        bool meta_binary_key = false; // include `b` alongside a requested key echo
+        bool meta_winner = false;     // W: this client owns recache/fill
+        bool meta_recache = false;    // N/R/X requested a fill claim; emit W or Z
+        bool meta_stale = false;      // X: item was explicitly invalidated
+        bool meta_suppress_value = false; // mg C matched: return HD rather than the value
+        std::uint64_t meta_conditional_cas = 0;
         std::uint32_t meta_expiry = 0; // meta `ms` absolute expiry (T converted at parse; 0 = never)
         std::optional<storage::TierManager::ReadStream> rs; // open object files for this GET
         Size get_size = 0;          // last byte to stream (exclusive)
@@ -107,6 +136,13 @@ protected:
         storage::TierManager::HeadPin head_pin; // pinned RAM head for the zero-copy send (ADR-0018)
         std::size_t head_sent = 0;              // partial-send progress into the head
         std::shared_ptr<const storage::HttpCacheMetadata> http_meta; // --mirror only
+
+        struct alignas(8) ReadCompletion {
+            Conn* connection = nullptr;
+            std::uint64_t device = 0;
+            Size expected = 0;
+            storage::Tier tier = storage::Tier::ram;
+        };
 
         // Disk-tail streaming with double-buffered read-ahead (ADR-0011): up to 2 lanes. Lane 0's
         // buffer is mandatory; lane 1 is acquired opportunistically to pipeline -- read piece N+1 while
@@ -121,6 +157,11 @@ protected:
             unsigned reads = 0;      // disk reads still outstanding for this piece
             bool err = false;        // a read failed
             bool ready = false;      // piece fully read (or all-head): awaiting its turn to send
+            unsigned tier_mask = 0;  // bit 0 SSD, bit 1 HDD for the in-flight batch
+            int read_errno = 0;
+            std::array<int, 2> tier_errno{};
+            std::array<ReadCompletion, storage::TierManager::ReadStream::kMaxSegs> read_completion;
+            std::chrono::steady_clock::time_point read_started{};
         };
         std::array<Lane, 2> lane;
         int n_lanes = 0;            // read buffers held (1 = serial, 2 = pipelined)
@@ -135,13 +176,21 @@ protected:
         std::optional<storage::TierManager::StoreHandle> sh; // open writer for this body
         crypto::Digest set_digest{}; // key digest; kept to retry begin_store while parked (set_wait)
         Size set_remaining = 0;     // body bytes still to receive (== full nbytes while parked)
+        Size set_store_size = 0;    // destination size (old + fragment for append/prepend)
+        char set_mode = 'S';        // S normal, A append, P prepend
+        std::optional<storage::TierManager::Snapshot> set_source; // immutable old generation
+        bool set_source_copied = false;
         std::uint32_t set_flags = 0;
-        std::uint32_t set_exptime = 0; // raw memcache exptime; -> absolute expiry at commit time
+        std::int64_t set_exptime = 0; // raw memcache exptime; negative means immediate expiration
         std::uint64_t set_cas = 0;     // cas store: required current CAS (0 = not a cas store)
-        std::string_view set_reply;    // reply to send on set_reject: NOT_STORED / NOT_FOUND / EXISTS
+        storage::StoreCondition set_condition = storage::StoreCondition::unconditional;
+        core::CommandKind set_command = core::CommandKind::set;
+        std::string_view set_reply;    // condition/admission/write failure reply (static protocol text)
         bool set_noreply = false;
         bool set_reject = false; // admission failed -> drain the body, then reject
         bool set_failed = false; // a disk write failed -> don't commit
+        Errc set_error = Errc::ok; // actual storage/open/write error; protocol subclass maps reply
+        storage::TierManager::CommitMetadata set_metadata{false, false};
     };
 
     // ---- the four protocol seams ----
@@ -172,6 +221,9 @@ protected:
     void start_send(Conn*);                         // (re)send the pending `out` (may coalesce with head)
     void close_conn(Conn*);
     void finish_get(Conn*); // GET fully served -> release buffers, resume parsing
+    void release_set_source(Conn*); // release append/prepend snapshot pin and fds
+    // Returns false after shedding the connection when the bounded SET waiter queue is full.
+    bool park_set_waiter(Conn*);
 
     // Input-buffer helpers: `in_off` is a consume cursor so pipelined leftovers aren't memmoved
     // on every request. Compact when waste grows large or the buffer is fully consumed.
@@ -219,7 +271,7 @@ private:
     void reject_queued_connections();
     void on_recv(Conn*, int res);
     void on_send(Conn*, int res);
-    void on_read(Conn*, int res);
+    void on_read(Conn*, const Conn::ReadCompletion&, int res);
     void start_send_head(Conn*);  // send the pinned head region zero-copy (partial-aware)
     void start_lane_send(Conn*);  // (re)send the current lane's piece (partial-aware)
     void prime_tail_read(Conn*);  // initial response queued -> start disk I/O behind the head
@@ -229,8 +281,9 @@ private:
     void abort_get(Conn*);        // error mid-GET -> release buffers, close
     void drain_set_waiters();     // retry parked writes once a staging buffer may be free
     void drain_get_waiters();     // retry parked GETs once a read I/O buffer may be free
-    void sweep_stalled(std::chrono::steady_clock::time_point now); // drop buffer-holding conns gone idle
-    void abort_conn(Conn*);       // abortive close (RST) so a stalled conn's pending op completes
+    void sweep_timeouts(std::chrono::steady_clock::time_point now);
+    enum class DropReason { stalled, idle, queue };
+    void abort_conn(Conn*, DropReason); // abortive close (RST), with reason-specific accounting
     void drain();                 // graceful shutdown: finish in-flight transfers, drop idle conns
     void unpin_if_held(Conn*);
     void release_lanes(Conn*); // release all held read buffers + reset lane state
@@ -239,6 +292,10 @@ private:
     int lfd_ = -1;
     ConnectionInbox* inbox_ = nullptr;
     unsigned io_timeout_ms_; // drop a stalled in-flight transfer after this many ms (0 = off, ADR-0011)
+    unsigned idle_timeout_ms_ = 0;  // expire idle keepalives (0 = off)
+    unsigned queue_timeout_ms_ = 0; // bound get_wait/set_wait residence (0 = off)
+    std::size_t max_get_waiters_ = 64;
+    std::size_t max_set_waiters_ = 64;
     std::chrono::steady_clock::time_point last_sweep_{}; // last stall sweep, to bound sweep frequency
     std::atomic<bool> stop_{false};
     const std::atomic<bool>* shutdown_ = nullptr; // external SIGTERM flag; null = run until stop()

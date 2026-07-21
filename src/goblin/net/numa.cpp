@@ -334,6 +334,9 @@ Result<unsigned> select_numa_node(std::optional<unsigned> requested,
 
     // A one-node machine has no placement ambiguity, even when a virtual NIC has no device locality.
     if (online_nodes.size() == 1) return online_nodes.front();
+    // Loopback/Unix-only deployments have no PCI device whose locality can guide us. Pick the
+    // first online node deterministically; an operator can still override this with --numa.
+    if (interfaces.empty()) return online_nodes.front();
 
     std::set<unsigned> nic_nodes;
     bool unknown = false;
@@ -430,7 +433,19 @@ Result<NumaBinding> configure_numa(std::optional<unsigned> requested, bool perve
         if (!discovered) return std::unexpected(discovered.error());
         interfaces = std::move(*discovered);
     }
-    auto node = select_numa_node(requested, interfaces, *online);
+    std::optional<unsigned> selection = requested;
+    if (!selection && interfaces.empty() && online->size() > 1) {
+        // A loopback/Unix-only listener has no PCI locality. Prefer the first online node that the
+        // caller's inherited taskset/cgroup actually permits, rather than blindly choosing node 0.
+        for (const unsigned candidate : *online) {
+            auto candidate_cpus = numa_node_cpus(candidate, *allowed);
+            if (candidate_cpus && !candidate_cpus->empty()) {
+                selection = candidate;
+                break;
+            }
+        }
+    }
+    auto node = select_numa_node(selection, interfaces, *online);
     if (!node) return std::unexpected(node.error());
     unsigned preferred_memory_node = *node;
     std::optional<unsigned> preferred_memory_distance;

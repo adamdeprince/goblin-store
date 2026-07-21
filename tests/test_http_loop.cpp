@@ -244,6 +244,52 @@ TEST("http loop: GET streams the body; HEAD is headers-only; a miss is 404") {
     CHECK(miss_ok);
 }
 
+TEST("http loop: reserved readiness endpoint reflects storage health") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("ready");
+    Index index;
+    auto tm = open_tm(base, index);
+    auto io = IoBufferPool::create(128 * KiB, 2, false);
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+    auto health = tm->storage_health_snapshot();
+    CHECK(!health.devices.empty());
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    KeyOptions opt;
+    HttpLoop loop(*rc, lfd, *tm, index, *io, opt, 0);
+    std::thread th([&] { loop.run(); });
+
+    bool healthy = false;
+    if (const int c = client_connect(port); c >= 0) {
+        const auto response = http_req(
+            c, "GET /__goblin/ready HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+        healthy = response && response->status == 200 &&
+                  response->body.find("\"ready\":true") != std::string::npos;
+        ::close(c);
+    }
+    if (!health.devices.empty()) tm->note_device_write(health.devices.front().device, EIO);
+    bool unavailable = false;
+    if (const int c = client_connect(port); c >= 0) {
+        const auto response = http_req(
+            c, "GET /__goblin/ready HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+        unavailable = response && response->status == 503 &&
+                      response->body.find("\"state\":\"read_only\"") != std::string::npos;
+        ::close(c);
+    }
+
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(healthy);
+    CHECK(unavailable);
+}
+
 TEST("http loop: Content-Type comes from the extension (GET, HEAD, and ranged)") {
     if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
     auto rc = Reactor::create();

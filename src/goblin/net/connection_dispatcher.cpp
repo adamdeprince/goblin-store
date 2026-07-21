@@ -1,5 +1,6 @@
 #include "goblin/net/connection_dispatcher.hpp"
 
+#include "goblin/core/stats.hpp"
 #include "goblin/net/stream_io.hpp"
 
 #include <algorithm>
@@ -20,6 +21,25 @@
 #endif
 
 namespace goblin::net {
+
+bool ConnectionBudget::try_acquire() noexcept {
+    std::uint64_t current = current_.load(std::memory_order_relaxed);
+    while (current < maximum_) {
+        if (current_.compare_exchange_weak(current, current + 1,
+                                           std::memory_order_acquire,
+                                           std::memory_order_relaxed))
+            return true;
+    }
+    return false;
+}
+
+void ConnectionBudget::release() noexcept {
+    std::uint64_t current = current_.load(std::memory_order_relaxed);
+    while (current != 0 &&
+           !current_.compare_exchange_weak(current, current - 1,
+                                           std::memory_order_release,
+                                           std::memory_order_relaxed)) {}
+}
 
 ConnectionRouter::ConnectionRouter(std::vector<int> worker_cpus)
     : worker_cpus_(std::move(worker_cpus)) {}
@@ -63,20 +83,25 @@ ConnectionRoute ConnectionRouter::choose(std::span<const std::uint64_t> loads,
 }
 
 ConnectionInbox::ConnectionInbox(std::size_t worker_id, int worker_cpu,
-                                 int notification_fd) noexcept
-    : worker_id_(worker_id), worker_cpu_(worker_cpu), notification_fd_(notification_fd) {}
+                                 int notification_fd,
+                                 std::shared_ptr<ConnectionBudget> connection_budget) noexcept
+    : worker_id_(worker_id), worker_cpu_(worker_cpu), notification_fd_(notification_fd),
+      connection_budget_(std::move(connection_budget)) {}
 
 Result<std::unique_ptr<ConnectionInbox>> ConnectionInbox::create(std::size_t worker_id,
-                                                                 int worker_cpu) {
+                                                                 int worker_cpu,
+                                                                 std::shared_ptr<ConnectionBudget> budget) {
 #if defined(__linux__)
     const int fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (fd < 0)
         return err(Errc::io_error,
                    std::string("connection-dispatch eventfd: ") + std::strerror(errno));
-    return std::unique_ptr<ConnectionInbox>(new ConnectionInbox(worker_id, worker_cpu, fd));
+    return std::unique_ptr<ConnectionInbox>(
+        new ConnectionInbox(worker_id, worker_cpu, fd, std::move(budget)));
 #else
     (void)worker_id;
     (void)worker_cpu;
+    (void)budget;
     return err(Errc::unsupported, "connection dispatch is supported only on Linux");
 #endif
 }
@@ -124,6 +149,7 @@ void ConnectionInbox::release_connection() noexcept {
     while (current != 0 &&
            !current_connections_.compare_exchange_weak(current, current - 1,
                                                        std::memory_order_relaxed)) {}
+    if (current != 0 && connection_budget_) connection_budget_->release();
 }
 
 void ConnectionInbox::discard_connections() noexcept {
@@ -136,14 +162,19 @@ void ConnectionInbox::discard_connections() noexcept {
 
 ConnectionDispatcher::ConnectionDispatcher(int listener_fd, std::vector<int> worker_cpus,
                                            std::string label,
-                                           bool require_exasock_connections)
+                                           bool require_exasock_connections,
+                                           std::shared_ptr<ConnectionBudget> connection_budget,
+                                           core::StatsRegistry* stats,
+                                           core::StatsDomain stats_domain)
     : listener_fd_(listener_fd), label_(std::move(label)),
       require_exasock_connections_(require_exasock_connections),
+      connection_budget_(std::move(connection_budget)), stats_(stats), stats_domain_(stats_domain),
       router_(std::move(worker_cpus)) {}
 
 Result<std::unique_ptr<ConnectionDispatcher>> ConnectionDispatcher::create(
     int listener_fd, std::vector<int> worker_cpus, std::string label,
-    bool require_exasock_connections) {
+    bool require_exasock_connections, std::shared_ptr<ConnectionBudget> connection_budget,
+    core::StatsRegistry* stats, core::StatsDomain stats_domain) {
     if (listener_fd < 0)
         return err(Errc::invalid_argument, "connection dispatcher listener is invalid");
     if (worker_cpus.empty()) {
@@ -152,10 +183,11 @@ Result<std::unique_ptr<ConnectionDispatcher>> ConnectionDispatcher::create(
     }
 
     auto dispatcher = std::unique_ptr<ConnectionDispatcher>(new ConnectionDispatcher(
-        listener_fd, worker_cpus, std::move(label), require_exasock_connections));
+        listener_fd, worker_cpus, std::move(label), require_exasock_connections,
+        connection_budget, stats, stats_domain));
     dispatcher->inboxes_.reserve(worker_cpus.size());
     for (std::size_t worker = 0; worker < worker_cpus.size(); ++worker) {
-        auto inbox = ConnectionInbox::create(worker, worker_cpus[worker]);
+        auto inbox = ConnectionInbox::create(worker, worker_cpus[worker], connection_budget);
         if (!inbox) return std::unexpected(inbox.error());
         dispatcher->inboxes_.push_back(std::move(*inbox));
     }
@@ -232,6 +264,18 @@ bool ConnectionDispatcher::dispatch(int fd) noexcept {
 void ConnectionDispatcher::run(std::atomic<bool>& shutdown) noexcept {
 #if defined(__linux__)
     while (!shutdown.load(std::memory_order_relaxed)) {
+        // Leave established sockets in the kernel's bounded listen queue while the application
+        // connection budget is full. The first accepted socket that loses an admission race is
+        // rejected explicitly; subsequent accepts pause until a worker retires a connection.
+        if (connection_budget_ && connection_budget_->full()) {
+            if (!listener_paused_) {
+                listener_paused_ = true;
+                if (stats_) stats_->note_listener_disabled(stats_domain_);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        listener_paused_ = false;
         pollfd descriptor{listener_fd_, POLLIN, 0};
         const int ready = ::poll(&descriptor, 1, 200);
         if (ready < 0) {
@@ -252,12 +296,32 @@ void ConnectionDispatcher::run(std::atomic<bool>& shutdown) noexcept {
         while (!shutdown.load(std::memory_order_relaxed)) {
             const int fd = ::accept(listener_fd_, nullptr, nullptr);
             if (fd >= 0) {
-                if (!dispatch(fd)) ::close(fd);
+                if (connection_budget_ && !connection_budget_->try_acquire()) {
+                    if (stats_) {
+                        stats_->note_connection_rejected(stats_domain_,
+                            core::ConnectionRejectReason::limit);
+                        if (!listener_paused_) stats_->note_listener_disabled(stats_domain_);
+                    }
+                    listener_paused_ = true;
+                    ::close(fd);
+                    break;
+                }
+                if (!dispatch(fd)) {
+                    if (connection_budget_) connection_budget_->release();
+                    if (stats_) stats_->note_connection_rejected(
+                        stats_domain_, core::ConnectionRejectReason::dispatch_queue);
+                    ::close(fd);
+                }
                 continue;
             }
             if (errno == EINTR || errno == ECONNABORTED) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                if (stats_) {
+                    stats_->note_listener_disabled(stats_domain_);
+                    stats_->note_connection_rejected(stats_domain_,
+                        core::ConnectionRejectReason::resource);
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 break;
             }
@@ -274,12 +338,16 @@ void ConnectionDispatcher::run(std::atomic<bool>& shutdown) noexcept {
 
 void ConnectionDispatcher::report() const noexcept {
     std::fprintf(stderr,
-                 "%s dispatch summary: workers=%zu cpu_local=%llu napi_local=%llu\n",
+                 "%s dispatch summary: workers=%zu cpu_local=%llu napi_local=%llu connections=%llu/%llu\n",
                  label_.c_str(), inboxes_.size(),
                  static_cast<unsigned long long>(
                      cpu_local_assignments_.load(std::memory_order_relaxed)),
                  static_cast<unsigned long long>(
-                     napi_local_assignments_.load(std::memory_order_relaxed)));
+                     napi_local_assignments_.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(
+                     connection_budget_ ? connection_budget_->current() : 0),
+                 static_cast<unsigned long long>(
+                     connection_budget_ ? connection_budget_->maximum() : 0));
     for (const auto& inbox : inboxes_)
         std::fprintf(stderr, "%s dispatch worker=%zu cpu=%d accepted=%llu current=%llu\n",
                      label_.c_str(), inbox->worker_id(), inbox->worker_cpu(),

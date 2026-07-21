@@ -28,15 +28,17 @@ constexpr bool available() noexcept { return GOBLIN_HAVE_TLS; }
 #if GOBLIN_HAVE_TLS
 class Context {
 public:
+    enum class SniPolicy { strict, optional };
     struct CertKey {
         std::string cert_path; // PEM certificate chain
         std::string key_path;  // PEM private key
     };
 
-    // Build from one-or-more cert/key pairs. The first is the default (used to start every handshake
-    // and for an unrecognized SNI); each cert's DNS SAN names (and CN) route their hostname to it.
+    // Build from one-or-more cert/key pairs. Strict mode requires a recognized SNI and selects its
+    // SAN/CN certificate; optional mode accepts absent SNI and uses the first certificate.
     // TLS 1.3 only, kTLS enabled. Move-only.
-    static Result<Context> create(const std::vector<CertKey>& certs);
+    static Result<Context> create(const std::vector<CertKey>& certs,
+                                  SniPolicy policy = SniPolicy::strict);
 
     // Start a handshake here: SSL_new(default_ctx()); the internal SNI callback swaps the per-host cert.
     SSL_CTX* default_ctx() const noexcept { return default_; }

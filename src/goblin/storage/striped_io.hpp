@@ -16,7 +16,8 @@ namespace goblin::storage {
 // Used to lay objects down (bootstrap / --source loader); the async write path layers on later.
 // `fds[i]` is an open, writable fd for drive i's per-object file.
 Status striped_pwrite(const DrivePool& pool, std::uint64_t key_hash, std::span<const int> fds,
-                      Offset offset, ByteView data, unsigned* failed_drive = nullptr);
+                      Offset offset, ByteView data, unsigned* failed_drive = nullptr,
+                      int* failed_errno = nullptr);
 
 // Gather [offset, offset+out.size()): submits one read per chunk across all drives on the reactor,
 // all at once, so the whole pool reads in parallel. Returns total bytes read.

@@ -11,9 +11,12 @@
 
 namespace goblin::memcache {
 
+class Authenticator;
+
 class EventLoop : public net::StreamLoop {
 public:
     using net::StreamLoop::StreamLoop; // inherit the (reactor, lfd, tm, index, iobufs, timeout) ctor
+    void set_authenticator(const Authenticator* value) noexcept { authenticator_ = value; }
 
 protected:
     void process(Conn*) override;
@@ -23,7 +26,12 @@ protected:
     void append_value_trailer(Conn*) override;
 
 private:
+    // Continue an active classic multi-get until it parks, starts streaming a hit, or reaches the
+    // final key. Returns false only when read-buffer backpressure parked the current key.
+    bool continue_get_batch(Conn*, std::uint32_t now);
     std::string format_stats() const; // STAT lines for the memcache `stats` command (aggregated)
+    std::string format_settings() const;
+    const Authenticator* authenticator_ = nullptr;
 };
 
 } // namespace goblin::memcache

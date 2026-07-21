@@ -1,6 +1,6 @@
 # ADR-0010: Write/upload admission — EVICT vs BLOCK on disk exhaustion
 
-**Status:** Accepted (2026-06-09), revised 2026-07-15.
+**Status:** Accepted (2026-06-09), revised 2026-07-20.
 
 ## Context
 [ADR-0003](0003-cache-semantics-head-as-cache.md) makes the default a best-effort cache that
@@ -52,6 +52,12 @@ is read-only.
   expired objects and policy victims that occupy that filesystem. Thus a full HDD mount cannot
   evict an SSD-only object on another `st_dev`. The separate global whole-object policy exists only
   to enforce the configured object-count bound; it is not the disk-full victim source.
+- **Non-capacity I/O failures do not evict.** They update the failed device's health counters and
+  transition hardware write failures to read-only/failed. Later layouts that touch that device are
+  rejected with `read_only`; they do not enter the capacity victim loop.
+- **Watermarks are proactive, not authoritative.** A bounded background pass samples live byte and
+  inode availability and reclaims filesystem-local victims from the high watermark toward the low
+  watermark. Foreground syscall results remain the admission truth.
 - **EVICT slow paths are serialized.** The first file creation, reservation, or `pwrite` attempt is
   concurrent. After an out-of-space result, one capacity coordinator serializes writers, retries
   before evicting, reclaims one expired object or filesystem-local victim, and retries after each

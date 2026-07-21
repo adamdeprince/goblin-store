@@ -36,6 +36,34 @@ using namespace goblin;
 using namespace goblin::storage;
 using goblin::crypto::hash_key;
 
+TEST("pool: filesystem capacity reports space and inode gauges once per filesystem") {
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-pool-capacity-" + std::to_string(::getpid())))
+            .string();
+    fs::create_directories(base + "/a");
+    fs::create_directories(base + "/b");
+    {
+        auto opened = Pool::open({base + "/a", base + "/b"}, 64 * KiB);
+        CHECK(opened.has_value());
+        if (opened) {
+            const auto capacity = opened->filesystem_capacity();
+            CHECK_EQ(capacity.size(), std::size_t(1));
+            if (!capacity.empty()) {
+                const auto& value = capacity.front();
+                CHECK(value.total_bytes > 0);
+                CHECK(value.allocated_bytes <= value.total_bytes);
+                CHECK(value.free_bytes <= value.total_bytes);
+                CHECK(value.available_bytes <= value.free_bytes);
+                CHECK_EQ(value.allocated_bytes + value.free_bytes, value.total_bytes);
+                CHECK(value.free_inodes <= value.total_inodes);
+                CHECK(value.available_inodes <= value.free_inodes);
+                CHECK_EQ(value.used_inodes + value.free_inodes, value.total_inodes);
+            }
+        }
+    }
+    fs::remove_all(base);
+}
+
 TEST("pool: Linux reservation keeps size zero and Pool moves preserve O_DIRECT") {
 #if defined(__linux__)
     const std::string base =
@@ -845,6 +873,36 @@ TEST("tier_manager: rejects oversized lengths before layout arithmetic or alloca
     fs::remove_all(base);
 }
 
+TEST("tier_manager: configurable object limit is enforced by common storage admission") {
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-object-limit-" + std::to_string(::getpid()))).string();
+    PoolConfig ssd, hdd;
+    ssd.stripe_unit = 64 * KiB;
+    ssd.dirs.push_back(base + "/ssd");
+    fs::create_directories(ssd.dirs.front());
+    TierSizes tiers;
+    tiers.ram_head = 4 * KiB;
+    tiers.ssd_prefix = 1 * MiB;
+    MemoryConfig mem;
+    mem.total_bytes = 64 * KiB;
+    mem.block_bytes = 64 * KiB;
+    mem.lock_memory = false;
+    mem.use_hugepages = false;
+    Index index;
+    auto tm = TierManager::open(tiers, mem, EvictionConfig{}, ssd, hdd, index,
+                                64 * KiB, 2, false, {}, 0, 8 * KiB);
+    CHECK(tm.has_value());
+    if (tm) {
+        CHECK_EQ(tm->max_object_size(), 8 * KiB);
+        auto allowed = tm->begin_store(hash_key("/allowed"), 8 * KiB);
+        CHECK(allowed.has_value());
+        auto rejected = tm->begin_store(hash_key("/rejected"), 8 * KiB + 1);
+        CHECK(!rejected.has_value());
+        if (!rejected) CHECK_EQ(rejected.error().code, Errc::too_large);
+    }
+    fs::remove_all(base);
+}
+
 TEST("tier_manager: concurrent disk-backed generations isolate commit from abort") {
     const std::string base =
         (fs::temp_directory_path() / ("goblin-generation-abort-" + std::to_string(::getpid())))
@@ -1017,6 +1075,191 @@ TEST("tier_manager: later concurrent disk generation atomically retires the earl
         CHECK(std::all_of(head->begin(), head->end(),
                           [](std::byte b) { return b == std::byte{0x52}; }));
 
+    fs::remove_all(base);
+}
+
+TEST("tier_manager: concurrent conditional stores linearize add and replace at commit") {
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-conditional-commit-" + std::to_string(::getpid())))
+            .string();
+    PoolConfig ssd, hdd;
+    ssd.stripe_unit = 64 * KiB;
+    ssd.dirs.push_back(base + "/ssd");
+    fs::create_directories(ssd.dirs.front());
+
+    TierSizes tiers;
+    tiers.ram_head = 4 * KiB;
+    tiers.ssd_prefix = 1 * MiB;
+    MemoryConfig mem;
+    mem.total_bytes = 1 * MiB;
+    mem.block_bytes = 64 * KiB;
+    mem.lock_memory = false;
+    mem.use_hugepages = false;
+    EvictionConfig ev;
+    Index index;
+    auto tm = TierManager::open(tiers, mem, ev, ssd, hdd, index, 256 * KiB,
+                                /*write_buffers=*/8, /*direct_io=*/false);
+    CHECK(tm.has_value());
+    if (!tm) {
+        fs::remove_all(base);
+        return;
+    }
+
+    constexpr unsigned kWriters = 8;
+    constexpr Size kValueSize = 64;
+    const auto add_key = hash_key("/conditional/concurrent-add");
+    std::array<std::optional<TierManager::StoreHandle>, kWriters> handles;
+    std::array<std::array<std::byte, kValueSize>, kWriters> values{};
+    for (unsigned i = 0; i < kWriters; ++i) {
+        values[i].fill(static_cast<std::byte>(i + 1));
+        auto handle = tm->begin_store(add_key, kValueSize, WriteMode::evict,
+                                      StoreCondition::add);
+        CHECK(handle.has_value());
+        if (!handle) continue;
+        handles[i].emplace(std::move(*handle));
+        CHECK(handles[i]->write(ByteView(values[i].data(), values[i].size())).has_value());
+    }
+
+    std::atomic<unsigned> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<unsigned> stored{0};
+    std::atomic<unsigned> conflicts{0};
+    std::atomic<unsigned> other_errors{0};
+    std::vector<std::thread> writers;
+    writers.reserve(kWriters);
+    for (unsigned i = 0; i < kWriters; ++i) {
+        writers.emplace_back([&, i] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+            if (!handles[i]) {
+                other_errors.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            const auto committed = handles[i]->commit(i + 1);
+            if (committed)
+                stored.fetch_add(1, std::memory_order_relaxed);
+            else if (committed.error().code == Errc::condition_not_met)
+                conflicts.fetch_add(1, std::memory_order_relaxed);
+            else
+                other_errors.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != kWriters) std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    for (auto& writer : writers) writer.join();
+
+    CHECK_EQ(stored.load(), 1u);
+    CHECK_EQ(conflicts.load(), kWriters - 1);
+    CHECK_EQ(other_errors.load(), 0u);
+    const auto winner = index.lookup(add_key);
+    CHECK(winner.has_value());
+    CHECK(winner && winner->flags >= 1 && winner->flags <= kWriters);
+    if (winner) {
+        const auto head = tm->head_view(add_key);
+        CHECK(head.has_value());
+        if (head) {
+            const std::byte expected = static_cast<std::byte>(winner->flags);
+            CHECK(std::all_of(head->begin(), head->end(),
+                              [expected](std::byte value) { return value == expected; }));
+        }
+    }
+
+    const auto replace_key = hash_key("/conditional/removed-before-replace");
+    std::array<std::byte, kValueSize> old_value{};
+    std::array<std::byte, kValueSize> new_value{};
+    old_value.fill(std::byte{0x31});
+    new_value.fill(std::byte{0x52});
+    CHECK(tm->store(replace_key, ByteView(old_value.data(), old_value.size()), 1).has_value());
+    auto replacement = tm->begin_store(replace_key, new_value.size(), WriteMode::evict,
+                                       StoreCondition::replace);
+    CHECK(replacement.has_value());
+    if (replacement) {
+        CHECK(replacement->write(ByteView(new_value.data(), new_value.size())).has_value());
+        CHECK(tm->remove(replace_key));
+        const auto committed = replacement->commit(2);
+        CHECK(!committed.has_value());
+        CHECK(!committed && committed.error().code == Errc::condition_not_met);
+        CHECK(!index.contains(replace_key));
+    }
+
+    fs::remove_all(base);
+}
+
+TEST("tier_manager: arithmetic, meta refresh state, access metadata, and flush are atomic") {
+    const fs::path base = fs::temp_directory_path() /
+        ("goblin-meta-state-" + std::to_string(::getpid()));
+    fs::remove_all(base);
+    fs::create_directories(base / "ssd");
+    PoolConfig ssd, hdd;
+    ssd.dirs.push_back((base / "ssd").string());
+    ssd.stripe_unit = 64 * KiB;
+    TierSizes tiers;
+    tiers.ram_head = 4 * KiB;
+    tiers.ssd_prefix = 1 * MiB;
+    MemoryConfig memory;
+    memory.total_bytes = 1 * MiB;
+    memory.block_bytes = 64 * KiB;
+    memory.lock_memory = false;
+    memory.use_hugepages = false;
+    EvictionConfig eviction;
+    Index index;
+    auto tm = TierManager::open(tiers, memory, eviction, ssd, hdd, index,
+                                64 * KiB, 8, false);
+    CHECK(tm.has_value());
+    if (!tm) { fs::remove_all(base); return; }
+
+    const auto number = hash_key("number");
+    const std::string ten = "10";
+    CHECK(tm->store(number, ByteView(reinterpret_cast<const std::byte*>(ten.data()), ten.size()),
+                    17).has_value());
+    const auto incremented = tm->arithmetic(number, 5, false);
+    CHECK(incremented.has_value());
+    if (incremented) CHECK_EQ(incremented->value, std::uint64_t(15));
+    const auto decremented = tm->arithmetic(number, 20, true);
+    CHECK(decremented.has_value());
+    if (decremented) CHECK_EQ(decremented->value, std::uint64_t(0));
+    auto before_read = index.lookup(number);
+    CHECK(before_read.has_value() && !before_read->fetched);
+    const auto head = tm->head_view(number);
+    CHECK(head.has_value());
+    if (head) CHECK_EQ(std::string(reinterpret_cast<const char*>(head->data()), head->size()),
+                       std::string("0"));
+
+    const auto created = tm->arithmetic(hash_key("new-number"), 2, false,
+                                        std::uint64_t(41), std::uint32_t(0));
+    CHECK(created.has_value());
+    if (created) CHECK(created->created && created->value == 41);
+    const std::string text = "not-a-number";
+    const auto text_key = hash_key("text");
+    CHECK(tm->store(text_key,
+                    ByteView(reinterpret_cast<const std::byte*>(text.data()), text.size()), 0)
+              .has_value());
+    const auto invalid = tm->arithmetic(text_key, 1, false);
+    CHECK(!invalid.has_value());
+    if (!invalid) CHECK_EQ(invalid.error().code, Errc::invalid_argument);
+
+    // head_view is itself a successful fetch and updates h/l metadata.
+    auto snapshot = tm->open_snapshot(number, /*record_access=*/true);
+    CHECK(snapshot.has_value());
+    if (snapshot && snapshot->pin.valid) tm->unpin_head(snapshot->pin);
+    const auto after_read = index.lookup(number);
+    CHECK(after_read.has_value() && after_read->fetched);
+    if (after_read) CHECK(after_read->last_access != 0);
+
+    const auto stale = tm->mark_stale(number, 0);
+    CHECK(stale == Index::MetaMutation::stored);
+    const auto stale_meta = index.lookup(number);
+    CHECK(stale_meta.has_value() && stale_meta->stale && !stale_meta->recache_claimed);
+    CHECK(tm->claim_recache(number) == Index::RecacheClaim::winner);
+    CHECK(tm->claim_recache(number) == Index::RecacheClaim::already_claimed);
+
+    tm->flush_all();
+    CHECK(!tm->lookup_live(number).has_value());
+    const auto survivor = hash_key("after-flush");
+    CHECK(tm->store(survivor, ByteView{}, 0).has_value());
+    CHECK(tm->lookup_live(survivor).has_value());
+    CHECK(tm->reap_expired() >= 3); // number, text, and new-number predate the flush cutoff
+    CHECK(index.contains(survivor));
     fs::remove_all(base);
 }
 
@@ -2183,5 +2426,139 @@ TEST("tier_manager capacity integration: fallocate admission evicts without gene
     }
     CHECK(actual_files == expected_files);
     CHECK_EQ(actual_files.size(), index.size());
+#endif
+}
+
+TEST("tier_manager: quarantine is generation-safe and removes the poisoned incarnation") {
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-quarantine-" + std::to_string(::getpid()))).string();
+    fs::create_directories(base);
+    PoolConfig ssd;
+    ssd.dirs = {base};
+    ssd.stripe_unit = 4 * KiB;
+    TierSizes tiers;
+    tiers.ram_head = 4 * KiB;
+    tiers.ssd_prefix = 1 * MiB;
+    MemoryConfig mem;
+    mem.total_bytes = 4 * MiB;
+    mem.block_bytes = 256 * KiB;
+    mem.lock_memory = false;
+    Index index;
+    auto tm = TierManager::open(tiers, mem, EvictionConfig{}, ssd, {}, index);
+    CHECK(tm.has_value());
+    if (tm) {
+        const auto digest = hash_key("/quarantine");
+        std::vector<std::byte> first(16 * KiB, std::byte{0x11});
+        std::vector<std::byte> second(16 * KiB, std::byte{0x22});
+        CHECK(tm->store(digest, ByteView(first.data(), first.size()), 1).has_value());
+        const auto old = index.lookup(digest);
+        CHECK(old.has_value());
+        CHECK(tm->store(digest, ByteView(second.data(), second.size()), 2).has_value());
+        const auto current = index.lookup(digest);
+        CHECK(current.has_value());
+        if (old && current) {
+            CHECK(old->file_generation != current->file_generation);
+            CHECK(!tm->quarantine_object(digest, old->file_generation));
+            CHECK(index.contains(digest));
+            CHECK(tm->quarantine_object(digest, current->file_generation));
+            CHECK(!index.contains(digest));
+            const auto health = tm->storage_health_snapshot();
+            CHECK_EQ(health.quarantined_objects, std::uint64_t(1));
+            CHECK_EQ(health.quarantine_failures, std::uint64_t(0));
+        }
+    }
+    fs::remove_all(base);
+}
+
+TEST("tier_manager: proactive watermark maintenance reclaims filesystem-local objects") {
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-watermark-" + std::to_string(::getpid()))).string();
+    fs::create_directories(base);
+    PoolConfig ssd;
+    ssd.dirs = {base};
+    ssd.stripe_unit = 4 * KiB;
+    TierSizes tiers;
+    tiers.ram_head = 4 * KiB;
+    tiers.ssd_prefix = 1 * MiB;
+    MemoryConfig mem;
+    mem.total_bytes = 4 * MiB;
+    mem.block_bytes = 256 * KiB;
+    mem.lock_memory = false;
+    EvictionConfig eviction;
+    eviction.high_watermark = 1e-12;
+    eviction.low_watermark = 5e-13;
+    Index index;
+    auto tm = TierManager::open(tiers, mem, eviction, ssd, {}, index);
+    CHECK(tm.has_value());
+    if (tm) {
+        const auto digest = hash_key("/watermark");
+        std::vector<std::byte> value(16 * KiB, std::byte{0x33});
+        CHECK(tm->store(digest, ByteView(value.data(), value.size()), 0).has_value());
+        CHECK_EQ(tm->reclaim_to_watermarks(4), std::size_t(1));
+        CHECK(!index.contains(digest));
+        const auto health = tm->storage_health_snapshot();
+        CHECK_EQ(health.watermark_scans, std::uint64_t(1));
+        CHECK_EQ(health.watermark_reclaim_runs, std::uint64_t(1));
+        CHECK_EQ(health.watermark_reclaimed_objects, std::uint64_t(1));
+    }
+    fs::remove_all(base);
+}
+
+TEST("tier_manager: a short tail read quarantines the indexed generation") {
+#if defined(__linux__)
+    if (!core::Reactor::available()) {
+        std::println("    (skipped: built without liburing)");
+        return;
+    }
+    auto reactor = core::Reactor::create();
+    if (!reactor) {
+        std::println("    (skipped: io_uring unavailable: {})", reactor.error().detail);
+        return;
+    }
+    const std::string base =
+        (fs::path("/var/tmp") / ("goblin-tail-poison-" + std::to_string(::getpid()))).string();
+    fs::create_directories(base);
+    PoolConfig ssd;
+    ssd.dirs = {base};
+    ssd.stripe_unit = 4 * KiB;
+    TierSizes tiers;
+    tiers.ram_head = 4 * KiB;
+    tiers.ssd_prefix = 1 * MiB;
+    MemoryConfig mem;
+    mem.total_bytes = 4 * MiB;
+    mem.block_bytes = 256 * KiB;
+    mem.lock_memory = false;
+    Index index;
+    auto tm = TierManager::open(tiers, mem, EvictionConfig{}, ssd, {}, index);
+    CHECK(tm.has_value());
+    if (tm) {
+        const auto digest = hash_key("/short-tail");
+        std::vector<std::byte> value(16 * KiB, std::byte{0x44});
+        CHECK(tm->store(digest, ByteView(value.data(), value.size()), 0).has_value());
+        auto snapshot = tm->open_snapshot(digest);
+        CHECK(snapshot.has_value());
+        if (snapshot && snapshot->rs) {
+            const auto object = fs::path(base) /
+                (digest.hex() + ".g" + std::to_string(snapshot->meta.file_generation));
+            fs::resize_file(object, 0);
+            void* allocation = nullptr;
+            CHECK_EQ(::posix_memalign(&allocation, kDeviceBlock, kDeviceBlock), 0);
+            if (allocation) {
+                const auto read = snapshot->rs->read(
+                    *reactor, tiers.ram_head,
+                    MutBytes(static_cast<std::byte*>(allocation), kDeviceBlock));
+                CHECK(!read.has_value());
+                std::free(allocation);
+            }
+            CHECK(!index.contains(digest));
+            const auto health = tm->storage_health_snapshot();
+            CHECK_EQ(health.quarantined_objects, std::uint64_t(1));
+            CHECK_EQ(health.state, TierManager::StorageHealthState::degraded);
+        }
+        if (snapshot && snapshot->pin.valid) tm->unpin_head(snapshot->pin);
+    }
+    fs::remove_all(base);
+#else
+    std::println("    (skipped: io_uring tail corruption probe is Linux-only)");
 #endif
 }

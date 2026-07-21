@@ -76,6 +76,32 @@ void append_head(std::string& out, std::string_view status, Size content_length,
     out += keep_alive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
 }
 
+void append_storage_readiness(std::string& out,
+                              const storage::TierManager::StorageHealthSnapshot& health,
+                              bool head_only, bool keep_alive) {
+    std::string body;
+    body.reserve(192);
+    body += "{\"ready\":";
+    body += health.ready ? "true" : "false";
+    body += ",\"state\":\"";
+    body += storage::TierManager::health_state_name(health.state);
+    body += "\",\"devices\":";
+    append_u64(body, health.devices.size());
+    body += ",\"quarantined_objects\":";
+    append_u64(body, health.quarantined_objects);
+    body += ",\"watermark_reclaimed_objects\":";
+    append_u64(body, health.watermark_reclaimed_objects);
+    body += "}\n";
+
+    out += health.ready ? "HTTP/1.1 200 OK\r\n" :
+                          "HTTP/1.1 503 Service Unavailable\r\n";
+    out += "Content-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: ";
+    append_u64(out, body.size());
+    out += keep_alive ? "\r\nConnection: keep-alive\r\n\r\n"
+                      : "\r\nConnection: close\r\n\r\n";
+    if (!head_only) out += body;
+}
+
 constexpr std::string_view k400 =
     "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 constexpr std::string_view k405 =
@@ -543,9 +569,14 @@ void HttpLoop::process(Conn* c) {
             break;
         }
         const Method method = pr.req.method;
+        const bool readiness_request =
+            (method == Method::get || method == Method::head) &&
+            pr.req.target == "/__goblin/ready";
         std::optional<std::string> key;
         std::optional<MirrorContext> mirror_context;
-        if (mirror_ && (method == Method::get || method == Method::head)) {
+        if (readiness_request) {
+            // Reserved operational endpoint: never enters the object keyspace or mirror origin.
+        } else if (mirror_ && (method == Method::get || method == Method::head)) {
             if (!pr.req.target.empty() && pr.req.target.front() == '/' &&
                 !pr.req.target.starts_with("//") &&
                 pr.req.target.find_first_of("\r\n#") == std::string_view::npos) {
@@ -573,6 +604,13 @@ void HttpLoop::process(Conn* c) {
             c->out += k421;
             c->quit_after = true;
             break;
+        }
+
+        if (readiness_request) {
+            append_storage_readiness(c->out, tm_.storage_health_snapshot(),
+                                     method == Method::head, !c->quit_after);
+            if (c->quit_after) break;
+            continue;
         }
 
         if (mirror_context) mirrors_.insert_or_assign(c, std::move(*mirror_context));

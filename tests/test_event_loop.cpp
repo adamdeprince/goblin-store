@@ -6,6 +6,8 @@
 #include "goblin/crypto/sha256.hpp"
 #include "goblin/net/connection_dispatcher.hpp"
 #include "goblin/protocol/memcache/event_loop.hpp"
+#include "goblin/protocol/memcache/auth.hpp"
+#include "goblin/protocol/memcache/protocol.hpp"
 #include "goblin/storage/index.hpp"
 #include "goblin/storage/tier_manager.hpp"
 
@@ -16,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <optional>
@@ -24,6 +27,7 @@
 #include <string_view>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -293,6 +297,48 @@ TEST("event loop: version + delete, pipelined in one request") {
     CHECK(ok);
 }
 
+TEST("event loop: ASCII authentication gates a pipelined connection") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("auth");
+    fs::create_directories(base);
+    const std::string credentials = base + "/users";
+    { std::ofstream file(credentials); file << "alice:secret\n"; }
+    ::chmod(credentials.c_str(), 0600);
+    auto auth = goblin::memcache::Authenticator::load(credentials);
+    Index index;
+    auto tm = open_tm(base, index, false);
+    auto io = make_iopool();
+    CHECK(auth && tm && io);
+    if (!auth || !tm || !io) { fs::remove_all(base); return; }
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    EventLoop loop(*rc, lfd, *tm, index, *io);
+    loop.set_authenticator(&*auth);
+    std::thread th([&] { loop.run(); });
+
+    bool ok = false;
+    const int client = client_connect(port);
+    if (client >= 0) {
+        constexpr std::string_view request =
+            "version\r\nset ignored 0 0 12\r\nalice secret\r\nversion\r\n";
+        if (write_all(client, request.data(), request.size())) {
+            const std::string response = read_until(client, goblin::memcache::kVersion);
+            ok = response == "CLIENT_ERROR unauthenticated\r\nSTORED\r\n" +
+                               std::string(goblin::memcache::kVersion);
+        }
+        ::close(client);
+    }
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(ok);
+}
+
 TEST("event loop: a command split across two recvs still parses") {
     if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
     auto rc = Reactor::create();
@@ -326,7 +372,7 @@ TEST("event loop: a command split across two recvs still parses") {
     CHECK(ok);
 }
 
-TEST("event loop: an unknown command returns ERROR") {
+TEST("event loop: unknown commands use ERROR and malformed known commands use CLIENT_ERROR") {
     if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
     auto rc = Reactor::create();
     if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
@@ -346,8 +392,18 @@ TEST("event loop: an unknown command returns ERROR") {
     bool ok = false;
     const int c = client_connect(port);
     if (c >= 0) {
-        write_all(c, "bogus-command\r\n", 15);
-        ok = read_until(c, "\r\n").find("ERROR") == 0;
+        const auto exchange = [&](std::string_view request) {
+            if (!write_all(c, request.data(), request.size())) return std::string{};
+            return read_until(c, "\r\n");
+        };
+        const std::string unknown = exchange("bogus-command\r\n");
+        const std::string malformed = exchange("set key 0 nope 1\r\n");
+        const std::string bad_key = exchange("delete bad\tkey\r\n");
+        const std::string settings = exchange("stats settings\r\n");
+        ok = unknown == "ERROR\r\n" &&
+             malformed == "CLIENT_ERROR bad command line format\r\n" &&
+             bad_key == "CLIENT_ERROR bad command line format\r\n" &&
+             settings == "END\r\n";
         ::close(c);
     }
     loop.stop();
@@ -421,6 +477,65 @@ TEST("event loop: GET head-resident / multi-piece / miss") {
         const auto b = get_value(c, "big");
         const auto m = get_value(c, "nope");
         ok = a && *a == small && b && *b == big && !m;
+        ::close(c);
+    }
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(ok);
+}
+
+TEST("event loop: multi-key get and gets return every hit in order and one END") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("multiget");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    auto io = make_iopool();
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+    const std::string small = pattern(31, 127);       // inline-head fast path
+    const std::string big = pattern(32, 96 * KiB);   // async disk-tail path
+    CHECK(store_obj(*tm, "small", small));
+    CHECK(store_obj(*tm, "big", big));
+    const auto small_meta = index.lookup(hash_key("small"));
+    const auto big_meta = index.lookup(hash_key("big"));
+    CHECK(small_meta.has_value() && big_meta.has_value());
+    if (!small_meta || !big_meta) { fs::remove_all(base); return; }
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    EventLoop loop(*rc, lfd, *tm, index, *io);
+    std::thread th([&] { loop.run(); });
+
+    bool ok = false;
+    const int c = client_connect(port);
+    if (c >= 0) {
+        const std::string request =
+            "get absent small big missing\r\ngets big nowhere small\r\nversion\r\n";
+        if (write_all(c, request.data(), request.size())) {
+            const std::string response = read_until(c, goblin::memcache::kVersion);
+            std::string expected;
+            expected += goblin::memcache::value_header("small", 0, small.size());
+            expected += small;
+            expected += "\r\n";
+            expected += goblin::memcache::value_header("big", 0, big.size());
+            expected += big;
+            expected += "\r\nEND\r\n";
+            expected += goblin::memcache::value_header_cas(
+                "big", 0, big.size(), big_meta->etag);
+            expected += big;
+            expected += "\r\n";
+            expected += goblin::memcache::value_header_cas(
+                "small", 0, small.size(), small_meta->etag);
+            expected += small;
+            expected += "\r\nEND\r\n";
+            expected += goblin::memcache::kVersion;
+            ok = response == expected;
+        }
         ::close(c);
     }
     loop.stop();
@@ -623,6 +738,80 @@ TEST("event loop: add / replace admission") {
     ::close(lfd);
     fs::remove_all(base);
     CHECK(ok);
+}
+
+TEST("event loop: add and replace conditions are rechecked when the value publishes") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("atomic-addrep");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    auto io = make_iopool();
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    EventLoop loop(*rc, lfd, *tm, index, *io);
+    std::thread th([&] { loop.run(); });
+
+    constexpr unsigned kWriters = 6;
+    const std::string value(64, 'a');
+    const std::string add_header = "add contested 0 0 " + std::to_string(value.size()) + "\r\n";
+    std::vector<int> clients;
+    for (unsigned i = 0; i < kWriters; ++i) {
+        const int client = client_connect(port);
+        if (client >= 0 && write_all(client, add_header.data(), add_header.size()))
+            clients.push_back(client);
+        else if (client >= 0)
+            ::close(client);
+    }
+    // Every command header reaches set_body while the key is still absent. Sending bodies only after
+    // that point deterministically exercises the old check-then-publish race.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    unsigned stored = 0, rejected = 0;
+    const std::string body = value + "\r\n";
+    for (const int client : clients) {
+        if (write_all(client, body.data(), body.size())) {
+            const std::string response = read_until(client, "\r\n");
+            if (response == "STORED\r\n") ++stored;
+            else if (response == "NOT_STORED\r\n") ++rejected;
+        }
+        ::close(client);
+    }
+
+    bool replace_rejected = false;
+    const int replacement = client_connect(port);
+    if (replacement >= 0) {
+        const std::string header =
+            "replace contested 0 0 " + std::to_string(value.size()) + "\r\n";
+        if (write_all(replacement, header.data(), header.size())) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            const int deleter = client_connect(port);
+            bool deleted = false;
+            if (deleter >= 0) {
+                const std::string request = "delete contested\r\n";
+                deleted = write_all(deleter, request.data(), request.size()) &&
+                          read_until(deleter, "\r\n") == "DELETED\r\n";
+                ::close(deleter);
+            }
+            replace_rejected = deleted && write_all(replacement, body.data(), body.size()) &&
+                               read_until(replacement, "\r\n") == "NOT_STORED\r\n";
+        }
+        ::close(replacement);
+    }
+
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    CHECK_EQ(clients.size(), std::size_t(kWriters));
+    CHECK_EQ(stored, 1u);
+    CHECK_EQ(rejected, kWriters - 1);
+    CHECK(replace_rejected);
+    CHECK(!index.contains(hash_key("contested")));
+    fs::remove_all(base);
 }
 
 TEST("event loop: a bad data-chunk terminator -> CLIENT_ERROR") {
@@ -842,6 +1031,177 @@ TEST("event loop: a stalled slow reader is disconnected, freeing its buffer for 
     CHECK(ok);
 }
 
+static std::optional<std::uint64_t> stat_u64(const std::string& reply,
+                                             std::string_view name);
+
+TEST("event loop: idle keepalives expire and increment the idle-drop counter") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("idlelimit");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    auto io = make_iopool();
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    StatsRegistry reg;
+    EventLoop loop(*rc, lfd, *tm, index, *io, /*io_timeout_ms=*/0, &reg);
+    loop.set_overload_limits(/*idle_timeout_ms=*/100, /*queue_timeout_ms=*/0, 64, 64);
+    std::thread th([&] { loop.run(); });
+
+    const int idle = client_connect(port);
+    bool expired = false;
+    if (idle >= 0) {
+        // Complete one request so the deadline is measured from an established server-side
+        // keepalive, rather than racing accept scheduling against the client safety timeout.
+        CHECK(write_all(idle, "version\r\n", 9));
+        CHECK(read_until(idle, "\r\n").starts_with("VERSION "));
+        timeval timeout{2, 0};
+        ::setsockopt(idle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+        char byte = 0;
+        ssize_t received;
+        do {
+            received = ::recv(idle, &byte, 1, 0);
+        } while (received < 0 && errno == EINTR);
+        expired = received == 0 || (received < 0 && errno == ECONNRESET);
+        ::close(idle);
+    }
+
+    std::string reply;
+    const int observer = client_connect(port);
+    if (observer >= 0) {
+        if (write_all(observer, "stats\r\n", 7)) reply = read_until(observer, "END\r\n");
+        ::close(observer);
+    }
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(expired);
+    CHECK(stat_u64(reply, "idle_drops").value_or(0) >= 1);
+}
+
+TEST("event loop: SET waiter count and queue deadline shed blocked connections") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("setlimits");
+    Index index;
+    auto tm = open_tm(base, index, false, /*write_buffers=*/1);
+    auto io = make_iopool();
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    StatsRegistry reg;
+    EventLoop loop(*rc, lfd, *tm, index, *io, /*io_timeout_ms=*/0, &reg);
+    loop.set_overload_limits(/*idle_timeout_ms=*/0, /*queue_timeout_ms=*/100,
+                             /*max_get_waiters=*/64, /*max_set_waiters=*/1);
+    std::thread th([&] { loop.run(); });
+
+    const int holder = client_connect(port);
+    const int waiter = client_connect(port);
+    const int excess = client_connect(port);
+    CHECK(holder >= 0 && waiter >= 0 && excess >= 0);
+    const std::string header1 = "set holder 0 0 65536\r\n";
+    const std::string header2 = "set waiter 0 0 65536\r\n";
+    const std::string header3 = "set excess 0 0 65536\r\n";
+    if (holder >= 0) write_all(holder, header1.data(), header1.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (waiter >= 0) write_all(waiter, header2.data(), header2.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    if (excess >= 0) write_all(excess, header3.data(), header3.size());
+
+    bool excess_dropped = false;
+    bool waiter_expired = false;
+    if (excess >= 0) {
+        timeval timeout{2, 0};
+        ::setsockopt(excess, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+        char byte = 0;
+        excess_dropped = ::recv(excess, &byte, 1, 0) <= 0;
+    }
+    if (waiter >= 0) {
+        timeval timeout{2, 0};
+        ::setsockopt(waiter, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+        char byte = 0;
+        waiter_expired = ::recv(waiter, &byte, 1, 0) <= 0;
+    }
+
+    std::string reply;
+    const int observer = client_connect(port);
+    if (observer >= 0) {
+        if (write_all(observer, "stats\r\n", 7)) reply = read_until(observer, "END\r\n");
+        ::close(observer);
+    }
+    if (holder >= 0) ::close(holder);
+    if (waiter >= 0) ::close(waiter);
+    if (excess >= 0) ::close(excess);
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(excess_dropped);
+    CHECK(waiter_expired);
+    CHECK(stat_u64(reply, "queue_drops").value_or(0) >= 2);
+}
+
+TEST("event loop: GET waiter bound sheds excess disk-tail readers") {
+    if (!Reactor::available()) { std::println("    (skipped: built without liburing)"); return; }
+    auto rc = Reactor::create();
+    if (!rc) { std::println("    (skipped: io_uring unavailable: {})", rc.error().detail); return; }
+    const std::string base = tmp_base("getlimit");
+    Index index;
+    auto tm = open_tm(base, index, false);
+    auto io = IoBufferPool::create(64 * KiB, /*count=*/1, false);
+    CHECK(tm.has_value() && io.has_value());
+    if (!tm || !io) { fs::remove_all(base); return; }
+    const std::string value = pattern(711, 8 * MiB);
+    CHECK(store_obj(*tm, "large", value));
+    auto [lfd, port] = make_loopback_listener();
+    CHECK(lfd >= 0);
+    if (lfd < 0) { fs::remove_all(base); return; }
+    StatsRegistry reg;
+    EventLoop loop(*rc, lfd, *tm, index, *io, /*io_timeout_ms=*/0, &reg);
+    loop.set_overload_limits(/*idle_timeout_ms=*/0, /*queue_timeout_ms=*/0,
+                             /*max_get_waiters=*/0, /*max_set_waiters=*/64);
+    std::thread th([&] { loop.run(); });
+
+    const int holder = client_connect(port);
+    if (holder >= 0) {
+        int receive_buffer = 2048;
+        ::setsockopt(holder, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof receive_buffer);
+        write_all(holder, "get large\r\n", 11);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const int excess = client_connect(port);
+    bool dropped = false;
+    if (excess >= 0) {
+        timeval timeout{2, 0};
+        ::setsockopt(excess, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+        write_all(excess, "get large\r\n", 11);
+        char byte = 0;
+        dropped = ::recv(excess, &byte, 1, 0) <= 0;
+    }
+    std::string reply;
+    const int observer = client_connect(port);
+    if (observer >= 0) {
+        if (write_all(observer, "stats\r\n", 7)) reply = read_until(observer, "END\r\n");
+        ::close(observer);
+    }
+    if (holder >= 0) ::close(holder);
+    if (excess >= 0) ::close(excess);
+    loop.stop();
+    th.join();
+    ::close(lfd);
+    fs::remove_all(base);
+    CHECK(dropped);
+    CHECK(stat_u64(reply, "queue_drops").value_or(0) >= 1);
+}
+
 // ----------------------------------------------------------------------------- Step 5: stats
 
 // Pull the integer value of a `STAT <name> <value>` line out of a stats reply (nullopt if absent).
@@ -882,6 +1242,10 @@ TEST("event loop: stats reports connections, hits/misses, sets and bytes") {
         const auto miss = get_value(c, "nope"); // one miss
         std::string reply;
         if (write_all(c, "stats\r\n", 7)) reply = read_until(c, "END\r\n");
+        std::string reset_reply;
+        if (write_all(c, "stats reset\r\n", 13)) reset_reply = read_until(c, "\r\n");
+        std::string after_reset;
+        if (write_all(c, "stats\r\n", 7)) after_reset = read_until(c, "END\r\n");
         ok = stored && hit && *hit == val && !miss &&
              reply.find("STAT pid ") != std::string::npos &&
              reply.find("STAT version goblin-store 0.0.2\r\n") != std::string::npos &&
@@ -890,7 +1254,16 @@ TEST("event loop: stats reports connections, hits/misses, sets and bytes") {
              stat_u64(reply, "cmd_set") == 1 && stat_u64(reply, "bytes_stored") == val.size() &&
              stat_u64(reply, "total_connections").value_or(0) >= 1 &&
              stat_u64(reply, "curr_connections").value_or(0) >= 1 &&
-             stat_u64(reply, "bytes_served").value_or(0) >= val.size();
+             stat_u64(reply, "bytes_served").value_or(0) >= val.size() &&
+             stat_u64(reply, "goblin_ssd_filesystem_count") == 1 &&
+             stat_u64(reply, "goblin_hdd_filesystem_count") == 0 &&
+             stat_u64(reply, "goblin_ssd_filesystem_0_capacity_bytes").value_or(0) > 0 &&
+             stat_u64(reply, "goblin_ssd_filesystem_0_inodes").value_or(0) > 0 &&
+             stat_u64(reply, "goblin_ssd_filesystem_0_inodes_free").has_value() &&
+             reset_reply == "RESET\r\n" && stat_u64(after_reset, "get_hits") == 0 &&
+             stat_u64(after_reset, "get_misses") == 0 &&
+             stat_u64(after_reset, "sets_stored") == 0 &&
+             stat_u64(after_reset, "curr_connections").value_or(0) >= 1;
         ::close(c);
     }
     loop.stop();
@@ -904,7 +1277,7 @@ TEST("event loop: stats reports connections, hits/misses, sets and bytes") {
 
 // "set <key> 0 <exptime> <len>\r\n<val>\r\n" — exercises memcache TTLs.
 static std::string set_ttl(int fd, const std::string& key, const std::string& val,
-                           std::uint32_t exptime) {
+                           std::int64_t exptime) {
     std::string req = "set " + key + " 0 " + std::to_string(exptime) + " " +
                       std::to_string(val.size()) + "\r\n";
     req += val;
@@ -938,12 +1311,15 @@ TEST("event loop: TTL — expired GET misses, live hits; add over an expired key
         const bool se = set_ttl(c, "exp", v, 1000000000u) == "STORED\r\n";
         const bool sl = set_ttl(c, "live", v, 4000000000u) == "STORED\r\n";
         const bool sn = set_value(c, "never", v) == "STORED\r\n"; // exptime 0 = never
+        const bool si = set_ttl(c, "immediate", v, -1) == "STORED\r\n";
         const auto ge = get_value(c, "exp");    // expired -> lazy miss
         const auto gl = get_value(c, "live");   // hit
         const auto gn = get_value(c, "never");  // hit
+        const auto gi = get_value(c, "immediate"); // negative exptime -> immediate lazy miss
         const bool add = set_value(c, "exp", v, "add") == "STORED\r\n"; // expired counts as absent
         const auto gr = get_value(c, "exp");    // re-added (no TTL) -> hit
-        ok = se && sl && sn && !ge && gl && *gl == v && gn && *gn == v && add && gr && *gr == v;
+        ok = se && sl && sn && si && !ge && gl && *gl == v && gn && *gn == v && !gi &&
+             add && gr && *gr == v;
         ::close(c);
     }
     loop.stop();
@@ -1105,8 +1481,15 @@ TEST("event loop: meta protocol — mn / ms / mg / md, flags, modes, CAS") {
         const bool del = meta_cmd(c, "md k") == "HD";                      // delete
         const bool miss = meta_cmd(c, "mg k") == "EN";                     // now a miss
         const bool del_nf = meta_cmd(c, "md k") == "NF";                   // already gone
+        const bool expired_store = meta_set(c, "expired", "x", "T-1") == "HD";
+        const auto before_touch = index.lookup(hash_key("expired"));
+        const bool expired_touch_misses = meta_cmd(c, "mg expired T300") == "EN";
+        const auto after_touch = index.lookup(hash_key("expired"));
+        const bool expired_not_revived = before_touch && after_touch &&
+                                         before_touch->expiry == 1 && after_touch->expiry == 1;
         ok = mn && store && meta_hd && opaque && got_val && add && repl && cas && cas_match &&
-             cas_stale && del && miss && del_nf;
+             cas_stale && del && miss && del_nf && expired_store && expired_touch_misses &&
+             expired_not_revived;
         ::close(c);
     }
     loop.stop();

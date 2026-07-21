@@ -29,6 +29,12 @@ created or reserved for it.
 Goblin continues with checked streaming writes instead. This fallback matters for some network and
 older filesystems.
 
+Other failures are not treated as invitations to evict. The failing device records the errno and
+hardware-class write failures move it to a read-only or failed state. New disk-backed admissions
+whose stripe layout touches that device then fail with `read_only`, rather than deleting healthy
+cache entries in a futile retry loop. This keeps disk-full, unsupported reservation, and actual I/O
+failure as three separate operational cases.
+
 ## EVICT and BLOCK under concurrency
 
 The storage caller selects EVICT or BLOCK for each admission, and the resulting `StoreHandle`
@@ -40,6 +46,13 @@ not stored in `ObjectMeta`.
 
 The normal file-creation and allocation attempts do not take the capacity coordinator, so writers
 remain concurrent while space is available. Only an out-of-space result enters the slow path.
+
+A background maintenance thread uses the same coordinator and filesystem-local policy. It samples
+live `fstatvfs` byte and inode availability and, once either use ratio reaches the configurable high
+watermark, reclaims toward the low watermark. Work is bounded per pass and repeated at the
+configured interval. This is proactive pressure control only: the real allocation/write result
+remains authoritative because other processes and open-but-unlinked generations can change space
+between samples.
 
 Each pool directory is identified at startup by its `st_dev`. Directories backed by the same mount
 share one capacity domain and one victim policy, even if they appear in different tiers; distinct
@@ -89,6 +102,12 @@ Capacity selection is local to the failed `st_dev`, but deletion remains whole-o
 object to free one full mount also removes its shards from any other mount it spans. This preserves
 Goblin's one-key/one-object semantics and updates every capacity policy together. Open readers can
 still delay the physical block release, which is why each retry remains the final authority.
+
+The same generation identity makes tail-read quarantine safe. A failed or short asynchronous read
+records the exact device error and removes only the generation captured by that reader. If a
+concurrent store has already published a newer generation, quarantine observes the mismatch and
+leaves it untouched. Existing readers retain their open descriptor while the poisoned pathname is
+unlinked; new lookups miss instead of repeatedly serving a known-bad object.
 
 See [ADR-0010](adr/0010-write-admission-modes.md) for the admission decision and
 [ADR-0018](adr/0018-concurrency-model.md) for the read/write publication model.

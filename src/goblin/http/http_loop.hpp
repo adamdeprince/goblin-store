@@ -18,31 +18,35 @@ class HttpLoop : public net::StreamLoop {
 public:
     HttpLoop(core::Reactor& reactor, int listen_fd, storage::TierManager& tm, storage::Index& index,
              core::IoBufferPool& iobufs, KeyOptions keyopt, unsigned io_timeout_ms = 0,
-             core::StatsRegistry* reg = nullptr, MirrorService* mirror = nullptr)
+             core::StatsRegistry* reg = nullptr, MirrorService* mirror = nullptr,
+             core::StatsDomain stats_domain = core::StatsDomain::http)
         : net::StreamLoop(reactor, listen_fd, tm, index, iobufs, io_timeout_ms, reg,
-                          WriteMode::evict, mirror != nullptr),
+                          WriteMode::evict, mirror != nullptr, stats_domain),
           keyopt_(keyopt), mirror_(mirror) {}
     HttpLoop(core::Reactor& reactor, net::ConnectionInbox& inbox, storage::TierManager& tm,
              storage::Index& index, core::IoBufferPool& iobufs, KeyOptions keyopt,
              unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr,
-             MirrorService* mirror = nullptr)
+             MirrorService* mirror = nullptr,
+             core::StatsDomain stats_domain = core::StatsDomain::http)
         : net::StreamLoop(reactor, inbox, tm, index, iobufs, io_timeout_ms, reg,
-                          WriteMode::evict, mirror != nullptr),
+                          WriteMode::evict, mirror != nullptr, stats_domain),
           keyopt_(keyopt), mirror_(mirror) {}
     HttpLoop(net::StreamIo& stream_io, int listen_fd, storage::TierManager& tm,
              storage::Index& index, core::IoBufferPool& iobufs, KeyOptions keyopt,
              unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr,
-             MirrorService* mirror = nullptr)
+             MirrorService* mirror = nullptr,
+             core::StatsDomain stats_domain = core::StatsDomain::http)
         : net::StreamLoop(stream_io, listen_fd, tm, index, iobufs, io_timeout_ms, reg,
-                          WriteMode::evict, mirror != nullptr),
+                          WriteMode::evict, mirror != nullptr, stats_domain),
           keyopt_(keyopt), mirror_(mirror) {}
     HttpLoop(net::StreamIo& stream_io, net::ConnectionInbox& inbox,
              storage::TierManager& tm, storage::Index& index,
              core::IoBufferPool& iobufs, KeyOptions keyopt,
              unsigned io_timeout_ms = 0, core::StatsRegistry* reg = nullptr,
-             MirrorService* mirror = nullptr)
+             MirrorService* mirror = nullptr,
+             core::StatsDomain stats_domain = core::StatsDomain::http)
         : net::StreamLoop(stream_io, inbox, tm, index, iobufs, io_timeout_ms, reg,
-                          WriteMode::evict, mirror != nullptr),
+                          WriteMode::evict, mirror != nullptr, stats_domain),
           keyopt_(keyopt), mirror_(mirror) {}
 
 protected:

@@ -22,6 +22,10 @@ bool detail_contains(const Status& status, std::string_view text) {
 
 } // namespace
 
+TEST("Network listeners default to loopback-only") {
+    CHECK_EQ(ServerConfig{}.listen_address, std::string("127.0.0.1"));
+}
+
 TEST("RDMA config requires a numeric address") {
     auto config = rdma_config();
     config.rdma.address = "cache.example.com";
@@ -53,26 +57,65 @@ TEST("Default native RDMA geometry validates") {
     CHECK(status.has_value());
 }
 
-TEST("TCP listen address must be numeric IPv4") {
+TEST("TCP listen address accepts exact numeric IPv4 and IPv6") {
     ServerConfig config;
     config.ssd.dirs.push_back("/not-opened-by-config-validation");
     config.listen_address = "cache.example.com";
-    CHECK(detail_contains(validate(config), "numeric IPv4"));
+    CHECK(detail_contains(validate(config), "numeric IPv4 or IPv6"));
 
     config.listen_address = "::1";
-    CHECK(detail_contains(validate(config), "numeric IPv4"));
+    CHECK(validate(config).has_value());
 
     config.listen_address = "127.1"; // getaddrinfo accepts this shorthand; inet_pton does not.
-    CHECK(detail_contains(validate(config), "numeric IPv4"));
+    CHECK(detail_contains(validate(config), "numeric IPv4 or IPv6"));
 
     config.listen_address = "127.0.0.1";
     CHECK(validate(config).has_value());
+}
+
+TEST("Overload limits are finite and reject invalid connection, backlog, and object bounds") {
+    ServerConfig config;
+    config.ssd.dirs.push_back("/not-opened-by-config-validation");
+    CHECK(config.max_connections > 0);
+    CHECK(config.listen_backlog > 0);
+    CHECK(config.idle_timeout_ms > 0);
+    CHECK(config.queue_timeout_ms > 0);
+    CHECK(config.max_get_waiters > 0);
+    CHECK(config.max_set_waiters > 0);
+    CHECK_EQ(config.max_object_size, kMaxObjectSize);
+    CHECK(validate(config).has_value());
+
+    config.max_connections = 0;
+    CHECK(detail_contains(validate(config), "--max-connections"));
+    config.max_connections = 1;
+    config.listen_backlog = 0;
+    CHECK(detail_contains(validate(config), "--listen-backlog"));
+    config.listen_backlog = 1;
+    config.max_object_size = 0;
+    CHECK(detail_contains(validate(config), "--max-object-size"));
+    config.max_object_size = kMaxObjectSize + 1;
+    CHECK(detail_contains(validate(config), "4 GiB hard limit"));
+}
+
+TEST("Disk reclaim watermarks require a strict low-to-high interval") {
+    auto config = rdma_config();
+    config.eviction.low_watermark = 0.80;
+    config.eviction.high_watermark = 0.90;
+    CHECK(validate(config).has_value());
+    config.eviction.low_watermark = 0.90;
+    CHECK(!validate(config).has_value());
+    config.eviction.low_watermark = 0.0;
+    CHECK(!validate(config).has_value());
+    config.eviction.low_watermark = 0.80;
+    config.eviction.high_watermark = 1.01;
+    CHECK(!validate(config).has_value());
 }
 
 TEST("ExaSock requires an exact address and a plaintext listener") {
     ServerConfig config;
     config.ssd.dirs.push_back("/not-opened-by-config-validation");
     config.net = NetMode::exasock;
+    config.listen_address = "0.0.0.0";
     CHECK(detail_contains(validate(config), "non-wildcard"));
 
     config.listen_address = "192.0.2.10";
@@ -84,6 +127,35 @@ TEST("ExaSock requires an exact address and a plaintext listener") {
     config.tls_cert_paths.push_back("cert.pem");
     config.tls_key_paths.push_back("key.pem");
     CHECK(detail_contains(validate(config), "plaintext HTTP"));
+}
+
+TEST("Unix memcache may be the only listener and validates its mode") {
+    ServerConfig config;
+    config.ssd.dirs.push_back("/not-opened-by-config-validation");
+    config.enable_memcache = false;
+    config.enable_http = false;
+    config.memcache_socket = "/tmp/goblin-test.sock";
+    CHECK(validate(config).has_value());
+    config.memcache_socket_mode = 01000;
+    CHECK(detail_contains(validate(config), "socket-mode"));
+}
+
+TEST("Memcache TLS needs certificates and the async TCP backend") {
+    ServerConfig config;
+    config.ssd.dirs.push_back("/not-opened-by-config-validation");
+    config.memcache_tls = true;
+    CHECK(detail_contains(validate(config), "TLS require"));
+    config.tls_cert_paths.push_back("cert.pem");
+    config.tls_key_paths.push_back("key.pem");
+    CHECK(validate(config).has_value());
+    config.net = NetMode::blocking;
+    CHECK(detail_contains(validate(config), "requires the default --net async"));
+}
+
+TEST("ASCII auth cannot leave native RDMA unauthenticated") {
+    auto config = rdma_config();
+    config.memcache_auth_file = "/secret/users";
+    CHECK(detail_contains(validate(config), "protects TCP and Unix memcache"));
 }
 
 TEST("Mirror requires HTTP, validates its base URL, and excludes virtual-host mode") {

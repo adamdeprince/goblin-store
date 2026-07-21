@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(goblin-store LANGUAGES CXX C VERSION 0.0.2)
+project(goblin-store LANGUAGES CXX C VERSION 0.0.3)
 
 # ---- Standard (ADR-0004): C++23, no extensions, modules off for now ----
 set(CMAKE_CXX_STANDARD 23)
@@ -72,7 +72,7 @@ if(PkgConfig_FOUND)
   endif()
 endif()
 
-# ---- OpenSSL (TLS/HTTPS, ADR-0005; kTLS data path, ADR-0011): optional; HTTPS off when absent.
+# ---- OpenSSL (HTTPS/memcache TLS, ADR-0005; kTLS data path, ADR-0011): optional.
 # System libssl by default — the kTLS speed win is the kernel's, identical to a vendored build, so
 # swapping in a pinned OpenSSL submodule later is a CMake-only change. ----
 set(GOBLIN_HAVE_TLS 0)

@@ -3,6 +3,7 @@
 #if GOBLIN_HAVE_TLS
 
 #include <fcntl.h>
+#include <openssl/bio.h>
 #include <poll.h>
 #include <string>
 
@@ -30,7 +31,8 @@ void HttpsLoop::drive_handshake(Conn* c) {
     if (c->closing) return;
     SSL* ssl = tls_.at(c).ssl;
     const int r = SSL_accept(ssl);
-    if (r == 1) { // handshake done -> kTLS TX live; capture SNI, then read the request
+    if (r == 1) { // handshake done -> verify kTLS TX, capture SNI, then read the request
+        if (!BIO_get_ktls_send(SSL_get_wbio(ssl))) { close_conn(c); return; }
         if (const char* sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)) c->sni = lower(sni);
         tls_.at(c).handshaking = false;
         start_recv(c);
@@ -49,6 +51,8 @@ void HttpsLoop::ssl_read_step(Conn* c) {
     char buf[16 * 1024];
     const int r = SSL_read(ssl, buf, sizeof buf);
     if (r > 0) {
+        stats_.bytes_received.fetch_add(static_cast<std::uint64_t>(r),
+                                        std::memory_order_relaxed);
         // Compact any consume cursor before appending so unparsed bytes stay contiguous.
         if (c->in_off) {
             c->in.erase(0, c->in_off);
