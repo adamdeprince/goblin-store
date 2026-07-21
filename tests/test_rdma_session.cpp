@@ -346,7 +346,7 @@ TEST("rdma session: rejected ADD drains and releases its bulk body without stori
     f.channel.reset_observations();
     CHECK(accept_inline(f, "version\r\n"));
     f.session->drive();
-    CHECK_EQ(f.channel.inline_stream, std::string("VERSION goblin-store 0.0.2\r\n"));
+    CHECK_EQ(f.channel.inline_stream, std::string("VERSION goblin-store 0.0.3\r\n"));
 }
 
 TEST("rdma session: add and replace conditions are rechecked after their bodies arrive") {
@@ -518,7 +518,7 @@ TEST("rdma session: version, delete, malformed command, and stats remain inline 
 
     CHECK(accept_inline(f, "version\r\n"));
     f.session->drive();
-    CHECK_EQ(f.channel.inline_stream, std::string("VERSION goblin-store 0.0.2\r\n"));
+    CHECK_EQ(f.channel.inline_stream, std::string("VERSION goblin-store 0.0.3\r\n"));
 
     f.channel.reset_observations();
     CHECK(accept_inline(f, "set doomed 0 0 1\r\n"));
@@ -559,7 +559,7 @@ TEST("rdma session: version, delete, malformed command, and stats remain inline 
     CHECK(accept_inline(f, "stats\r\n"));
     f.session->drive();
     CHECK(f.channel.bulk_sends.empty());
-    CHECK(f.channel.inline_stream.find("STAT version goblin-store 0.0.2\r\n") !=
+    CHECK(f.channel.inline_stream.find("STAT version goblin-store 0.0.3\r\n") !=
           std::string::npos);
     CHECK(f.channel.inline_stream.find("STAT cmd_set 1\r\n") != std::string::npos);
     CHECK(f.channel.inline_stream.find("STAT sets_stored 1\r\n") != std::string::npos);

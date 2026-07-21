@@ -241,7 +241,7 @@ TEST("memcache ASCII authentication gates commands and permits retry") {
     CHECK_EQ(result,
         std::string("CLIENT_ERROR unauthenticated\r\n"
                     "CLIENT_ERROR authentication failure\r\n"
-                    "STORED\r\nVERSION goblin-store 0.0.2\r\n"));
+                    "STORED\r\nVERSION goblin-store 0.0.3\r\n"));
     fs::remove_all(root);
 #endif
 }
