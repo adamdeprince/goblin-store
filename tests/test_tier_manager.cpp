@@ -112,6 +112,47 @@ TEST("pool: Linux reservation keeps size zero and Pool moves preserve O_DIRECT")
 #endif
 }
 
+TEST("pool: immutable read descriptors are reused through the shared cache") {
+    const std::string base =
+        (fs::temp_directory_path() / ("goblin-pool-fds-" + std::to_string(::getpid()))).string();
+    fs::create_directories(base);
+    auto handles = FileHandleCache::create(4);
+    CHECK(handles.has_value());
+    if (!handles) {
+        fs::remove_all(base);
+        return;
+    }
+    auto opened = Pool::open({base}, 64 * KiB, /*direct_io=*/false, *handles);
+    CHECK(opened.has_value());
+    if (!opened) {
+        fs::remove_all(base);
+        return;
+    }
+    const auto digest = hash_key("/pool/fd-cache");
+    {
+        auto created = opened->open_object(digest, 128 * KiB, /*create=*/true, 1);
+        CHECK(created.has_value());
+    }
+    int first_fd = -1;
+    {
+        auto first = opened->open_object(digest, 128 * KiB, /*create=*/false, 1);
+        CHECK(first.has_value());
+        if (first) first_fd = first->fds()[0];
+    }
+    {
+        auto second = opened->open_object(digest, 128 * KiB, /*create=*/false, 1);
+        CHECK(second.has_value());
+        if (second) CHECK_EQ(second->fds()[0], first_fd);
+    }
+    const auto stats = opened->file_handle_cache_stats();
+    CHECK_EQ(stats.cached, std::size_t{1});
+    CHECK_EQ(stats.misses, std::uint64_t{1});
+    CHECK_EQ(stats.hits, std::uint64_t{1});
+    opened->unlink_object(digest, 128 * KiB, 1);
+    CHECK_EQ(opened->file_handle_cache_stats().cached, std::size_t{0});
+    fs::remove_all(base);
+}
+
 TEST("tier_manager: store across SSD prefix + HDD tail, read back through io_uring") {
     if (!core::Reactor::available()) {
         std::println("    (skipped: built without liburing)");

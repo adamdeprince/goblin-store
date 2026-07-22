@@ -84,6 +84,11 @@ copy-on-write publish** (readers never see a torn value, [ADR-0018](docs/adr/001
 digest identity** ([ADR-0014](docs/adr/0014-keyless-digest-identity.md)), and **bounded,
 mlock-able data pools** ([ADR-0016](docs/adr/0016-bounded-locked-memory.md)).
 
+C++ applications can bypass every listener and protocol layer through the
+**[embedded storage API](docs/embedded-cpp-storage.md)**. Its streaming writer performs bounded,
+atomic publication; its per-thread reader delivers a pinned RAM head to the first callback before
+waiting for the disk tail, using its own io_uring when available.
+
 Start at **[`docs/adr/README.md`](docs/adr/README.md)** — 21 ADRs covering the full design.
 For a focused explanation of the NUMA-aware head cache, HugeTLB geometry, and the two-R820
 interconnect test, read **[NUMA-local RAM heads and interconnect bandwidth](docs/numa-interconnect-bandwidth.md)**.
@@ -100,6 +105,11 @@ filesystem-local reclaim, and immutable publication, read
 **[Full-filesystem writes: reservation, reclaim, and publication](docs/full-filesystem-writes.md)**.
 
 ## Protocols
+
+- **Embedded C++23 storage:** link `GoblinStore::storage` and include `<goblin/store.hpp>` for
+  protocol-free streaming writes, head-first reads, lookup, erase, and flush. The store is shared;
+  each application worker owns a reusable reader/ring. See the
+  [embedded API guide](docs/embedded-cpp-storage.md).
 
 - **memcache (TCP):** classic text retrieval, storage, arithmetic, touch, delete, delayed flush,
   stats, and CAS—including full multi-key `get`/`gets`, `gat`/`gats`, and atomic `add`/`replace`.
@@ -216,7 +226,8 @@ Key knobs (see `--help`): `--ram-head` (power-of-two per-object resident head, d
 `--ssd-prefix` (positional tier size), `--block` (power-of-two allocation/promotion block, default
 2 MiB on x86 and 32 MiB on Arm/LoongArch), `--io-buffers` /
 `--io-chunk` (warmed-read quantum), `--write-io-chunk` (admission/write quantum), `--eviction`,
-`--max-objects`, `--max-object-size`, `--no-mlock` (dev), `--tls-cert`/
+`--file-handle-cache` (immutable-object read descriptors), `--max-objects`, `--max-object-size`,
+`--no-mlock` (dev), `--tls-cert`/
 `--tls-key` (HTTPS and memcache TLS), `--memcache-tls`, `--auth-file`, `--memcache-socket`,
 `--disk-high-watermark` / `--disk-low-watermark` / `--disk-reclaim-interval`,
 `--source` (preload a directory tree), `--numa NODE` (explicit NUMA
@@ -226,6 +237,38 @@ NUMA node), `--small-memory SIZE` / `--small-sub-memory SIZE` (packed-small-obje
 each non-local node), `--increment FLOAT` (score added per successful key read), `--decay FLOAT`
 (per-minute score multiplier in `(0, 1)`), and `--perverse` (benchmark-only inversion of preferred
 head-memory placement).
+
+### Read chunks and open-file caching
+
+`--io-chunk SIZE` controls the aligned buffer and maximum logical tail-read quantum used by a warm
+GET. It is independent of both `--ram-head` and the write-side `--write-io-chunk`, and accepts powers
+of two from 4 KiB upward. The default remains 256 KiB; storage-engine workloads with large values and
+fast backing devices can test larger values such as `--io-chunk 4M` without changing object layout.
+
+Goblin retains read-only descriptors for immutable object generations in a shared, bounded, sharded
+CLOCK cache. `--file-handle-cache N` sets its total capacity; the default is 128 and `N` must be a
+nonzero power of two. Hash-selected shards let unrelated reads open, find, and replace descriptors
+without a global cache mutex, while an atomic reservation preserves the exact process-wide capacity
+without statically partitioning it. Hits receive a second chance, inactive cold entries are replaced,
+and a descriptor leased by an active read cannot be evicted. Deleting or replacing an object removes
+its generation from the cache immediately, while an in-flight reader keeps the already-open unlinked
+inode valid until that snapshot completes. Write descriptors are never cached.
+
+The process file-descriptor limit must cover cached object files, active connections, pool directory
+descriptors, and normal runtime headroom. For a cache-heavy run, inspect and raise the soft limit in
+the shell before starting Goblin:
+
+```sh
+ulimit -Sn
+ulimit -n 262144
+./build/goblin-store --file-handle-cache 131072 --io-chunk 4M ...
+```
+
+The requested soft limit cannot exceed the account's hard limit (`ulimit -Hn`). With systemd, set
+`LimitNOFILE=262144` (or the deployment's chosen value) in the service unit instead. Normal memcache
+`stats` exposes cache capacity, shard count, occupancy, active leases, hits, misses, evictions,
+bypasses, and invalidations as `file_handle_cache_*`; `stats settings` reports the configured
+capacity.
 
 ### Network security
 

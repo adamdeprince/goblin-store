@@ -99,21 +99,39 @@ ObjectFiles::ObjectFiles(std::span<const int> src) noexcept {
     for (unsigned i = 0; i < n_; ++i) fds_[i] = src[i];
     for (unsigned i = n_; i < kMaxPoolDrives; ++i) fds_[i] = -1;
 }
+ObjectFiles::ObjectFiles(
+    std::span<const int> src,
+    std::span<const std::shared_ptr<CachedFileDescriptor>> cached) noexcept {
+    n_ = static_cast<unsigned>(std::min<std::size_t>(src.size(), kMaxPoolDrives));
+    for (unsigned i = 0; i < n_; ++i) {
+        fds_[i] = src[i];
+        if (i < cached.size()) cached_[i] = cached[i];
+    }
+    for (unsigned i = n_; i < kMaxPoolDrives; ++i) fds_[i] = -1;
+}
 ObjectFiles::~ObjectFiles() {
     for (unsigned i = 0; i < n_; ++i)
-        if (fds_[i] >= 0) ::close(fds_[i]);
+        if (fds_[i] >= 0 && !cached_[i]) ::close(fds_[i]);
 }
-ObjectFiles::ObjectFiles(ObjectFiles&& o) noexcept : fds_(o.fds_), n_(o.n_) {
-    for (unsigned i = 0; i < o.n_; ++i) o.fds_[i] = -1;
+ObjectFiles::ObjectFiles(ObjectFiles&& o) noexcept
+    : fds_(o.fds_), cached_(std::move(o.cached_)), n_(o.n_) {
+    for (unsigned i = 0; i < o.n_; ++i) {
+        o.fds_[i] = -1;
+        o.cached_[i].reset();
+    }
     o.n_ = 0;
 }
 ObjectFiles& ObjectFiles::operator=(ObjectFiles&& o) noexcept {
     if (this != &o) {
         for (unsigned i = 0; i < n_; ++i)
-            if (fds_[i] >= 0) ::close(fds_[i]);
+            if (fds_[i] >= 0 && !cached_[i]) ::close(fds_[i]);
         fds_ = o.fds_;
+        cached_ = std::move(o.cached_);
         n_ = o.n_;
-        for (unsigned i = 0; i < o.n_; ++i) o.fds_[i] = -1;
+        for (unsigned i = 0; i < o.n_; ++i) {
+            o.fds_[i] = -1;
+            o.cached_[i].reset();
+        }
         o.n_ = 0;
     }
     return *this;
@@ -139,7 +157,7 @@ Pool::~Pool() {
 Pool::Pool(Pool&& o) noexcept
     : drives_(o.drives_), dirs_(std::move(o.dirs_)), dirfds_(std::move(o.dirfds_)),
       devices_(std::move(o.devices_)),
-      direct_io_(o.direct_io_) {}
+      direct_io_(o.direct_io_), file_handles_(std::move(o.file_handles_)) {}
 Pool& Pool::operator=(Pool&& o) noexcept {
     if (this != &o) {
         for (const int fd : dirfds_)
@@ -149,6 +167,7 @@ Pool& Pool::operator=(Pool&& o) noexcept {
         dirfds_ = std::move(o.dirfds_);
         devices_ = std::move(o.devices_);
         direct_io_ = o.direct_io_;
+        file_handles_ = std::move(o.file_handles_);
     }
     return *this;
 }
@@ -181,7 +200,8 @@ std::vector<Pool::FilesystemCapacity> Pool::filesystem_capacity() const {
     return out;
 }
 
-Result<Pool> Pool::open(const std::vector<std::string>& dirs, Size stripe_unit, bool direct_io) {
+Result<Pool> Pool::open(const std::vector<std::string>& dirs, Size stripe_unit, bool direct_io,
+                        std::shared_ptr<FileHandleCache> file_handles) {
     if (dirs.empty()) return err(Errc::invalid_argument, "empty pool");
     std::vector<int> dirfds;
     std::vector<std::uint64_t> devices;
@@ -203,7 +223,7 @@ Result<Pool> Pool::open(const std::vector<std::string>& dirs, Size stripe_unit, 
         devices.push_back(static_cast<std::uint64_t>(st.st_dev));
     }
     return Pool(DrivePool(static_cast<unsigned>(dirs.size()), stripe_unit), dirs,
-                std::move(dirfds), std::move(devices), direct_io);
+                std::move(dirfds), std::move(devices), direct_io, std::move(file_handles));
 }
 
 Result<ObjectFiles> Pool::open_object(const Digest& digest, Size tier_bytes, bool create,
@@ -214,6 +234,7 @@ Result<ObjectFiles> Pool::open_object(const Digest& digest, Size tier_bytes, boo
     if (n > kMaxPoolDrives) return err(Errc::invalid_argument, "pool has too many drives");
     std::array<int, kMaxPoolDrives> fds{};
     std::array<bool, kMaxPoolDrives> created{};
+    std::array<std::shared_ptr<CachedFileDescriptor>, kMaxPoolDrives> cached{};
     for (unsigned i = 0; i < n; ++i) fds[i] = -1;
     if (tier_bytes == 0) return ObjectFiles(std::span<const int>(fds.data(), n));
 
@@ -243,12 +264,24 @@ Result<ObjectFiles> Pool::open_object(const Digest& digest, Size tier_bytes, boo
     for (unsigned c = 0; c < used; ++c) {
         const unsigned d = drives_.drive_of(digest.bucket(), static_cast<Offset>(c) * stripe);
         if (fds[d] >= 0) continue;
-        const int fd = ::openat(dirfds_[d], name, flags, 0644);
+        int fd = -1;
+        int open_errno = 0;
+        if (!create && file_handles_) {
+            auto opened = file_handles_->open_read(
+                FileHandleCache::Key{digest, generation, dirfds_[d]}, name, flags, &open_errno);
+            if (opened) {
+                cached[d] = std::move(*opened);
+                fd = cached[d]->get();
+            }
+        } else {
+            fd = ::openat(dirfds_[d], name, flags, 0644);
+            if (fd < 0) open_errno = errno;
+        }
         if (fd < 0) {
-            const int open_errno = errno;
             if (failed_errno) *failed_errno = open_errno;
             for (unsigned i = 0; i < n; ++i)
-                if (fds[i] >= 0) ::close(fds[i]);
+                if (fds[i] >= 0 && !cached[i]) ::close(fds[i]);
+            for (auto& descriptor : cached) descriptor.reset();
             if (create) {
                 // Never unlink the pathname that failed O_EXCL: it may be a pre-existing generation
                 // from a sequence collision. Roll back only files this invocation actually created.
@@ -264,7 +297,9 @@ Result<ObjectFiles> Pool::open_object(const Digest& digest, Size tier_bytes, boo
         fds[d] = fd;
         created[d] = create;
     }
-    return ObjectFiles(std::span<const int>(fds.data(), n));
+    if (create) return ObjectFiles(std::span<const int>(fds.data(), n));
+    return ObjectFiles(std::span<const int>(fds.data(), n),
+                       std::span<const std::shared_ptr<CachedFileDescriptor>>(cached.data(), n));
 }
 
 Status Pool::reserve_object(const Digest& digest, Size tier_bytes,
@@ -327,6 +362,8 @@ void Pool::unlink_object(const Digest& digest, Size tier_bytes, std::uint64_t ge
     for (unsigned c = 0; c < used; ++c) {
         const unsigned d = drives_.drive_of(digest.bucket(), static_cast<Offset>(c) * stripe);
         ::unlinkat(dirfds_[d], name, 0); // best-effort; ENOENT is fine
+        if (file_handles_)
+            file_handles_->invalidate(FileHandleCache::Key{digest, generation, dirfds_[d]});
     }
 }
 
@@ -337,7 +374,7 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
                                       const PoolConfig& hdd, Index& index, Size io_chunk,
                                       unsigned write_buffers, bool direct_io,
                                       AccessScoreConfig access_score, Size write_io_chunk,
-                                      Size max_object_size) {
+                                      Size max_object_size, unsigned file_handle_cache) {
     if (max_object_size == 0 || max_object_size > kMaxObjectSize)
         return err(Errc::invalid_argument,
                    "max object size must be between 1 byte and the 4 GiB hard limit");
@@ -421,11 +458,13 @@ Result<TierManager> TierManager::open(const TierSizes& t, const MemoryConfig& me
         ev.max_ssd_objects ? static_cast<std::size_t>(ev.max_ssd_objects) : cap_hint;
     auto object_policy = make_eviction_policy(ev.policy, obj_cap);
 
-    auto sp = Pool::open(ssd.dirs, ssd.stripe_unit, direct_io);
+    auto file_handles = FileHandleCache::create(file_handle_cache);
+    if (!file_handles) return std::unexpected(file_handles.error());
+    auto sp = Pool::open(ssd.dirs, ssd.stripe_unit, direct_io, *file_handles);
     if (!sp) return std::unexpected(sp.error());
     std::optional<Pool> hp;
     if (!hdd.dirs.empty()) {
-        auto h = Pool::open(hdd.dirs, hdd.stripe_unit, direct_io);
+        auto h = Pool::open(hdd.dirs, hdd.stripe_unit, direct_io, *file_handles);
         if (!h) return std::unexpected(h.error());
         hp.emplace(std::move(*h));
     }

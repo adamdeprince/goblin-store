@@ -16,6 +16,9 @@ option(GOBLIN_SANITIZE "ASan/UBSan in Debug builds"      ON)
 option(GOBLIN_ENABLE_EXASOCK
        "Build the explicitly selected ExaSock TCP network backend"
        OFF)
+option(GOBLIN_BUILD_BLOBDB_BENCHMARK
+       "Build the opt-in Goblin Store versus integrated BlobDB lifecycle benchmark"
+       OFF)
 
 # ExaSock is an installed, preload-based Cisco/Exablaze userspace TCP stack.  Keep the
 # integration opt-in and consume only its public per-socket header; no ExaSock code is vendored or
@@ -92,20 +95,22 @@ endif()
 
 # ---- core library (everything under src/goblin except main.cpp) ----
 # GLOB is used deliberately for a fast-moving scaffold (CONFIGURE_DEPENDS re-globs on build).
-file(GLOB_RECURSE GOBLIN_LIB_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/goblin/*.cpp")
-list(REMOVE_ITEM GOBLIN_LIB_SOURCES "${CMAKE_SOURCE_DIR}/src/goblin/main.cpp")
-list(REMOVE_ITEM GOBLIN_LIB_SOURCES "${CMAKE_SOURCE_DIR}/src/goblin/tools/path_prep.cpp")
-list(REMOVE_ITEM GOBLIN_LIB_SOURCES "${CMAKE_SOURCE_DIR}/src/goblin/tools/bench.cpp")
+file(GLOB_RECURSE GOBLIN_LIB_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/goblin/*.cpp")
+list(REMOVE_ITEM GOBLIN_LIB_SOURCES "${PROJECT_SOURCE_DIR}/src/goblin/main.cpp")
+list(REMOVE_ITEM GOBLIN_LIB_SOURCES "${PROJECT_SOURCE_DIR}/src/goblin/store.cpp")
+list(REMOVE_ITEM GOBLIN_LIB_SOURCES "${PROJECT_SOURCE_DIR}/src/goblin/tools/path_prep.cpp")
+list(REMOVE_ITEM GOBLIN_LIB_SOURCES "${PROJECT_SOURCE_DIR}/src/goblin/tools/bench.cpp")
 
 # ---- third-party: picohttpparser (HTTP/1.1 request parsing) — built without our strict warnings ----
-add_library(picohttpparser STATIC "${CMAKE_SOURCE_DIR}/third_party/picohttpparser/picohttpparser.c")
+add_library(picohttpparser STATIC "${PROJECT_SOURCE_DIR}/third_party/picohttpparser/picohttpparser.c")
 target_include_directories(picohttpparser SYSTEM PUBLIC
-  "${CMAKE_SOURCE_DIR}/third_party/picohttpparser")
+  "${PROJECT_SOURCE_DIR}/third_party/picohttpparser")
 
 add_library(goblin_core STATIC ${GOBLIN_LIB_SOURCES})
 target_include_directories(goblin_core PUBLIC
-  "${CMAKE_SOURCE_DIR}/src"
-  "${CMAKE_SOURCE_DIR}/python/cpp/include")
+  "${PROJECT_SOURCE_DIR}/include"
+  "${PROJECT_SOURCE_DIR}/src"
+  "${PROJECT_SOURCE_DIR}/python/cpp/include")
 target_compile_features(goblin_core PUBLIC cxx_std_23)
 target_compile_definitions(goblin_core PUBLIC GOBLIN_HAVE_URING=${GOBLIN_HAVE_URING})
 target_compile_definitions(goblin_core PUBLIC GOBLIN_HAVE_TLS=${GOBLIN_HAVE_TLS})
@@ -119,6 +124,14 @@ if(GOBLIN_WERROR)
 endif()
 target_compile_options(goblin_core PUBLIC ${GOBLIN_WARNINGS})
 target_link_libraries(goblin_core PUBLIC picohttpparser)
+
+# Stable consumer-facing library for applications embedding the storage engine. This intentionally
+# carries no listener/protocol dependency at the API boundary; the static linker pulls only the
+# storage implementation it references from goblin_core.
+add_library(goblin_store_storage STATIC "${PROJECT_SOURCE_DIR}/src/goblin/store.cpp")
+target_link_libraries(goblin_store_storage PUBLIC goblin_core)
+set_target_properties(goblin_store_storage PROPERTIES OUTPUT_NAME goblin-store-storage)
+add_library(GoblinStore::storage ALIAS goblin_store_storage)
 
 if(GOBLIN_HAVE_URING)
   target_link_libraries(goblin_core PUBLIC PkgConfig::LIBURING)
@@ -156,27 +169,57 @@ if(GOBLIN_SANITIZE)
 endif()
 
 # ---- main executable ----
-add_executable(goblin-store "${CMAKE_SOURCE_DIR}/src/goblin/main.cpp")
+add_executable(goblin-store "${PROJECT_SOURCE_DIR}/src/goblin/main.cpp")
 target_link_libraries(goblin-store PRIVATE goblin_core)
 
 # CLI helper that blesses a directory as a Goblin pool store (ADR-0013).
-add_executable(goblin-store-path-prep "${CMAKE_SOURCE_DIR}/src/goblin/tools/path_prep.cpp")
+add_executable(goblin-store-path-prep "${PROJECT_SOURCE_DIR}/src/goblin/tools/path_prep.cpp")
 target_link_libraries(goblin-store-path-prep PRIVATE goblin_core)
 
 # Load generator for large-object GET throughput/latency (memcache + HTTP); pure socket client.
 find_package(Threads REQUIRED)
-add_executable(goblin-bench "${CMAKE_SOURCE_DIR}/src/goblin/tools/bench.cpp")
+add_executable(goblin-bench "${PROJECT_SOURCE_DIR}/src/goblin/tools/bench.cpp")
 target_compile_features(goblin-bench PRIVATE cxx_std_23)
 target_link_libraries(goblin-bench PRIVATE Threads::Threads)
+
+# Full lifecycle benchmark against integrated BlobDB from an installed RocksDB. Keep this opt-in so
+# RocksDB is never a dependency of the server, its clients, or the default build.
+if(GOBLIN_BUILD_BLOBDB_BENCHMARK)
+  find_package(RocksDB CONFIG QUIET)
+  set(_goblin_rocksdb_target "")
+  if(TARGET RocksDB::rocksdb)
+    set(_goblin_rocksdb_target RocksDB::rocksdb)
+  elseif(TARGET rocksdb)
+    set(_goblin_rocksdb_target rocksdb)
+  elseif(PkgConfig_FOUND)
+    pkg_check_modules(GOBLIN_ROCKSDB QUIET IMPORTED_TARGET rocksdb)
+    if(GOBLIN_ROCKSDB_FOUND)
+      set(_goblin_rocksdb_target PkgConfig::GOBLIN_ROCKSDB)
+    endif()
+  endif()
+  if(NOT _goblin_rocksdb_target)
+    message(FATAL_ERROR
+      "GOBLIN_BUILD_BLOBDB_BENCHMARK=ON requires an installed RocksDB development package")
+  endif()
+  add_executable(bench_goblin_and_blobdb
+    "${PROJECT_SOURCE_DIR}/bench/bench_goblin_and_blobdb.cpp")
+  set_target_properties(bench_goblin_and_blobdb PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF)
+  target_compile_options(bench_goblin_and_blobdb PRIVATE ${GOBLIN_WARNINGS})
+  target_link_libraries(bench_goblin_and_blobdb PRIVATE
+    GoblinStore::storage ${_goblin_rocksdb_target})
+endif()
 
 # ---- tests (dependency-free; see tests/mini_test.hpp) ----
 include(CTest)
 if(BUILD_TESTING)
-  file(GLOB GOBLIN_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/tests/*.cpp")
+  file(GLOB GOBLIN_TEST_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/tests/*.cpp")
   if(GOBLIN_TEST_SOURCES)
     add_executable(goblin_tests ${GOBLIN_TEST_SOURCES})
-    target_include_directories(goblin_tests PRIVATE "${CMAKE_SOURCE_DIR}/tests")
-    target_link_libraries(goblin_tests PRIVATE goblin_core)
+    target_include_directories(goblin_tests PRIVATE "${PROJECT_SOURCE_DIR}/tests")
+    target_link_libraries(goblin_tests PRIVATE GoblinStore::storage)
     add_test(NAME goblin_tests COMMAND goblin_tests)
   endif()
 endif()

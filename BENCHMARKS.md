@@ -20,6 +20,15 @@ The current Optane small-file comparison—including the fixed 373,165-object co
 cache population rate, head-size sweep, resident-memory calculation, CPU load, and warm-cache
 latency—is in **[Small-object HTTP caching on Optane](docs/optane-small-object-benchmark.md)**.
 
+The opt-in **[Goblin Store versus BlobDB harness](bench/GOBLIN_BLOBDB_BENCHMARK.md)** performs a
+complete populate-and-read lifecycle for both engines under matched application-memory budgets. It
+replays one fixed key schedule serially and records time to first byte and complete retrieval in
+nanoseconds for three datasets: Goblin's embedded C++ O_DIRECT storage path, integrated BlobDB
+buffered reads, and integrated BlobDB direct reads. Neither engine crosses a network or protocol
+layer in this harness. Goblin materializes every value into a per-reader aligned buffer that starts
+empty, grows only when the encountered object does not fit, and is reused between requests; disk
+tails land directly in that final buffer.
+
 ## The rig
 
 Two AWS instances, same VPC / same AZ (us-east-2c), driven over a real NIC on private IPs:

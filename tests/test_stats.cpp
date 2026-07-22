@@ -64,11 +64,13 @@ TEST("stats settings exposes memcache security and Unix listener configuration")
     settings.config.memcache_auth_file = "/run/secrets/goblin-users";
     settings.config.memcache_tls = true;
     settings.config.memcache_socket = "/run/goblin-store/memcache.sock";
+    settings.config.file_handle_cache = 4096;
     const std::string response = goblin::memcache::format_settings_response(settings);
     CHECK(response.find("STAT auth_enabled_ascii yes\r\n") != std::string::npos);
     CHECK(response.find("STAT memcache_tls 1\r\n") != std::string::npos);
     CHECK(response.find("STAT domain_socket /run/goblin-store/memcache.sock\r\n") !=
           std::string::npos);
+    CHECK_EQ(stat_value(response, "file_handle_cache"), 4096);
 }
 
 TEST("stats: normal response exposes capacity and inodes for both disk tiers") {
@@ -102,6 +104,9 @@ TEST("stats: normal response exposes capacity and inodes for both disk tiers") {
         CHECK_EQ(stat_value(response, "goblin_ram_buddy_free_262144_blocks"), 16);
         CHECK_EQ(stat_value(response, "goblin_ssd_filesystem_count"), 1);
         CHECK_EQ(stat_value(response, "goblin_hdd_filesystem_count"), 1);
+        CHECK_EQ(stat_value(response, "file_handle_cache_capacity"), 128);
+        CHECK(stat_value(response, "file_handle_cache_shards") > 1);
+        CHECK_EQ(stat_value(response, "file_handle_cache_cached"), 0);
         for (const std::string_view tier : {"ssd", "hdd"}) {
             const std::string prefix = "goblin_" + std::string(tier) + "_filesystem_0_";
             CHECK(stat_value(response, prefix + "capacity_bytes").value_or(0) > 0);

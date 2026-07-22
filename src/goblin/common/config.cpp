@@ -125,6 +125,9 @@ Status validate(const ServerConfig& c) {
     if (!is_power_of_two(c.write_io_chunk_bytes) || c.write_io_chunk_bytes < kDeviceBlock)
         return err(Errc::invalid_argument,
                    "write_io_chunk_bytes must be a power of two >= 4 KiB");
+    if (c.file_handle_cache == 0 || !is_power_of_two(c.file_handle_cache))
+        return err(Errc::invalid_argument,
+                   "--file-handle-cache must be a nonzero power of two");
     if (c.io_buffers == 0)
         return err(Errc::invalid_argument, "io_buffers must be >= 1");
     if (c.max_connections == 0)

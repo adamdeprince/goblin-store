@@ -99,6 +99,7 @@ void print_help() {
         "  --ssd-prefix SIZE   per-object SSD prefix                 [default 32M]\n"
         "  --io-chunk SIZE     cache-hit/read streaming chunk size   [default 256K]\n"
         "  --write-io-chunk SIZE  write-staging chunk size           [default 256K; mirror 1M]\n"
+        "  --file-handle-cache N  cached immutable read descriptors, power of two [default 128]\n"
         "  --io-buffers N      streaming I/O buffers per worker      [default 64]\n"
         "  --io-timeout MS     drop a stalled transfer (slow client) [default 30000, 0=off]\n"
         "  --idle-timeout MS   expire idle TCP connections            [default 300000, 0=off]\n"
@@ -233,6 +234,12 @@ int main(int argc, char** argv) {
             auto v = take(a); if (!v) return 2;
             auto n = parse_int<std::uint64_t>(*v); if (!n) { bad("max-objects", *v); return 2; }
             cfg.eviction.max_ssd_objects = *n;
+        }
+        else if (a == "--file-handle-cache") {
+            auto v = take(a); if (!v) return 2;
+            auto n = parse_int<unsigned>(*v);
+            if (!n) { bad("file-handle-cache", *v); return 2; }
+            cfg.file_handle_cache = *n;
         }
         else if (a == "--tls-cert")  { auto v = take(a); if (!v) return 2; cfg.tls_cert_paths.emplace_back(*v); }
         else if (a == "--tls-key")   { auto v = take(a); if (!v) return 2; cfg.tls_key_paths.emplace_back(*v); }
@@ -556,6 +563,7 @@ int main(int argc, char** argv) {
     std::println("│ io bufs     : {} x {} KiB read / {} KiB write, stall timeout {}",
                  cfg.io_buffers, cfg.io_chunk_bytes / KiB, cfg.write_io_chunk_bytes / KiB,
                  cfg.io_timeout_ms ? std::to_string(cfg.io_timeout_ms) + "ms" : std::string("off"));
+    std::println("│ file handles: {} cached read descriptors", cfg.file_handle_cache);
     std::println("│ overload    : {} stream connections, backlog {}, idle {}ms, queue {}ms ({}/{} GET/SET waiters per worker)",
                  cfg.max_connections, cfg.listen_backlog, cfg.idle_timeout_ms,
                  cfg.queue_timeout_ms, cfg.max_get_waiters, cfg.max_set_waiters);
@@ -581,7 +589,7 @@ int main(int argc, char** argv) {
                                          cfg.io_chunk_bytes, cfg.io_buffers,
                                          cfg.cache_bypass == CacheBypass::o_direct,
                                          cfg.access_score, cfg.write_io_chunk_bytes,
-                                         cfg.max_object_size);
+                                         cfg.max_object_size, cfg.file_handle_cache);
     if (!tm) {
         std::println(stderr, "startup: {}", tm.error().detail);
         return 1;

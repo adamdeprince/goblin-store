@@ -82,6 +82,7 @@ TEST("Overload limits are finite and reject invalid connection, backlog, and obj
     CHECK(config.queue_timeout_ms > 0);
     CHECK(config.max_get_waiters > 0);
     CHECK(config.max_set_waiters > 0);
+    CHECK_EQ(config.file_handle_cache, 128U);
     CHECK_EQ(config.max_object_size, kMaxObjectSize);
     CHECK(validate(config).has_value());
 
@@ -95,6 +96,12 @@ TEST("Overload limits are finite and reject invalid connection, backlog, and obj
     CHECK(detail_contains(validate(config), "--max-object-size"));
     config.max_object_size = kMaxObjectSize + 1;
     CHECK(detail_contains(validate(config), "4 GiB hard limit"));
+
+    config.max_object_size = kMaxObjectSize;
+    config.file_handle_cache = 3;
+    CHECK(detail_contains(validate(config), "--file-handle-cache"));
+    config.file_handle_cache = 0;
+    CHECK(detail_contains(validate(config), "--file-handle-cache"));
 }
 
 TEST("Disk reclaim watermarks require a strict low-to-high interval") {

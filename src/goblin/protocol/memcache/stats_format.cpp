@@ -161,6 +161,16 @@ std::string format_stats_response(storage::TierManager& tm, const core::StatsSna
     line(out, "listen_disabled_num", stats.listen_disabled_num);
     line(out, "auth_cmds", stats.auth_cmds);
     line(out, "auth_errors", stats.auth_errors);
+    const auto handles = tm.file_handle_cache_stats();
+    line(out, "file_handle_cache_capacity", handles.capacity);
+    line(out, "file_handle_cache_shards", handles.shards);
+    line(out, "file_handle_cache_cached", handles.cached);
+    line(out, "file_handle_cache_in_use", handles.in_use);
+    line(out, "file_handle_cache_hits", handles.hits);
+    line(out, "file_handle_cache_misses", handles.misses);
+    line(out, "file_handle_cache_evictions", handles.evictions);
+    line(out, "file_handle_cache_bypasses", handles.bypasses);
+    line(out, "file_handle_cache_invalidations", handles.invalidations);
     buddy_free_blocks(out, tm);
     filesystem_capacity(out, tm);
     const auto health = tm.storage_health_snapshot();
@@ -269,6 +279,7 @@ std::string format_settings_response(const core::StatsSettings& settings) {
     line(out, "queue_timeout_ms", c.queue_timeout_ms);
     line(out, "listen_backlog", c.listen_backlog);
     line(out, "io_chunk_bytes", c.io_chunk_bytes);
+    line(out, "file_handle_cache", c.file_handle_cache);
     line(out, "io_buffers", c.io_buffers);
     line(out, "ram_head_bytes", c.tiers.ram_head);
     line(out, "ssd_prefix_bytes", c.tiers.ssd_prefix);

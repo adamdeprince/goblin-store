@@ -13,6 +13,7 @@
 #include "goblin/core/reactor.hpp"
 #include "goblin/core/stats.hpp"
 #include "goblin/storage/eviction.hpp"
+#include "goblin/storage/file_handle_cache.hpp"
 #include "goblin/crypto/sha256.hpp" // Digest
 #include "goblin/storage/drive_pool.hpp"
 #include "goblin/storage/index.hpp"
@@ -46,6 +47,8 @@ public:
         for (auto& f : fds_) f = -1;
     }
     explicit ObjectFiles(std::span<const int> src) noexcept;
+    ObjectFiles(std::span<const int> src,
+                std::span<const std::shared_ptr<CachedFileDescriptor>> cached) noexcept;
     ~ObjectFiles();
     ObjectFiles(ObjectFiles&&) noexcept;
     ObjectFiles& operator=(ObjectFiles&&) noexcept;
@@ -56,6 +59,7 @@ public:
 
 private:
     std::array<int, kMaxPoolDrives> fds_{};
+    std::array<std::shared_ptr<CachedFileDescriptor>, kMaxPoolDrives> cached_{};
     unsigned n_ = 0;
 };
 
@@ -76,7 +80,8 @@ public:
         std::uint64_t available_inodes = 0;
     };
     static Result<Pool> open(const std::vector<std::string>& dirs, Size stripe_unit,
-                             bool direct_io = false);
+                             bool direct_io = false,
+                             std::shared_ptr<FileHandleCache> file_handles = {});
     ~Pool();
     Pool(Pool&&) noexcept;
     Pool& operator=(Pool&&) noexcept;
@@ -92,6 +97,9 @@ public:
     }
     std::span<const std::uint64_t> devices() const noexcept { return devices_; }
     std::vector<FilesystemCapacity> filesystem_capacity() const;
+    FileHandleCache::Stats file_handle_cache_stats() const noexcept {
+        return file_handles_ ? file_handles_->stats() : FileHandleCache::Stats{};
+    }
     // Open immutable per-object generation files covering `tier_bytes`. Generation zero is only
     // valid for a zero-byte/RAM-only tier and therefore opens no file.
     Result<ObjectFiles> open_object(const Digest& digest, Size tier_bytes, bool create,
@@ -109,15 +117,16 @@ public:
 private:
     Pool(DrivePool dp, std::vector<std::string> dirs, std::vector<int> dirfds,
          std::vector<std::uint64_t> devices,
-         bool direct_io)
+         bool direct_io, std::shared_ptr<FileHandleCache> file_handles)
         : drives_(dp), dirs_(std::move(dirs)), dirfds_(std::move(dirfds)),
           devices_(std::move(devices)),
-          direct_io_(direct_io) {}
+          direct_io_(direct_io), file_handles_(std::move(file_handles)) {}
     DrivePool drives_;
     std::vector<std::string> dirs_;
     std::vector<int> dirfds_;
     std::vector<std::uint64_t> devices_; // st_dev for each drive directory (capacity domain)
     bool direct_io_ = false; // open object files with O_DIRECT (ADR-0011)
+    std::shared_ptr<FileHandleCache> file_handles_; // shared across SSD/HDD pools
 };
 
 class TierManager {
@@ -130,7 +139,8 @@ public:
                                     bool direct_io = false,
                                     AccessScoreConfig access_score = {},
                                     Size write_io_chunk = 0,
-                                    Size max_object_size = kMaxObjectSize);
+                                    Size max_object_size = kMaxObjectSize,
+                                    unsigned file_handle_cache = 128);
     bool three_layer() const noexcept { return hdd_.has_value(); }
     Size max_object_size() const noexcept { return max_object_size_; }
 
@@ -337,6 +347,9 @@ public:
     std::vector<FilesystemCapacityStats> filesystem_capacity_snapshot() const;
     ObservabilitySnapshot observability_snapshot() const;
     StorageHealthSnapshot storage_health_snapshot() const;
+    FileHandleCache::Stats file_handle_cache_stats() const noexcept {
+        return ssd_.file_handle_cache_stats();
+    }
     // Check live block/inode availability and reclaim filesystem-local victims when either use
     // ratio reaches the high watermark. Work is bounded per call; the maintenance thread repeats.
     std::size_t reclaim_to_watermarks(std::size_t max_victims = 1024);

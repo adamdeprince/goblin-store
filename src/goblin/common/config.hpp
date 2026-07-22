@@ -173,6 +173,7 @@ struct ServerConfig {
     // deliberately independent: large mirror admission writes must not inflate warmed-tail reads.
     Size          io_chunk_bytes = 256 * KiB; // cache-hit/read streaming chunk size
     Size          write_io_chunk_bytes = 256 * KiB; // SET/mirror write-staging chunk size
+    unsigned      file_handle_cache = 128;    // sharded read-only object fd CLOCK cache; power of two
     unsigned      io_buffers     = 64;         // streaming chunk buffers (read pool/worker; write staging)
     unsigned      io_timeout_ms  = 30000;      // drop a stalled in-flight transfer (slow client); 0 = off
     unsigned      idle_timeout_ms = 300000;    // expire idle keepalive connections; 0 = off
